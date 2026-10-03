@@ -1,0 +1,9 @@
+{
+  "cash": 100000.0,
+  "shares": 0,
+  "initial": 100000.0,
+  "trades": [],
+  "weights": {"rsi": 0.35, "macd": 0.35, "trend": 0.30},
+  "memory": [],
+  "last_run": null
+}
