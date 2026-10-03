@@ -1,4 +1,4 @@
-import streamlit as st
+  import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -21,6 +21,11 @@ def market_open():
     if n.weekday() >= 5:
         return False
     return dtime(9, 55) <= n.time() <= dtime(18, 10)
+
+# --- URL'den ayarları yükle (kalıcı) ---
+qp = st.query_params
+auto_on = qp.get("auto", "0") == "1"
+interval_min = int(qp.get("int", "5"))
 
 @st.cache_data(ttl=120)
 def get_data(period="6mo"):
@@ -112,17 +117,13 @@ class Bot:
 
 if "bot" not in st.session_state:
     st.session_state.bot = Bot(100000)
-if "auto_on" not in st.session_state:
-    st.session_state.auto_on = False
-if "interval_min" not in st.session_state:
-    st.session_state.interval_min = 5
 if "log" not in st.session_state:
     st.session_state.log = []
 
 bot = st.session_state.bot
 
-# --- OTOMATİK YENİLEME ---
-if st.session_state.auto_on:
+# --- OTOMATİK YENİLEME (sadece mod açıksa) ---
+if auto_on:
     st_autorefresh(interval=60 * 1000, key="auto_refresh")
 
 df = get_data()
@@ -135,14 +136,13 @@ last = df.iloc[-1]
 price = float(last["Close"])
 date = last["Date"]
 
-# --- OTOMATİK İŞLEM MANTIĞI ---
 action, score, sig = bot.decide(last)
 auto_msg = None
 
-if st.session_state.auto_on:
+if auto_on:
     n = now_tr()
     should_run = (bot.last_auto_time is None) or \
-                 ((n - bot.last_auto_time).total_seconds() >= st.session_state.interval_min * 60)
+                 ((n - bot.last_auto_time).total_seconds() >= interval_min * 60)
     if should_run and market_open():
         ok = bot.execute(action, price, date, reason=f"OTOMATİK {action} (skor {score:+.2f})")
         bot.last_auto_time = n
@@ -178,11 +178,19 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🤖 Otomatik Mod")
-    auto = st.toggle("Kendi kendine işlem yap", value=st.session_state.auto_on)
-    st.session_state.auto_on = auto
-    st.session_state.interval_min = st.slider("Kaç dakikada bir karar", 1, 60, st.session_state.interval_min)
 
-    if auto:
+    # Toggle URL'e yazsın
+    auto_widget = st.toggle("Kendi kendine işlem yap", value=auto_on, key="auto_toggle")
+    if auto_widget != auto_on:
+        st.query_params["auto"] = "1" if auto_widget else "0"
+        st.rerun()
+
+    interval_widget = st.slider("Kaç dakikada bir karar", 1, 60, interval_min, key="int_slider")
+    if interval_widget != interval_min:
+        st.query_params["int"] = str(interval_widget)
+        st.rerun()
+
+    if auto_on:
         if market_open():
             st.success("🟢 Borsa AÇIK — Bot çalışıyor")
         else:
@@ -190,6 +198,7 @@ with st.sidebar:
         st.caption(f"Otomatik işlem sayısı: {bot.auto_count}")
         if bot.last_auto_time:
             st.caption(f"Son çalışma: {bot.last_auto_time.strftime('%H:%M:%S')}")
+        st.caption("✅ Mod açık — sayfa yenilense de açık kalır")
 
     st.divider()
     st.subheader("🎮 Manuel")
@@ -274,13 +283,11 @@ if st.button("🚀 AI Kararını Şimdi Uygula", type="primary", use_container_w
     else:
         st.info(f"AI '{action}' dedi ama koşul yok.")
 
-# --- OTOMATİK LOG ---
 if st.session_state.log:
     st.subheader("📡 Otomatik İşlem Logu")
     for line in reversed(st.session_state.log[-20:]):
         st.text(line)
 
-# --- İŞLEM GEÇMİŞİ ---
 st.subheader("📜 İşlem Geçmişi")
 if bot.trades:
     tdf = pd.DataFrame(bot.trades)
@@ -290,7 +297,6 @@ if bot.trades:
 else:
     st.info("Henüz işlem yok.")
 
-# --- AI vs AL-TUT ---
 st.subheader("📊 AI vs Al-Tut")
 if bot.trades:
     first = df["Close"].iloc[0]
@@ -306,4 +312,4 @@ if bot.trades:
 
 st.divider()
 st.caption("⚠️ Hayali simülasyon. Yatırım tavsiyesi değildir.")
-st.caption(f"🕐 Türkiye saati: {now_tr().strftime('%Y-%m-%d %H:%M:%S')} — Borsa: {'AÇIK' if market_open() else 'KAPALI'}")
+st.caption(f"🕐 Türkiye: {now_tr().strftime('%Y-%m-%d %H:%M:%S')} — Borsa: {'AÇIK' if market_open() else 'KAPALI'}")          
