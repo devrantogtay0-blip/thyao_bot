@@ -3,14 +3,26 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="THYAO AI Trader", page_icon="✈️", layout="wide")
 st.title("✈️ THYAO Yapay Zeka Trader")
-st.caption("Türk Hava Yolları - Gerçek veri, hayali para, kendi kendine işlem.")
+st.caption("Türk Hava Yolları — Gerçek veri, hayali para, KENDİ KENDİNE işlem.")
 
+TR = ZoneInfo("Europe/Istanbul")
 
-@st.cache_data(ttl=300)
+def now_tr():
+    return datetime.now(TR)
+
+def market_open():
+    n = now_tr()
+    if n.weekday() >= 5:
+        return False
+    return dtime(9, 55) <= n.time() <= dtime(18, 10)
+
+@st.cache_data(ttl=120)
 def get_data(period="6mo"):
     df = yf.Ticker("THYAO.IS").history(period=period, interval="1d")
     if df.empty:
@@ -18,7 +30,6 @@ def get_data(period="6mo"):
     df = df.reset_index()
     df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
     return df
-
 
 def add_indicators(df):
     df = df.copy()
@@ -36,7 +47,6 @@ def add_indicators(df):
     df["SMA50"] = c.rolling(50).mean()
     return df.dropna().reset_index(drop=True)
 
-
 class Bot:
     def __init__(self, cash=100000.0):
         self.cash = cash
@@ -45,6 +55,8 @@ class Bot:
         self.trades = []
         self.w = {"rsi": 0.35, "macd": 0.35, "trend": 0.30}
         self.memory = []
+        self.last_auto_time = None
+        self.auto_count = 0
 
     def value(self, price):
         return self.cash + self.shares * price
@@ -100,11 +112,22 @@ class Bot:
 
 if "bot" not in st.session_state:
     st.session_state.bot = Bot(100000)
+if "auto_on" not in st.session_state:
+    st.session_state.auto_on = False
+if "interval_min" not in st.session_state:
+    st.session_state.interval_min = 5
+if "log" not in st.session_state:
+    st.session_state.log = []
+
 bot = st.session_state.bot
+
+# --- OTOMATİK YENİLEME ---
+if st.session_state.auto_on:
+    st_autorefresh(interval=60 * 1000, key="auto_refresh")
 
 df = get_data()
 if df is None:
-    st.error("THYAO verisi çekilemedi. Birkaç saniye sonra tekrar dene.")
+    st.error("THYAO verisi çekilemedi. Tekrar dene.")
     st.stop()
 
 df = add_indicators(df)
@@ -112,6 +135,29 @@ last = df.iloc[-1]
 price = float(last["Close"])
 date = last["Date"]
 
+# --- OTOMATİK İŞLEM MANTIĞI ---
+action, score, sig = bot.decide(last)
+auto_msg = None
+
+if st.session_state.auto_on:
+    n = now_tr()
+    should_run = (bot.last_auto_time is None) or \
+                 ((n - bot.last_auto_time).total_seconds() >= st.session_state.interval_min * 60)
+    if should_run and market_open():
+        ok = bot.execute(action, price, date, reason=f"OTOMATİK {action} (skor {score:+.2f})")
+        bot.last_auto_time = n
+        bot.auto_count += 1
+        if ok:
+            auto_msg = f"🤖 OTOMATİK {action}: {price:.2f} TL"
+            bot.learn(True)
+        else:
+            auto_msg = f"🤖 OTOMATİK karar: {action} — koşul yok"
+        st.session_state.log.append(f"{n.strftime('%H:%M:%S')} — {auto_msg}")
+    elif should_run and not market_open():
+        bot.last_auto_time = n
+        st.session_state.log.append(f"{now_tr().strftime('%H:%M:%S')} — Borsa kapalı, bekleniyor")
+
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Panel")
     st.metric("THYAO", f"{price:.2f} TL")
@@ -125,11 +171,28 @@ with st.sidebar:
     if bot.memory:
         acc = sum(bot.memory) / len(bot.memory) * 100
         st.metric("AI Doğruluk", f"{acc:.0f}%")
+
     st.write("**Ağırlıklar:**")
     for k, v in bot.w.items():
         st.progress(min(v, 1.0), text=f"{k}: {v:.2f}")
 
     st.divider()
+    st.subheader("🤖 Otomatik Mod")
+    auto = st.toggle("Kendi kendine işlem yap", value=st.session_state.auto_on)
+    st.session_state.auto_on = auto
+    st.session_state.interval_min = st.slider("Kaç dakikada bir karar", 1, 60, st.session_state.interval_min)
+
+    if auto:
+        if market_open():
+            st.success("🟢 Borsa AÇIK — Bot çalışıyor")
+        else:
+            st.warning("🟡 Borsa KAPALI — Bot bekliyor")
+        st.caption(f"Otomatik işlem sayısı: {bot.auto_count}")
+        if bot.last_auto_time:
+            st.caption(f"Son çalışma: {bot.last_auto_time.strftime('%H:%M:%S')}")
+
+    st.divider()
+    st.subheader("🎮 Manuel")
     q = st.number_input("Adet", 1, 10000, 10)
     c1, c2 = st.columns(2)
     if c1.button("🟢 AL", use_container_width=True):
@@ -153,8 +216,10 @@ with st.sidebar:
 
     if st.button("🔄 Sıfırla", use_container_width=True):
         st.session_state.bot = Bot(100000)
+        st.session_state.log = []
         st.rerun()
 
+# --- ÜST BİLGİ ---
 c1, c2, c3 = st.columns(3)
 c1.metric("Fiyat", f"{price:.2f} TL")
 c2.metric("RSI", f"{last['RSI']:.1f}",
@@ -162,6 +227,10 @@ c2.metric("RSI", f"{last['RSI']:.1f}",
 c3.metric("MACD", f"{last['MACD_hist']:.2f}",
           "Pozitif" if last["MACD_hist"] > 0 else "Negatif")
 
+if auto_msg:
+    st.info(auto_msg)
+
+# --- GRAFİK ---
 st.subheader("📈 Grafik")
 fig = go.Figure()
 fig.add_trace(go.Candlestick(x=df["Date"], open=df["Open"], high=df["High"],
@@ -175,14 +244,15 @@ for t in bot.trades:
         sym = "triangle-up" if t["action"] == "AL" else "triangle-down"
         fig.add_trace(go.Scatter(x=[td], y=[t["price"]], mode="markers",
                                   marker=dict(color=color, size=14, symbol=sym),
-                                  showlegend=False, hovertext=f"{t['action']} @ {t['price']:.2f}"))
+                                  showlegend=False,
+                                  hovertext=f"{t['action']} @ {t['price']:.2f}"))
     except Exception:
         pass
 fig.update_layout(height=450, xaxis_rangeslider_visible=False,
                   template="plotly_dark", margin=dict(l=0, r=0, t=0, b=0))
 st.plotly_chart(fig, use_container_width=True)
 
-action, score, sig = bot.decide(last)
+# --- AI KARARI ---
 st.subheader("🤖 AI Kararı")
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -196,14 +266,21 @@ with c3:
     for k, v in bot.w.items():
         st.write(f"• {k}: {v:.2f}")
 
-if st.button("🚀 AI Kararını Uygula", type="primary", use_container_width=True):
-    ok = bot.execute(action, price, date, reason=f"AI {action} (skor {score:+.2f})")
+if st.button("🚀 AI Kararını Şimdi Uygula", type="primary", use_container_width=True):
+    ok = bot.execute(action, price, date, reason=f"Manuel AI {action} (skor {score:+.2f})")
     if ok:
         st.success(f"AI {action} yaptı: {price:.2f} TL")
         st.rerun()
     else:
         st.info(f"AI '{action}' dedi ama koşul yok.")
 
+# --- OTOMATİK LOG ---
+if st.session_state.log:
+    st.subheader("📡 Otomatik İşlem Logu")
+    for line in reversed(st.session_state.log[-20:]):
+        st.text(line)
+
+# --- İŞLEM GEÇMİŞİ ---
 st.subheader("📜 İşlem Geçmişi")
 if bot.trades:
     tdf = pd.DataFrame(bot.trades)
@@ -213,6 +290,7 @@ if bot.trades:
 else:
     st.info("Henüz işlem yok.")
 
+# --- AI vs AL-TUT ---
 st.subheader("📊 AI vs Al-Tut")
 if bot.trades:
     first = df["Close"].iloc[0]
@@ -228,3 +306,4 @@ if bot.trades:
 
 st.divider()
 st.caption("⚠️ Hayali simülasyon. Yatırım tavsiyesi değildir.")
+st.caption(f"🕐 Türkiye saati: {now_tr().strftime('%Y-%m-%d %H:%M:%S')} — Borsa: {'AÇIK' if market_open() else 'KAPALI'}")
