@@ -3,7 +3,11 @@
   "shares": 0,
   "initial": 100000.0,
   "trades": [],
-  "weights": {"rsi": 0.35, "macd": 0.35, "trend": 0.30},
+  "weights": {
+    "rsi": 0.35,
+    "macd": 0.35,
+    "trend": 0.3
+  },
   "memory": [],
-  "last_run": null
+  "last_run": "2026-10-03 10:05"
 }
