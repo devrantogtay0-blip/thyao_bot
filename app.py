@@ -10,9 +10,9 @@ from streamlit_autorefresh import st_autorefresh
 import random
 import copy
 
-st.set_page_config(page_title="THYAO AI v7 - Super Brain", page_icon="🧠", layout="wide")
-st.title("🧠 THYAO AI Pro Trader v7 - Super Brain")
-st.caption("Sinir agi + Genetik + Multi-Bot Arena + Actor-Critic")
+st.set_page_config(page_title="THYAO AI v8", page_icon="🧠", layout="wide")
+st.title("🧠 THYAO AI Trader v8")
+st.caption("Self-Evolving AI: Sinir agi + Genetik + Meta-Evrim + Arena + 25 Usta")
 
 TR = ZoneInfo("Europe/Istanbul")
 def now_tr(): return datetime.now(TR)
@@ -21,80 +21,114 @@ def market_open():
     if n.weekday() >= 5: return False
     return dtime(9, 55) <= n.time() <= dtime(18, 10)
 
-HISSELER = {"THYAO": "THYAO.IS", "GARAN": "GARAN.IS", "ASELS": "ASELS.IS", "AKBNK": "AKBNK.IS"}
-qp = st.query_params
-auto_on = qp.get("auto", "0") == "1"
-test_mode = qp.get("test", "0") == "1"
-interval_min = int(qp.get("int", "2"))
-secili_hisse = qp.get("hisse", "THYAO")
-refresh_sn = int(qp.get("rs", "30"))
-min_conf = float(qp.get("conf", "0.25"))
+# ====== HISSELER ======
+HISSELER = {
+    "THYAO": "THYAO.IS", "GARAN": "GARAN.IS", "ASELS": "ASELS.IS",
+    "AKBNK": "AKBNK.IS", "EREGL": "EREGL.IS", "TUPRS": "TUPRS.IS",
+    "SISE": "SISE.IS", "KCHOL": "KCHOL.IS",
+}
 
-# ====== USTALAR ======
+# ====== URL PARAMS (guvenli) ======
+qp = st.query_params
+def qp_get(key, default):
+    try:
+        v = qp.get(key)
+        return v if v is not None else default
+    except Exception:
+        return default
+
+def qp_set(key, value):
+    try:
+        st.query_params[key] = str(value)
+    except Exception:
+        pass
+
+hisse_param = qp_get("hisse", "THYAO")
+secili_hisse = hisse_param if hisse_param in HISSELER else "THYAO"
+auto_on = qp_get("auto", "0") == "1"
+test_mode = qp_get("test", "0") == "1"
+try:
+    interval_min = int(qp_get("int", "2"))
+except Exception:
+    interval_min = 2
+try:
+    refresh_sn = int(qp_get("rs", "30"))
+except Exception:
+    refresh_sn = 30
+
+# ====== 25 USTA ======
 GURUS = [
-    {"name": "Buffett", "check": lambda r: r["Close"] > r["SMA200"] and r["Volatility"] < 0.3},
-    {"name": "Graham", "check": lambda r: r["Close"] < r["BB_dn"]},
-    {"name": "Lynch", "check": lambda r: 50 < r["RSI"] < 70 and r["MACD_hist"] > 0},
-    {"name": "Munger", "check": lambda r: r["SMA20"] > r["SMA50"] and r["ADX"] > 20},
-    {"name": "Fisher", "check": lambda r: r["SMA50"] > r.get("SMA200", r["SMA50"]) * 0.95},
-    {"name": "Templeton", "check": lambda r: r["RSI"] < 35},
-    {"name": "Soros", "check": lambda r: r["MACD"] > r["MACD_sig"]},
-    {"name": "Livermore", "check": lambda r: r["SMA20"] > r["SMA50"] and r["Close"] > r["SMA20"]},
-    {"name": "TudorJones", "check": lambda r: r["Close"] > r["SMA50"]},
-    {"name": "Dalio", "check": lambda r: r["Volatility"] < 0.35},
-    {"name": "Druckenmiller", "check": lambda r: r["ADX"] > 25 and r["MACD_hist"] > 0},
-    {"name": "ONeil", "check": lambda r: r["RSI"] > 60 and r["Vol_ratio"] > 1.2},
-    {"name": "Minervini", "check": lambda r: r.get("BB_width", 1) < 0.08 and r["ADX"] > 20},
-    {"name": "Darvas", "check": lambda r: r["Close"] > r["BB_up"] * 0.98},
-    {"name": "Simons", "check": lambda r: r["RSI"] < 30},
-    {"name": "Burry", "check": lambda r: r["RSI"] < 25 and r["WILLR"] < -85},
-    {"name": "Icahn", "check": lambda r: r["Close"] < r["BB_mid"] and r["ADX"] < 20},
-    {"name": "Ackman", "check": lambda r: r["SMA20"] > r["SMA50"] and r["Volatility"] < 0.4},
-    {"name": "Klarman", "check": lambda r: r["Close"] < r["BB_dn"] * 1.02},
-    {"name": "Marks", "check": lambda r: r["RSI"] < 40 and r["MACD_hist"] > -0.5},
-    {"name": "Tepper", "check": lambda r: r["RSI"] < 35 and r["BB_dn"] > r["Close"] * 0.95},
-    {"name": "Griffin", "check": lambda r: r["Vol_ratio"] > 1.0 and abs(r["MACD_hist"]) > 0.1},
-    {"name": "Cohen", "check": lambda r: r["RSI"] > 55 and r["Vol_ratio"] > 1.3},
-    {"name": "LWilliams", "check": lambda r: r["K"] < 20 and r["ATR"] > 0},
-    {"name": "Seykota", "check": lambda r: r["SMA20"] > r["SMA50"] and r["ADX"] > 22},
+    {"n": "Buffett",      "f": lambda r: r["Close"] > r["SMA200"] and r["Volatility"] < 0.3},
+    {"n": "Graham",       "f": lambda r: r["Close"] < r["BB_dn"]},
+    {"n": "Lynch",        "f": lambda r: 50 < r["RSI"] < 70 and r["MACD_hist"] > 0},
+    {"n": "Munger",       "f": lambda r: r["SMA20"] > r["SMA50"] and r["ADX"] > 20},
+    {"n": "Fisher",       "f": lambda r: r["SMA50"] > r.get("SMA200", r["SMA50"]) * 0.95},
+    {"n": "Templeton",    "f": lambda r: r["RSI"] < 35},
+    {"n": "Soros",        "f": lambda r: r["MACD"] > r["MACD_sig"]},
+    {"n": "Livermore",    "f": lambda r: r["SMA20"] > r["SMA50"] and r["Close"] > r["SMA20"]},
+    {"n": "TudorJones",   "f": lambda r: r["Close"] > r["SMA50"]},
+    {"n": "Dalio",        "f": lambda r: r["Volatility"] < 0.35},
+    {"n": "Druckenmiller","f": lambda r: r["ADX"] > 25 and r["MACD_hist"] > 0},
+    {"n": "ONeil",        "f": lambda r: r["RSI"] > 60 and r["Vol_ratio"] > 1.2},
+    {"n": "Minervini",    "f": lambda r: r.get("BB_width", 1) < 0.08 and r["ADX"] > 20},
+    {"n": "Darvas",       "f": lambda r: r["Close"] > r["BB_up"] * 0.98},
+    {"n": "Simons",       "f": lambda r: r["RSI"] < 30},
+    {"n": "Burry",        "f": lambda r: r["RSI"] < 25 and r["WILLR"] < -85},
+    {"n": "Icahn",        "f": lambda r: r["Close"] < r["BB_mid"] and r["ADX"] < 20},
+    {"n": "Ackman",       "f": lambda r: r["SMA20"] > r["SMA50"] and r["Volatility"] < 0.4},
+    {"n": "Klarman",      "f": lambda r: r["Close"] < r["BB_dn"] * 1.02},
+    {"n": "Marks",        "f": lambda r: r["RSI"] < 40 and r["MACD_hist"] > -0.5},
+    {"n": "Tepper",       "f": lambda r: r["RSI"] < 35 and r["BB_dn"] > r["Close"] * 0.95},
+    {"n": "Griffin",      "f": lambda r: r["Vol_ratio"] > 1.0 and abs(r["MACD_hist"]) > 0.1},
+    {"n": "Cohen",        "f": lambda r: r["RSI"] > 55 and r["Vol_ratio"] > 1.3},
+    {"n": "LWilliams",    "f": lambda r: r["K"] < 20 and r["ATR"] > 0},
+    {"n": "Seykota",      "f": lambda r: r["SMA20"] > r["SMA50"] and r["ADX"] > 22},
 ]
 
 def guru_score(row, side="BUY"):
-    c = []
+    c = 0
     for g in GURUS:
         try:
-            v = bool(g["check"](row))
-            c.append(v if side == "BUY" else not v)
+            v = bool(g["f"](row))
+            if side == "SELL": v = not v
+            if v: c += 1
         except Exception:
-            c.append(False)
-    return sum(1 for x in c if x) / len(GURUS)
+            pass
+    return c / len(GURUS)
 
 def guru_details(row):
     r = []
     for g in GURUS:
-        try: onay = bool(g["check"](row))
-        except Exception: onay = False
-        r.append({"Usta": g["name"], "Onay": "AL" if onay else "BEKLE"})
+        try: ok = bool(g["f"](row))
+        except Exception: ok = False
+        r.append({"Usta": g["n"], "Onay": "AL" if ok else "BEKLE"})
     return r
 
 # ====== VERI ======
 @st.cache_data(ttl=30)
-def get_data(symbol, period="2y", interval="1d"):
-    df = yf.Ticker(symbol).history(period=period, interval=interval)
-    if df.empty: return None
-    df = df.reset_index()
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-    return df
+def get_data(symbol, period="2y"):
+    try:
+        df = yf.Ticker(symbol).history(period=period, interval="1d")
+        if df.empty: return None
+        df = df.reset_index()
+        df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+        return df
+    except Exception:
+        return None
 
 @st.cache_data(ttl=15)
 def get_canli(symbol):
     try:
         df = yf.Ticker(symbol).history(period="1d", interval="1m")
         if df.empty: return None
-        return {"price": float(df["Close"].iloc[-1]), "open": float(df["Open"].iloc[0]),
-                "high": float(df["High"].max()), "low": float(df["Low"].min()),
-                "volume": int(df["Volume"].sum()),
-                "change_pct": float((df["Close"].iloc[-1] / df["Open"].iloc[0] - 1) * 100)}
+        return {
+            "price": float(df["Close"].iloc[-1]),
+            "open": float(df["Open"].iloc[0]),
+            "high": float(df["High"].max()),
+            "low": float(df["Low"].min()),
+            "volume": int(df["Volume"].sum()),
+            "change_pct": float((df["Close"].iloc[-1] / df["Open"].iloc[0] - 1) * 100),
+        }
     except Exception:
         return None
 
@@ -137,7 +171,6 @@ def add_indicators(df):
     df["Vol_ratio"] = v / df["Vol_SMA"]
     df["Returns"] = c.pct_change()
     df["Volatility"] = df["Returns"].rolling(20).std() * np.sqrt(252)
-    # Ekstra
     df["EMA9"] = c.ewm(span=9, adjust=False).mean()
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
     df["Mom10"] = c.pct_change(10)
@@ -146,152 +179,121 @@ def add_indicators(df):
     df["Gap"] = (df["Open"] - c.shift()) / c.shift()
     return df.dropna().reset_index(drop=True)
 
-def get_state(row):
-    r = "L" if row["RSI"] < 35 else ("H" if row["RSI"] > 65 else "M")
-    m = "P" if row["MACD_hist"] > 0 else "N"
-    t = "U" if row["SMA20"] > row["SMA50"] else "D"
-    a = "S" if row.get("ADX", 25) > 25 else "W"
-    return f"{r}{m}{t}{a}"
-
-def extract_features(row, prev_rows=None):
-    """20+ ozellik cikar."""
+def extract_features(row):
     f = [
         row["RSI"] / 100,
         np.clip(row["MACD_hist"] * 10, -1, 1),
-        (row["SMA20"] / row["SMA50"] - 1) * 10 if row["SMA50"] else 0,
-        (row["Close"] - row["BB_mid"]) / (row["BB_up"] - row["BB_dn"] + 1e-9),
+        np.clip((row["SMA20"] / row["SMA50"] - 1) * 10, -1, 1) if row["SMA50"] else 0,
+        np.clip((row["Close"] - row["BB_mid"]) / (row["BB_up"] - row["BB_dn"] + 1e-9), -1, 1),
         row["K"] / 100,
-        row["D"] / 100,
         np.clip(row["ADX"] / 50, 0, 1),
         np.clip(row["Volatility"] * 3, 0, 1),
         np.clip(row["Vol_ratio"] - 1, -1, 1),
         np.clip(row["Mom10"] * 10, -1, 1),
-        np.clip(row["Mom30"] * 10, -1, 1),
         np.clip(row["HL_ratio"] * 20, 0, 1),
         np.clip(row["Gap"] * 20, -1, 1),
-        np.clip((row["Close"] / row["SMA200"] - 1) * 5 if row["SMA200"] else 0, -1, 1),
+        np.clip((row["Close"] / row["SMA200"] - 1) * 5, -1, 1) if row["SMA200"] else 0,
         np.clip((row["EMA9"] - row["EMA21"]) / row["Close"] * 20, -1, 1),
+        1 if row["Close"] > row["SMA20"] else 0,
+        1 if row["Close"] > row["SMA50"] else 0,
+        1 if row["MACD"] > row["MACD_sig"] else 0,
+        1 if row["SMA20"] > row["SMA50"] else 0,
         np.clip(row["WILLR"] / 100, -1, 0),
-        (1 if row["Close"] > row["SMA20"] else 0),
-        (1 if row["Close"] > row["SMA50"] else 0),
-        (1 if row["MACD"] > row["MACD_sig"] else 0),
-        (1 if row["SMA20"] > row["SMA50"] else 0),
+        np.clip(row["Mom30"] * 10, -1, 1),
+        1 if row["Close"] > row["BB_mid"] else 0,
     ]
     return np.array(f, dtype=np.float64)
 
-# ====== SIFIRDAN NEURAL NETWORK (numpy) ======
+# ====== SIFIRDAN NEURAL NETWORK ======
 class NeuralNet:
-    """2 katmanli MLP. numpy ile sifirdan."""
-    def __init__(self, n_in=20, n_h1=24, n_h2=12, n_out=3, lr=0.01):
-        np.random.seed(42)
+    def __init__(self, n_in=20, h1=24, h2=12, n_out=3, lr=0.01):
         self.lr = lr
-        # Xavier init
-        self.W1 = np.random.randn(n_in, n_h1) * np.sqrt(2.0 / n_in)
-        self.b1 = np.zeros(n_h1)
-        self.W2 = np.random.randn(n_h1, n_h2) * np.sqrt(2.0 / n_h1)
-        self.b2 = np.zeros(n_h2)
-        self.W3 = np.random.randn(n_h2, n_out) * np.sqrt(2.0 / n_h2)
+        self.W1 = np.random.randn(n_in, h1) * np.sqrt(2.0 / n_in)
+        self.b1 = np.zeros(h1)
+        self.W2 = np.random.randn(h1, h2) * np.sqrt(2.0 / h1)
+        self.b2 = np.zeros(h2)
+        self.W3 = np.random.randn(h2, n_out) * np.sqrt(2.0 / h2)
         self.b3 = np.zeros(n_out)
         self.loss_history = []
 
-    def relu(self, x): return np.maximum(0, x)
-    def relu_d(self, x): return (x > 0).astype(float)
-    def softmax(self, x):
-        e = np.exp(x - np.max(x))
-        return e / (e.sum() + 1e-9)
+    def _relu(self, x): return np.maximum(0, x)
+    def _relu_d(self, x): return (x > 0).astype(float)
+    def _softmax(self, x):
+        e = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        return e / (e.sum(axis=-1, keepdims=True) + 1e-9)
 
     def forward(self, x):
         z1 = x @ self.W1 + self.b1
-        a1 = self.relu(z1)
+        a1 = self._relu(z1)
         z2 = a1 @ self.W2 + self.b2
-        a2 = self.relu(z2)
+        a2 = self._relu(z2)
         z3 = a2 @ self.W3 + self.b3
-        return self.softmax(z3), (x, z1, a1, z2, a2, z3)
+        return self._softmax(z3), (x, z1, a1, z2, a2, z3)
 
     def predict(self, x):
-        if len(x.shape) == 1:
-            x = x.reshape(1, -1)
-        probs, _ = self.forward(x)
-        return probs[0]  # [P(SAT), P(TUT), P(AL)]
+        if x.ndim == 1: x = x.reshape(1, -1)
+        p, _ = self.forward(x)
+        return p[0]
 
     def train_step(self, X, y):
-        """Batch egitim. y: 0=SAT, 1=TUT, 2=AL"""
         n = X.shape[0]
         probs, (x, z1, a1, z2, a2, z3) = self.forward(X)
-        # Cross-entropy loss
-        y_one_hot = np.zeros_like(probs)
-        y_one_hot[np.arange(n), y] = 1
-        loss = -np.mean(np.sum(y_one_hot * np.log(probs + 1e-9), axis=1))
+        y1h = np.zeros_like(probs)
+        y1h[np.arange(n), y] = 1
+        loss = -np.mean(np.sum(y1h * np.log(probs + 1e-9), axis=1))
         self.loss_history.append(float(loss))
-        if len(self.loss_history) > 200: self.loss_history = self.loss_history[-200:]
-
-        # Backprop
-        dz3 = (probs - y_one_hot) / n
-        dW3 = a2.T @ dz3
-        db3 = dz3.sum(axis=0)
-        da2 = dz3 @ self.W3.T
-        dz2 = da2 * self.relu_d(z2)
-        dW2 = a1.T @ dz2
-        db2 = dz2.sum(axis=0)
-        da1 = dz2 @ self.W2.T
-        dz1 = da1 * self.relu_d(z1)
-        dW1 = x.T @ dz1
-        db1 = dz1.sum(axis=0)
-
-        # Gradyan inişi
+        if len(self.loss_history) > 100: self.loss_history = self.loss_history[-100:]
+        dz3 = (probs - y1h) / n
+        dW3 = a2.T @ dz3; db3 = dz3.sum(0)
+        da2 = dz3 @ self.W3.T; dz2 = da2 * self._relu_d(z2)
+        dW2 = a1.T @ dz2; db2 = dz2.sum(0)
+        da1 = dz2 @ self.W2.T; dz1 = da1 * self._relu_d(z1)
+        dW1 = x.T @ dz1; db1 = dz1.sum(0)
         self.W3 -= self.lr * dW3; self.b3 -= self.lr * db3
         self.W2 -= self.lr * dW2; self.b2 -= self.lr * db2
         self.W1 -= self.lr * dW1; self.b1 -= self.lr * db1
-
         return loss
 
     def mutate(self, rate=0.05, scale=0.1):
         for W in [self.W1, self.W2, self.W3]:
-            mask = np.random.random(W.shape) < rate
-            W += mask * np.random.randn(*W.shape) * scale
+            m = np.random.random(W.shape) < rate
+            W += m * np.random.randn(*W.shape) * scale
 
     def clone(self):
-        new = NeuralNet(self.W1.shape[0], self.W1.shape[1], self.W2.shape[1], self.W3.shape[1], self.lr)
-        new.W1 = self.W1.copy(); new.b1 = self.b1.copy()
-        new.W2 = self.W2.copy(); new.b2 = self.b2.copy()
-        new.W3 = self.W3.copy(); new.b3 = self.b3.copy()
-        return new
+        n = NeuralNet(self.W1.shape[0], self.W1.shape[1], self.W2.shape[1], self.W3.shape[1], self.lr)
+        n.W1 = self.W1.copy(); n.b1 = self.b1.copy()
+        n.W2 = self.W2.copy(); n.b2 = self.b2.copy()
+        n.W3 = self.W3.copy(); n.b3 = self.b3.copy()
+        return n
 
     def crossover(self, other):
-        new = self.clone()
-        for attr in ["W1", "b1", "W2", "b2", "W3", "b3"]:
-            a = getattr(self, attr); b = getattr(other, attr)
-            mask = np.random.random(a.shape) < 0.5
-            setattr(new, attr, np.where(mask, a, b))
-        return new
+        n = self.clone()
+        for a in ["W1", "b1", "W2", "b2", "W3", "b3"]:
+            A = getattr(self, a); B = getattr(other, a)
+            m = np.random.random(A.shape) < 0.5
+            setattr(n, a, np.where(m, A, B))
+        return n
 
-    def size(self):
+    def n_params(self):
         return sum(w.size for w in [self.W1, self.b1, self.W2, self.b2, self.W3, self.b3])
 
-# ====== EXPERIENCE REPLAY ======
+# ====== REPLAY BUFFER ======
 class ReplayBuffer:
-    def __init__(self, capacity=1000):
-        self.buffer = []
-        self.capacity = capacity
+    def __init__(self, cap=500):
+        self.buf = []
+        self.cap = cap
+    def add(self, feat, label):
+        self.buf.append((feat, label))
+        if len(self.buf) > self.cap: self.buf = self.buf[-self.cap:]
+    def sample(self, bs=32):
+        if len(self.buf) < bs: return None
+        b = random.sample(self.buf, bs)
+        return np.array([x[0] for x in b]), np.array([x[1] for x in b])
+    def size(self): return len(self.buf)
 
-    def add(self, features, label):
-        self.buffer.append((features, label))
-        if len(self.buffer) > self.capacity:
-            self.buffer = self.buffer[-self.capacity:]
-
-    def sample(self, batch_size=32):
-        if len(self.buffer) < batch_size: return None
-        batch = random.sample(self.buffer, batch_size)
-        X = np.array([b[0] for b in batch])
-        y = np.array([b[1] for b in batch])
-        return X, y
-
-    def size(self): return len(self.buffer)
-
-# ====== AKTOR (Tek Bot) ======
+# ====== BOT ======
 class Bot:
-    """Tek yarışmacı bot. Kendi NN'si + hafizasi var."""
-    def __init__(self, name="Bot", cash=100000.0, strategy="balanced"):
+    def __init__(self, name, cash=100000.0, strategy="balanced"):
         self.name = name
         self.cash = cash
         self.shares = 0
@@ -299,84 +301,86 @@ class Bot:
         self.trades = []
         self.nn = NeuralNet()
         self.replay = ReplayBuffer(500)
-        self.strategy = strategy  # aggressive, balanced, conservative
+        self.strategy = strategy
         self.wins = 0
         self.losses = 0
         self.total_pnl = 0.0
-        self.predictions = []  # (features, predicted, actual, correct)
         self.entry_price = None
         self.entry_features = None
-        self.score = 0.0
+        self.last_price = cash
+        # Meta DNA
+        self.risk_pct = 0.25
+        self.min_conf = 0.25
+        self.sl_pct = 3.0
+        self.tp_pct = 6.0
 
-    def value(self, price): return self.cash + self.shares * price
+    def value(self, p): return self.cash + self.shares * p
 
     def decide(self, row, price):
         feat = extract_features(row)
-        probs = self.nn.predict(feat)  # [P_SAT, P_TUT, P_AL]
-        # Strateji bazli esikler
-        thresholds = {"aggressive": (0.3, 0.5), "balanced": (0.35, 0.45), "conservative": (0.4, 0.4)}[self.strategy]
-        sat_t, al_t = thresholds
-        if probs[2] > al_t: action = "AL"
-        elif probs[0] > sat_t: action = "SAT"
-        else: action = "TUT"
-        return action, probs, feat
+        probs = self.nn.predict(feat)
+        thr = {"aggressive": (0.30, 0.50), "balanced": (0.35, 0.45), "conservative": (0.40, 0.40)}.get(self.strategy, (0.35, 0.45))
+        if probs[2] > thr[1]: a = "AL"
+        elif probs[0] > thr[0]: a = "SAT"
+        else: a = "TUT"
+        return a, probs, feat
 
     def execute(self, action, price, date, feat, reason="AI"):
+        # Stop / TP kontrol
+        if self.shares > 0 and self.entry_price:
+            pct = (price / self.entry_price - 1) * 100
+            if pct <= -self.sl_pct:
+                action = "SAT"; reason = f"STOP-LOSS ({pct:+.1f}%)"
+            elif pct >= self.tp_pct:
+                action = "SAT"; reason = f"TAKE-PROFIT ({pct:+.1f}%)"
+
         if action == "AL" and self.cash > price * 10:
-            qty = int((self.cash * 0.25) / price)
-            if qty < 1: return False
-            self.cash -= qty * price
-            self.shares += qty
+            q = int((self.cash * self.risk_pct) / price)
+            if q < 1: return False
+            self.cash -= q * price
+            self.shares += q
             self.entry_price = price
             self.entry_features = feat
-            self.trades.append({"date": date, "action": "AL", "price": price, "qty": qty, "value": self.value(price), "reason": reason})
+            self.trades.append({"date": date, "action": "AL", "price": price, "qty": q,
+                                "value": self.value(price), "reason": reason})
             return True
         if action == "SAT" and self.shares > 0:
-            qty = self.shares
-            pnl = (price - self.entry_price) * qty if self.entry_price else 0
-            self.cash += qty * price
+            q = self.shares
+            pnl = (price - self.entry_price) * q if self.entry_price else 0
+            self.cash += q * price
             self.shares = 0
             self.total_pnl += pnl
-            # Etiket: dogru mu yapti?
             if pnl > 0: self.wins += 1
             else: self.losses += 1
-            # NN egitimi icin ornek
             if self.entry_features is not None:
-                label = 2 if pnl > 0 else 0  # AL iyi = 2 (AL), kotu = 0 (SAT)
+                label = 2 if pnl > 0 else 0
                 self.replay.add(self.entry_features, label)
-            # Prediction kaydet
-            if self.entry_features is not None:
-                self.predictions.append({"correct": pnl > 0})
-            self.trades.append({"date": date, "action": "SAT", "price": price, "qty": qty, "value": self.value(price), "reason": reason, "pnl": pnl})
+            self.trades.append({"date": date, "action": "SAT", "price": price, "qty": q,
+                                "value": self.value(price), "reason": reason, "pnl": pnl})
             self.entry_price = None
             self.entry_features = None
             return True
         return False
 
-    def train_from_replay(self, epochs=3, batch=32):
-        if self.replay.size() < batch: return None
-        total_loss = 0.0
-        cnt = 0
+    def train(self, epochs=2, bs=16):
+        if self.replay.size() < bs: return None
+        losses = []
         for _ in range(epochs):
-            s = self.replay.sample(batch)
+            s = self.replay.sample(bs)
             if s is None: break
             X, y = s
-            # TUT etiketleri ekle (her zaman olası)
-            loss = self.nn.train_step(X, y)
-            total_loss += loss; cnt += 1
-        return total_loss / cnt if cnt else None
+            losses.append(self.nn.train_step(X, y))
+        return float(np.mean(losses)) if losses else None
 
     def win_rate(self):
         t = self.wins + self.losses
         return self.wins / t if t > 0 else 0.0
 
     def fitness(self):
-        """Genetik algoritma icin uygunluk."""
-        if not self.trades: return -999
-        val = self.value(self.last_price) if hasattr(self, "last_price") else self.initial + self.total_pnl
-        return (val / self.initial - 1) * 100 + self.win_rate() * 20
+        v = self.value(self.last_price)
+        return (v / self.initial - 1) * 100 + self.win_rate() * 20
 
-# ====== ARENA (Multi-Bot) ======
+# ====== ARENA ======
 class Arena:
     def __init__(self, cash=100000.0):
         self.bots = [
@@ -389,40 +393,34 @@ class Arena:
         ]
         self.generation = 1
         self.champion_history = []
-        self.last_evolve_at = 0
+        self.evolve_counter = 0
+        self.champion_name = "Alpha"
 
-    def best_bot(self, price):
+    def best(self, price):
         for b in self.bots: b.last_price = price
         return max(self.bots, key=lambda b: b.value(price))
 
-    def worst_bot(self, price):
-        for b in self.bots: b.last_price = price
-        return min(self.bots, key=lambda b: b.value(price))
-
     def evolve(self, price):
-        """En iyi 2 botun cocugu eski botlari degistirir."""
         for b in self.bots: b.last_price = price
-        sorted_bots = sorted(self.bots, key=lambda b: b.value(price), reverse=True)
-        best1, best2 = sorted_bots[0], sorted_bots[1]
-        worst1, worst2 = sorted_bots[-1], sorted_bots[-2]
-
-        # Cocuk NN: crossover + mutation
-        child1_nn = best1.nn.crossover(best2.nn); child1_nn.mutate(0.05, 0.1)
-        child2_nn = best2.nn.crossover(best1.nn); child2_nn.mutate(0.05, 0.1)
-
-        # Worst botlari sifirla ve cocuk NN ver
-        for bot, new_nn, name in [(worst1, child1_nn, f"Gen{self.generation+1}a"), (worst2, child2_nn, f"Gen{self.generation+1}b")]:
+        sb = sorted(self.bots, key=lambda b: b.value(price), reverse=True)
+        b1, b2 = sb[0], sb[1]
+        self.champion_name = b1.name
+        w1, w2 = sb[-1], sb[-2]
+        c1 = b1.nn.crossover(b2.nn); c1.mutate(0.05, 0.1)
+        c2 = b2.nn.crossover(b1.nn); c2.mutate(0.05, 0.1)
+        for bot, nn, nm in [(w1, c1, f"G{self.generation+1}a"), (w2, c2, f"G{self.generation+1}b")]:
             bot.cash = 100000.0
             bot.shares = 0
             bot.initial = 100000.0
             bot.total_pnl = 0.0
             bot.wins = 0; bot.losses = 0
             bot.trades = []
-            bot.nn = new_nn
-            bot.replay = ReplayBuffer(500)  # Hafiza sifirla
-            bot.name = name
+            bot.nn = nn
+            bot.replay = ReplayBuffer(500)
+            bot.name = nm
         self.generation += 1
-        self.champion_history.append({"gen": self.generation-1, "champion": best1.name, "value": best1.value(price)})
+        self.champion_history.append({"gen": self.generation-1, "champion": b1.name,
+                                       "value": round(b1.value(price), 0)})
 
     def leaderboard(self, price):
         for b in self.bots: b.last_price = price
@@ -430,211 +428,322 @@ class Arena:
         for b in self.bots:
             v = b.value(price)
             rows.append({
-                "Bot": b.name,
-                "Strateji": b.strategy,
+                "Bot": b.name, "Strateji": b.strategy,
                 "Portfoy": f"{v:,.0f}",
-                "Getiri %": f"{(v/b.initial-1)*100:+.2f}",
+                "Getiri%": f"{(v/b.initial-1)*100:+.2f}",
                 "Islem": len(b.trades),
-                "Kazanma %": f"%{b.win_rate()*100:.0f}",
-                "NN Deneyim": b.replay.size(),
+                "Kazanma%": f"%{b.win_rate()*100:.0f}",
+                "Hafiza": b.replay.size(),
             })
         return sorted(rows, key=lambda x: float(x["Portfoy"].replace(",", "")), reverse=True)
+
+# ====== META EVOLVER ======
+class MetaEvolver:
+    def __init__(self, n=8):
+        self.n = n
+        self.pop = [self._rand() for _ in range(n)]
+        self.hall = []
+        self.gen = 0
+        self.hist = []
+        self.reflections = []
+
+    def _rand(self):
+        return {
+            "risk_pct": float(np.random.uniform(0.1, 0.4)),
+            "min_conf": float(np.random.uniform(0.15, 0.45)),
+            "sl_pct": float(np.random.uniform(1.5, 5.0)),
+            "tp_pct": float(np.random.uniform(3.0, 12.0)),
+            "use_bb": bool(np.random.choice([True, False])),
+            "use_adx": bool(np.random.choice([True, False])),
+        }
+
+    def _mut(self, dna, rate=0.3):
+        new = dict(dna)
+        for k, v in new.items():
+            if np.random.random() < rate:
+                if isinstance(v, bool):
+                    new[k] = not v
+                elif isinstance(v, float):
+                    new[k] = v * float(np.random.uniform(0.85, 1.15))
+                    if k == "risk_pct": new[k] = float(np.clip(new[k], 0.05, 0.5))
+                    if k == "min_conf": new[k] = float(np.clip(new[k], 0.1, 0.5))
+                    if k == "sl_pct": new[k] = float(np.clip(new[k], 1.0, 8.0))
+                    if k == "tp_pct": new[k] = float(np.clip(new[k], 2.0, 20.0))
+        return new
+
+    def _cross(self, a, b):
+        return {k: (a[k] if np.random.random() < 0.5 else b[k]) for k in a}
+
+    def _backtest(self, dna, df):
+        if len(df) < 60: return -999
+        cash = 100000.0; shares = 0; entry = None
+        wins = losses = 0
+        peak = cash; max_dd = 0
+        for i in range(1, len(df)):
+            row = df.iloc[i]; price = float(row["Close"])
+            sig = 0
+            if row["RSI"] < 35: sig += 1
+            if row["RSI"] > 65: sig -= 1
+            if row["MACD_hist"] > 0: sig += 1
+            else: sig -= 1
+            if dna.get("use_bb"):
+                if row["Close"] < row["BB_dn"]: sig += 1
+                if row["Close"] > row["BB_up"]: sig -= 1
+            if dna.get("use_adx") and row.get("ADX", 25) < 18:
+                sig = int(np.sign(sig))
+            if sig >= 2 and shares == 0 and cash > price * 10:
+                q = int((cash * dna["risk_pct"]) / price)
+                if q > 0:
+                    cash -= q * price; shares = q; entry = price
+            elif shares > 0 and entry:
+                pct = (price / entry - 1) * 100
+                if sig <= -2 or pct <= -dna["sl_pct"] or pct >= dna["tp_pct"]:
+                    cash += shares * price
+                    if price > entry: wins += 1
+                    else: losses += 1
+                    shares = 0; entry = None
+            val = cash + shares * price
+            peak = max(peak, val)
+            max_dd = max(max_dd, (peak - val) / peak * 100)
+        final = cash + shares * float(df["Close"].iloc[-1])
+        ret = (final / 100000.0 - 1) * 100
+        t = wins + losses
+        wr = wins / t if t > 0 else 0
+        return ret + wr * 20 - max_dd * 0.5
+
+    def evolve(self, df):
+        scored = [(self._backtest(d, df), d) for d in self.pop]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        self.gen += 1
+        best_fit, best_dna = scored[0]
+        self.hist.append(best_fit)
+        self.hall.append({"gen": self.gen, "fit": round(best_fit, 2), "dna": dict(best_dna)})
+        self.hall = sorted(self.hall, key=lambda x: x["fit"], reverse=True)[:8]
+
+        new_pop = [scored[0][1], scored[1][1]]
+        while len(new_pop) < self.n:
+            if np.random.random() < 0.6:
+                a = scored[np.random.randint(0, min(4, len(scored)))][1]
+                b = scored[np.random.randint(0, min(4, len(scored)))][1]
+                new_pop.append(self._mut(self._cross(a, b), 0.2))
+            else:
+                new_pop.append(self._mut(scored[0][1], 0.4))
+        self.pop = new_pop
+
+        refl = self._reflect(best_dna)
+        if refl: self.reflections.append(refl)
+        self.reflections = self.reflections[-15:]
+        return best_dna, best_fit
+
+    def _reflect(self, dna):
+        parts = []
+        parts.append("Bollinger kullaniyorum" if dna["use_bb"] else "Bollinger'siz calisiyorum")
+        parts.append("ADX filtresi aktif" if dna["use_adx"] else "ADX kullanmiyorum")
+        parts.append(f"SL: %{dna['sl_pct']:.1f}")
+        parts.append(f"TP: %{dna['tp_pct']:.1f}")
+        parts.append(f"Risk: %{dna['risk_pct']*100:.0f}")
+        trend = ""
+        if len(self.hist) >= 2:
+            trend = "📈" if self.hist[-1] > self.hist[-2] else "📉"
+        return f"Gen {self.gen}: {trend} " + " | ".join(parts)
 
 # ====== SESSION ======
 if "arena" not in st.session_state:
     st.session_state.arena = Arena(100000)
+if "meta" not in st.session_state:
+    st.session_state.meta = MetaEvolver(8)
 if "log" not in st.session_state:
     st.session_state.log = []
+if "last_meta" not in st.session_state:
+    st.session_state.last_meta = 0
+if "alarms" not in st.session_state:
+    st.session_state.alarms = []
+
 arena = st.session_state.arena
+meta = st.session_state.meta
 
 if auto_on:
-    st_autorefresh(interval=refresh_sn * 1000, key="auto_refresh")
+    st_autorefresh(interval=refresh_sn * 1000, key="rf")
 
+# ====== VERI CEK ======
 symbol = HISSELER[secili_hisse]
 df = get_data(symbol)
-if df is None:
-    st.error("Veri yok"); st.stop()
+if df is None or df.empty:
+    st.error(f"{secili_hisse} verisi cekilemedi. Farkli hisse sec.")
+    st.stop()
 
 df = add_indicators(df)
+if df.empty:
+    st.error("Yetersiz veri")
+    st.stop()
+
 last = df.iloc[-1]
 canli = get_canli(symbol)
 price = canli["price"] if canli else float(last["Close"])
 date = last["Date"]
 
-# Her bot karar verir
+# ====== ALARM ======
+for a in st.session_state.alarms:
+    if not a.get("done") and a["hisse"] == secili_hisse:
+        if (a["yon"] == "ust" and price >= a["fiyat"]) or (a["yon"] == "alt" and price <= a["fiyat"]):
+            a["done"] = True
+            st.session_state.log.append(f"{now_tr().strftime('%H:%M:%S')} - 🚨 {a['hisse']} {a['yon']} {a['fiyat']} tetiklendi ({price:.2f})")
+
+# ====== HER BOT KARAR ======
 decisions = {}
 for b in arena.bots:
     b.last_price = price
-    action, probs, feat = b.decide(last, price)
-    decisions[b.name] = (action, probs, feat)
+    a, p, f = b.decide(last, price)
+    decisions[b.name] = (a, p, f)
 
-champion = arena.best_bot(price)
+champion = arena.best(price)
 
-# Otomatik islem
+# ====== OTOMATIK ======
 auto_msgs = []
-if auto_on:
+if auto_on and (market_open() or test_mode):
     n = now_tr()
-    if market_open() or test_mode:
-        for b in arena.bots:
-            action, probs, feat = decisions[b.name]
-            ok = b.execute(action, price, date, feat, reason=f"AI {action}")
-            if ok:
-                auto_msgs.append(f"{b.name}: {action} @ {price:.2f}")
+    for b in arena.bots:
+        a, p, f = decisions[b.name]
+        if b.execute(a, price, date, f, reason=f"AI {a}"):
+            auto_msgs.append(f"{b.name}:{a}")
+    for b in arena.bots:
+        b.train(2, 16)
+    arena.evolve_counter += 1
+    if arena.evolve_counter >= 50:
+        arena.evolve(price)
+        arena.evolve_counter = 0
+        st.session_state.log.append(f"{n.strftime('%H:%M:%S')} - 🧬 Arena Gen {arena.generation}")
+    if auto_msgs:
+        st.session_state.log.append(f"{n.strftime('%H:%M:%S')} - " + " | ".join(auto_msgs))
 
-        # NN egitimi
-        for b in arena.bots:
-            loss = b.train_from_replay(epochs=2, batch=16)
-        
-        # Nesil ilerlemesi - 20 islem sonrasi evrim
-        arena.last_evolve_at += 1
-        if arena.last_evolve_at >= 50:
-            arena.evolve(price)
-            arena.last_evolve_at = 0
-            st.session_state.log.append(f"{n.strftime('%H:%M:%S')} - 🧬 Yeni nesil! Gen {arena.generation}")
-
-        if auto_msgs:
-            st.session_state.log.append(f"{n.strftime('%H:%M:%S')} - " + " | ".join(auto_msgs))
+# ====== META EVRIM (100 islemde bir) ======
+total_tr = sum(len(b.trades) for b in arena.bots)
+if total_tr > 0 and total_tr // 100 > st.session_state.last_meta:
+    st.session_state.last_meta = total_tr // 100
+    best_dna, fit = meta.evolve(df)
+    champion.risk_pct = best_dna["risk_pct"]
+    champion.min_conf = best_dna["min_conf"]
+    champion.sl_pct = best_dna["sl_pct"]
+    champion.tp_pct = best_dna["tp_pct"]
+    st.session_state.log.append(f"{now_tr().strftime('%H:%M:%S')} - 🔬 Meta Gen {meta.gen} fit {fit:+.2f}")
 
 # ====== SIDEBAR ======
 with st.sidebar:
-    st.header("🧠 Super Brain v7")
+    st.header("⚙️ Panel")
     hs = st.selectbox("Hisse", list(HISSELER.keys()), index=list(HISSELER.keys()).index(secili_hisse))
     if hs != secili_hisse:
-        st.query_params["hisse"] = hs; st.rerun()
+        qp_set("hisse", hs); st.rerun()
 
-    st.metric(f"{secili_hisse}", f"{price:.2f}", f"{canli['change_pct']:+.2f}%" if canli else "")
-
-    st.divider()
-    st.subheader("🏆 Sampiyon")
-    st.metric(champion.name, f"{champion.value(price):,.0f} TL",
-              f"{(champion.value(price)/champion.initial-1)*100:+.2f}%")
-    st.caption(f"Strateji: {champion.strategy} | Kazanma: %{champion.win_rate()*100:.0f}")
+    st.metric(secili_hisse, f"{price:.2f}", f"{canli['change_pct']:+.2f}%" if canli else "")
+    st.metric("Sampiyon", f"{champion.name} - {champion.value(price):,.0f}",
+              f"{(champion.value(price)/champion.initial-1)*100:+.1f}%")
 
     st.divider()
-    st.subheader("Kontroller")
     rs = st.slider("Yenile (sn)", 10, 300, refresh_sn)
-    if rs != refresh_sn:
-        st.query_params["rs"] = str(rs); st.rerun()
-
+    if rs != refresh_sn: qp_set("rs", rs); st.rerun()
     aw = st.toggle("Otomatik", value=auto_on)
-    if aw != auto_on:
-        st.query_params["auto"] = "1" if aw else "0"; st.rerun()
+    if aw != auto_on: qp_set("auto", "1" if aw else "0"); st.rerun()
     tw = st.toggle("Test Modu", value=test_mode)
-    if tw != test_mode:
-        st.query_params["test"] = "1" if tw else "0"; st.rerun()
+    if tw != test_mode: qp_set("test", "1" if tw else "0"); st.rerun()
 
     st.divider()
-    st.subheader("🧬 Evrim")
-    st.write(f"Nesil: **{arena.generation}**")
-    st.write(f"Sonraki evrim: **{50 - arena.last_evolve_at}** islem")
+    st.subheader("🔔 Alarm")
+    af = st.number_input("Fiyat", value=float(round(price, 2)), step=0.5)
+    ay = st.selectbox("Yon", ["ust", "alt"])
+    if st.button("➕ Ekle", use_container_width=True):
+        st.session_state.alarms.append({"hisse": secili_hisse, "fiyat": af, "yon": ay, "done": False})
+        st.success("Eklendi")
 
+    st.divider()
+    st.write(f"🧬 Arena Gen: **{arena.generation}**")
+    st.write(f"🔬 Meta Gen: **{meta.gen}**")
     if st.button("🔄 Sifirla", use_container_width=True):
         st.session_state.arena = Arena(100000)
+        st.session_state.meta = MetaEvolver(8)
         st.session_state.log = []
         st.rerun()
 
-# ====== ÜST ======
+# ====== UST ======
 c1, c2, c3, c4 = st.columns(4)
-c1.metric(f"{secili_hisse}", f"{price:.2f}")
-c2.metric("Rejim", "TREND" if last.get("ADX", 20) > 25 else "RANGE")
-c3.metric("Volatilite", f"{last['Volatility']*100:.1f}%")
-c4.metric("Nesil", f"Gen {arena.generation}")
+c1.metric(secili_hisse, f"{price:.2f}")
+c2.metric("RSI", f"{last['RSI']:.1f}")
+c3.metric("Arena Gen", arena.generation)
+c4.metric("Meta Gen", meta.gen)
 
-if auto_msgs:
-    st.info(" | ".join(auto_msgs[:3]))
+if auto_msgs: st.info(" | ".join(auto_msgs[:4]))
 
 # ====== SEKMELER ======
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🏟️ Arena", "🧠 Sinir Agi", "🧬 Genetik", "📊 Kararlar", "📜 Islemler", "📡 Log"
+t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+    "🏟️ Arena", "🧠 NN", "🧬 Genetik", "🔬 Meta", "💭 Yansima", "📜 Islemler", "📡 Log"
 ])
 
-with tab1:
-    st.subheader("🏟️ Multi-Bot Arena - 6 Bot Yarisi")
-    lb = arena.leaderboard(price)
-    st.dataframe(pd.DataFrame(lb), use_container_width=True, hide_index=True)
-
+with t1:
+    st.subheader("🏟️ Multi-Bot Arena")
+    st.dataframe(pd.DataFrame(arena.leaderboard(price)), use_container_width=True, hide_index=True)
     st.divider()
-    st.subheader("📊 Portfoy Karsilastirmasi")
     fig = go.Figure()
     for b in arena.bots:
-        vals = [b.initial]
-        for t in b.trades:
-            vals.append(t["value"])
-        vals.append(b.value(price))
+        vals = [b.initial] + [t["value"] for t in b.trades] + [b.value(price)]
         fig.add_trace(go.Scatter(y=vals, name=b.name, mode="lines+markers"))
-    fig.update_layout(height=400, template="plotly_dark", xaxis_title="Islem Sirasi", yaxis_title="Portfoy (TL)")
+    fig.update_layout(height=400, template="plotly_dark", xaxis_title="Islem Sirasi", yaxis_title="TL")
     st.plotly_chart(fig, use_container_width=True)
 
-with tab2:
-    st.subheader("🧠 Sinir Agi Analizi")
+with t2:
+    st.subheader("🧠 Neural Network")
     c1, c2, c3 = st.columns(3)
     c1.metric("Mimari", "20-24-12-3")
-    c2.metric("Parametre", f"{champion.nn.size()}")
+    c2.metric("Parametre", f"{champion.nn.n_params()}")
     c3.metric("Egitim Adimi", len(champion.nn.loss_history))
-    st.caption("Giris: 20 ozellik | Gizli: 24 + 12 noron | Cikis: SAT/TUT/AL")
-
     if champion.nn.loss_history:
-        st.divider()
-        st.subheader("📉 Egitim Kaybi (Loss)")
         st.line_chart(pd.DataFrame({"Loss": champion.nn.loss_history}))
-
     st.divider()
-    st.subheader("🎯 Aktif Botun Sinyalleri")
-    action, probs, feat = decisions[champion.name]
+    st.subheader("Sampiyon Karar Olasiliklari")
+    a, p, f = decisions[champion.name]
     c1, c2, c3 = st.columns(3)
-    c1.metric("SAT Olasiligi", f"%{probs[0]*100:.1f}")
-    c2.metric("TUT Olasiligi", f"%{probs[1]*100:.1f}")
-    c3.metric("AL Olasiligi", f"%{probs[2]*100:.1f}")
-    st.write(f"**Karar: {action}**")
+    c1.metric("P(SAT)", f"%{p[0]*100:.1f}")
+    c2.metric("P(TUT)", f"%{p[1]*100:.1f}")
+    c3.metric("P(AL)", f"%{p[2]*100:.1f}")
+    st.write(f"**Karar: {a}**")
 
-with tab3:
-    st.subheader("🧬 Genetik Algoritma")
-    st.caption("En iyi 2 bot cocuk uretir, en kotu 2 bot yerini cocuklara birakir.")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Nesil", arena.generation)
-    c2.metric("Toplam Evrim", len(arena.champion_history))
-    c3.metric("Bot Sayisi", len(arena.bots))
-
+with t3:
+    st.subheader("🧬 Arena Genetik Evrimi")
     if arena.champion_history:
-        st.divider()
-        st.subheader("🏆 Sampiyon Gecmisi")
         st.dataframe(pd.DataFrame(arena.champion_history), use_container_width=True, hide_index=True)
+    else:
+        st.info("50 islemde bir evrim olur")
 
-    st.divider()
-    st.subheader("🧪 Her Botun NN Istatistigi")
-    rows = []
-    for b in arena.bots:
-        rows.append({
-            "Bot": b.name,
-            "Strateji": b.strategy,
-            "Hafiza": b.replay.size(),
-            "Egitim": len(b.nn.loss_history),
-            "Son Loss": f"{b.nn.loss_history[-1]:.4f}" if b.nn.loss_history else "-",
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+with t4:
+    st.subheader("🔬 Meta-Evolution (Kendi DNA'si)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Nesil", meta.gen)
+    c2.metric("En Iyi Fitness", f"{max(meta.hist) if meta.hist else 0:+.2f}")
+    c3.metric("Son Fitness", f"{meta.hist[-1] if meta.hist else 0:+.2f}")
+    st.caption("100 islemde bir evrimlesir.")
+    if meta.hall:
+        rows = []
+        for h in meta.hall:
+            d = h["dna"]
+            rows.append({
+                "Nesil": h["gen"], "Fitness": f"{h['fit']:+.2f}",
+                "Risk %": f"%{d['risk_pct']*100:.0f}",
+                "SL%": f"{d['sl_pct']:.1f}", "TP%": f"{d['tp_pct']:.1f}",
+                "BB": "✅" if d["use_bb"] else "❌",
+                "ADX": "✅" if d["use_adx"] else "❌",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if meta.hist:
+        st.line_chart(pd.DataFrame({"Fitness": meta.hist}))
 
-with tab4:
-    st.subheader("📊 Tum Botlarin Kararlari")
-    rows = []
-    for name, (a, p, f) in decisions.items():
-        rows.append({
-            "Bot": name,
-            "Karar": a,
-            "P(SAT)": f"%{p[0]*100:.0f}",
-            "P(TUT)": f"%{p[1]*100:.0f}",
-            "P(AL)": f"%{p[2]*100:.0f}",
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+with t5:
+    st.subheader("💭 Botun Yansimalari")
+    if meta.reflections:
+        for r in reversed(meta.reflections):
+            st.info(r)
+    else:
+        st.warning("Bot henuz ogrenmedi. 100 islem gerekiyor.")
 
-    st.divider()
-    st.subheader("👑 Usta Onayi")
-    gd = guru_details(last)
-    onay = sum(1 for g in gd if g["Onay"] == "AL")
-    st.metric("Onaylayan Usta", f"{onay}/25")
-    st.dataframe(pd.DataFrame(gd), use_container_width=True, hide_index=True)
-
-with tab5:
-    st.subheader("📜 Sampiyon Islemleri")
+with t6:
+    st.subheader(f"📜 {champion.name} Islemleri")
     if champion.trades:
         tdf = pd.DataFrame(champion.trades)
         tdf["date"] = pd.to_datetime(tdf["date"]).dt.strftime("%Y-%m-%d %H:%M")
@@ -643,8 +752,8 @@ with tab5:
     else:
         st.info("Islem yok")
 
-with tab6:
-    for line in reversed(st.session_state.log[-30:]):
+with t7:
+    for line in reversed(st.session_state.log[-40:]):
         st.text(line)
 
 st.divider()
