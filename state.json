@@ -1,16 +1,27 @@
 {
-  "cash": 100000.0,
-  "shares": 0,
+  "cash": 75036.34816187501,
+  "shares": 85,
   "initial": 100000.0,
-  "trades": [],
+  "trades": [
+    {
+      "date": "2026-10-05 00:00:00",
+      "ts": "2026-10-05T10:21:15+03:00",
+      "action": "AL",
+      "price": 293.4,
+      "qty": 85,
+      "value": 99962.6,
+      "reason": "AI AL | Usta %16",
+      "pnl": 0
+    }
+  ],
   "weights": {
     "rsi": 0.35,
     "macd": 0.35,
     "trend": 0.3
   },
   "memory": [],
-  "last_run": "2026-10-05 09:57",
-  "generation": 3,
+  "last_run": "2026-10-05 10:21",
+  "generation": 4,
   "wins": 0,
   "losses": 0,
   "tp_pct": 6.0,
@@ -22,13 +33,19 @@
   "max_drawdown_pct": 20.0,
   "max_stale_min": 45,
   "peak_value": 100000.0,
-  "equity": [],
-  "entry_price": null,
-  "entry_cost": null,
-  "entry_high": null,
-  "entry_low": null,
-  "entry_ts": null,
+  "equity": [
+    {
+      "ts": "2026-10-05T10:21+03:00",
+      "value": 99962.6,
+      "price": 293.25
+    }
+  ],
+  "entry_price": 293.396625,
+  "entry_cost": 24963.651838124995,
+  "entry_high": 293.396625,
+  "entry_low": 293.396625,
+  "entry_ts": "2026-10-05T10:21:15+03:00",
   "entry_features": null,
-  "last_price": 292.0,
-  "last_action": "TUT"
+  "last_price": 293.25,
+  "last_action": "AL"
 }
