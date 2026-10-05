@@ -20,8 +20,8 @@
     "trend": 0.3
   },
   "memory": [],
-  "last_run": "2026-10-05 14:49",
-  "generation": 13,
+  "last_run": "2026-10-05 15:23",
+  "generation": 14,
   "wins": 0,
   "losses": 0,
   "tp_pct": 6.0,
@@ -83,14 +83,19 @@
       "ts": "2026-10-05T14:49+03:00",
       "value": 99920.1,
       "price": 292.75
+    },
+    {
+      "ts": "2026-10-05T15:23+03:00",
+      "value": 99898.85,
+      "price": 292.5
     }
   ],
   "entry_price": 293.396625,
   "entry_cost": 24963.651838124995,
   "entry_high": 294.5,
-  "entry_low": 292.75,
+  "entry_low": 292.5,
   "entry_ts": "2026-10-05T10:21:15+03:00",
   "entry_features": null,
-  "last_price": 292.75,
+  "last_price": 292.5,
   "last_action": "AL"
 }
