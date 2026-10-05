@@ -20,8 +20,8 @@
     "trend": 0.3
   },
   "memory": [],
-  "last_run": "2026-10-05 10:49",
-  "generation": 5,
+  "last_run": "2026-10-05 11:20",
+  "generation": 6,
   "wins": 0,
   "losses": 0,
   "tp_pct": 6.0,
@@ -32,7 +32,7 @@
   "cooldown_min": 30,
   "max_drawdown_pct": 20.0,
   "max_stale_min": 45,
-  "peak_value": 100000.0,
+  "peak_value": 100047.59816187501,
   "equity": [
     {
       "ts": "2026-10-05T10:21+03:00",
@@ -43,14 +43,19 @@
       "ts": "2026-10-05T10:49+03:00",
       "value": 99920.1,
       "price": 292.75
+    },
+    {
+      "ts": "2026-10-05T11:20+03:00",
+      "value": 100047.6,
+      "price": 294.25
     }
   ],
   "entry_price": 293.396625,
   "entry_cost": 24963.651838124995,
-  "entry_high": 293.396625,
+  "entry_high": 294.25,
   "entry_low": 292.75,
   "entry_ts": "2026-10-05T10:21:15+03:00",
   "entry_features": null,
-  "last_price": 292.75,
+  "last_price": 294.25,
   "last_action": "AL"
 }
