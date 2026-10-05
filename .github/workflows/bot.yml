@@ -13,17 +13,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+
       - name: Install
-        run: pip install yfinance
+        run: pip install -r requirements.txt
+
       - name: Run bot
         run: python bot.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROPOSALS_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROPOSALS_GH_REPO: ${{ github.repository }}
+          PROPOSALS_GH_BRANCH: main
+
       - name: Save state
         run: |
           git config user.name "thyao-bot"
           git config user.email "bot@thyao.local"
           git add state.json
-          git diff --staged --quiet || git commit -m "Bot: $(date -u +'%Y-%m-%d %H:%M')"
+          git add bot.pkl || true
+          git add proposals.json || true
+          git diff --staged --quiet || git commit -m "Bot: $(date -u +'%Y-%m-%d %H:%M') [skip ci]"
           git push
