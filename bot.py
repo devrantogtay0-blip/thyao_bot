@@ -1,137 +1,391 @@
-# bot.py - v10 7/24 otomatik bot
-import json, os, sys
-from datetime import datetime
+#!/usr/bin/env python3
+"""bot.py v12 - 7/24 otomatik bot (sanal / paper islem)
+
+Yenilikler v12:
+    * Telegram bildirimi (notify.send)
+    * MAE/MFE/hold/ret_pct takibi (analytics.trade_stats icin)
+    * entry_high/entry_low pozisyon acikken guncellenir
+
+Kullanim:
+    python bot.py              # normal calisma (GitHub Actions)
+    python bot.py --dry-run    # karar uret, hicbir dosyaya yazma
+    python bot.py --force      # borsa saati / veri tazeligi kontrolunu atla (test)
+"""
+import argparse
+import json
+import logging
+import os
+import pickle
+import subprocess
+import sys
+import time
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 try:
-    from ai_brain import Bot, guru_score
-    from self_improve import SelfImprover
-except ImportError as e:
-    print(f"Import hatasi: {e}"); sys.exit(1)
+    import numpy as np  # noqa: F401
+    import pandas as pd
+    import yfinance as yf
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                           "yfinance", "pandas", "numpy"])
+    import numpy as np  # noqa: F401
+    import pandas as pd
+    import yfinance as yf
 
 try:
-    import yfinance as yf
-    import pandas as pd
-    import numpy as np
+    from ai_brain import Bot, guru_score, BOT_VERSION
+    from self_improve import SelfImprover
+    from indicators import add_ind
+except ImportError as e:
+    print(f"Import hatasi: {e}")
+    sys.exit(1)
+
+# notify opsiyonel - yoksa sessizce atlar
+try:
+    from notify import send as notify_send
 except ImportError:
-    os.system("pip install yfinance pandas numpy -q")
-    import yfinance as yf
-    import pandas as pd
-    import numpy as np
+    def notify_send(text):
+        return False
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("bot")
 
 TR = ZoneInfo("Europe/Istanbul")
-STATE = "state.json"
+SYMBOL = os.getenv("BOT_SYMBOL", "THYAO.IS")
+STATE = os.getenv("BOT_STATE", "state.json")
+BOT_FILE = os.getenv("BOT_FILE", "bot.pkl")
+MAX_TRADES = 500
+MAX_EQUITY = 1000
 
-def now_tr(): return datetime.now(TR)
+DEFAULTS = {
+    "cash": 100000.0, "shares": 0, "initial": 100000.0, "trades": [],
+    "last_run": None, "generation": 0, "wins": 0, "losses": 0,
+    "tp_pct": 6.0, "sl_pct": 3.0, "risk_pct": 0.25, "min_conf": 0.25,
+    "max_daily_trades": 4, "cooldown_min": 30,
+    "max_drawdown_pct": 20.0, "max_stale_min": 45,
+    "peak_value": None, "equity": [],
+    # v12 ek alanlar (MAE/MFE takibi)
+    "entry_price": None, "entry_cost": None,
+    "entry_high": None, "entry_low": None,
+    "entry_ts": None, "entry_features": None,
+}
+
+
+def now_tr():
+    return datetime.now(TR)
+
 
 def market_open():
     n = now_tr()
-    if n.weekday() >= 5: return False
-    return (9, 55) <= (n.hour, n.minute) <= (18, 10)
+    return n.weekday() < 5 and dtime(9, 55) <= n.time() <= dtime(18, 10)
 
+
+# ---------------------------------------------------------------- state
 def load_state():
+    state = {}
     if os.path.exists(STATE):
         try:
-            with open(STATE, "r", encoding="utf-8") as f: return json.load(f)
-        except Exception: pass
-    return {"cash": 100000.0, "shares": 0, "initial": 100000.0, "trades": [],
-            "last_run": None, "generation": 0, "wins": 0, "losses": 0,
-            "tp_pct": 6.0, "sl_pct": 3.0, "risk_pct": 0.25, "min_conf": 0.25}
+            with open(STATE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as e:
+            log.error("state.json bozuk (%s) -> state.json.bak olarak saklandi", e)
+            try:
+                os.replace(STATE, STATE + ".bak")
+            except OSError:
+                pass
+            state = {}
+    for k, v in DEFAULTS.items():
+        state.setdefault(k, list(v) if isinstance(v, list) else v)
+    if state["peak_value"] is None:
+        state["peak_value"] = state["initial"]
+    return state
+
+
+def atomic_write(path, writer, mode):
+    tmp = path + ".tmp"
+    with open(tmp, mode, **({"encoding": "utf-8"} if "b" not in mode else {})) as f:
+        writer(f)
+    os.replace(tmp, path)
+
 
 def save_state(s):
-    with open(STATE, "w", encoding="utf-8") as f:
-        json.dump(s, f, indent=2, ensure_ascii=False, default=str)
+    atomic_write(STATE, lambda f: json.dump(s, f, indent=2, ensure_ascii=False, default=str), "w")
 
-def add_ind(df):
-    df = df.copy()
-    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
-    d = c.diff()
-    g = d.where(d > 0, 0).rolling(14).mean(); ls = (-d.where(d < 0, 0)).rolling(14).mean()
-    df["RSI"] = 100 - (100 / (1 + g / ls))
-    e12 = c.ewm(span=12, adjust=False).mean(); e26 = c.ewm(span=26, adjust=False).mean()
-    df["MACD"] = e12 - e26
-    df["MACD_sig"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_hist"] = df["MACD"] - df["MACD_sig"]
-    df["SMA20"] = c.rolling(20).mean(); df["SMA50"] = c.rolling(50).mean()
-    df["SMA200"] = c.rolling(200).mean()
-    df["BB_mid"] = df["SMA20"]; df["BB_std"] = c.rolling(20).std()
-    df["BB_up"] = df["BB_mid"] + 2 * df["BB_std"]; df["BB_dn"] = df["BB_mid"] - 2 * df["BB_std"]
-    df["BB_width"] = (df["BB_up"] - df["BB_dn"]) / df["BB_mid"]
-    lo14 = l.rolling(14).min(); hi14 = h.rolling(14).max()
-    df["K"] = 100 * (c - lo14) / (hi14 - lo14); df["D"] = df["K"].rolling(3).mean()
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
-    df["WILLR"] = -100 * (hi14 - c) / (hi14 - lo14)
-    up = h.diff(); dn = -l.diff()
-    pdm = np.where((up > dn) & (up > 0), up, 0.0); mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    tr14 = tr.rolling(14).sum()
-    pdi = 100 * pd.Series(pdm, index=df.index).rolling(14).sum() / tr14
-    mdi = 100 * pd.Series(mdm, index=df.index).rolling(14).sum() / tr14
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    df["ADX"] = dx.rolling(14).mean()
-    df["Vol_SMA"] = v.rolling(20).mean(); df["Vol_ratio"] = v / df["Vol_SMA"]
-    df["Returns"] = c.pct_change()
-    df["Volatility"] = df["Returns"].rolling(20).std() * np.sqrt(252)
-    df["EMA9"] = c.ewm(span=9, adjust=False).mean()
-    df["EMA21"] = c.ewm(span=21, adjust=False).mean()
-    df["Mom10"] = c.pct_change(10); df["Mom30"] = c.pct_change(30)
-    df["HL_ratio"] = (h - l) / c
-    df["Gap"] = (df["Open"] - c.shift()) / c.shift()
-    return df.dropna().reset_index(drop=True)
 
-def main():
+# ---------------------------------------------------------------- veri
+def fetch(period, interval, tries=3):
+    for i in range(tries):
+        try:
+            df = yf.Ticker(SYMBOL).history(period=period, interval=interval)
+            if not df.empty:
+                return df
+        except Exception as e:
+            log.warning("yfinance hata (%d/%d): %s", i + 1, tries, e)
+        time.sleep(2 ** i)
+    return None
+
+
+def live_price():
+    df = fetch("1d", "1m", tries=2)
+    if df is None:
+        return None
+    ts = df.index[-1]
+    ts = ts.tz_localize(TR) if ts.tzinfo is None else ts.tz_convert(TR)
+    age = (now_tr() - ts.to_pydatetime()).total_seconds() / 60
+    return float(df["Close"].iloc[-1]), age
+
+
+# ---------------------------------------------------------------- bot
+def restore_bot(state, df=None):
+    """Bot'u diskten geri yukler; entry_high/entry_low state.json'dan gelir (MAE/MFE icin)."""
+    bot = None
+    if os.path.exists(BOT_FILE):
+        try:
+            with open(BOT_FILE, "rb") as f:
+                bot = pickle.load(f)
+            if getattr(bot, "version", 1) != BOT_VERSION:
+                log.warning("Eski surum bot (v%s) atildi", getattr(bot, "version", 1))
+                bot = None
+            else:
+                log.info("Bot diskten yuklendi (%s)", BOT_FILE)
+        except Exception as e:
+            log.warning("Bot yuklenemedi: %s", e)
+            bot = None
+    if bot is None:
+        bot = Bot("Alpha", state["cash"], "balanced")
+        m = bot.pretrain(df) if df is not None else None
+        if m:
+            log.info("On-egitim: %d ornek | dogrulama %%%.0f (taban %%%.0f)",
+                     m["n"], m["val_acc"] * 100, m["baseline"] * 100)
+    bot.cash = state["cash"]
+    bot.shares = state["shares"]
+    bot.initial = state["initial"]
+    bot.wins, bot.losses = state["wins"], state["losses"]
+    bot.tp_pct, bot.sl_pct = state["tp_pct"], state["sl_pct"]
+    bot.risk_pct, bot.min_conf = state["risk_pct"], state["min_conf"]
+    # v12: pozisyon acikken entry_high/entry_low korunur (MAE/MFE hesabi icin)
+    if bot.shares > 0:
+        if state.get("entry_price"):
+            bot.entry_price = state["entry_price"]
+            bot.entry_cost = state.get("entry_cost")
+        bot._entry_high = state.get("entry_high") or bot.entry_price or 0.0
+        bot._entry_low = state.get("entry_low") or bot.entry_price or 0.0
+        bot._entry_ts = state.get("entry_ts")
+    else:
+        bot.entry_price = bot.entry_cost = bot.entry_features = None
+        bot._entry_high = bot._entry_low = None
+        bot._entry_ts = None
+    return bot
+
+
+def track_excursion(bot, price):
+    """Her cagride entry_high/entry_low'u guncelle (pozisyon acikken)."""
+    if bot.shares > 0 and getattr(bot, "_entry_high", None):
+        bot._entry_high = max(bot._entry_high, price)
+        bot._entry_low = min(bot._entry_low, price)
+
+
+def trade_extras(bot, price, pnl, cost, date):
+    """Kapanan islem icin MAE/MFE/hold/ret_pct hesapla."""
+    ret_pct = (pnl / cost * 100) if cost else 0.0
+    entry = bot.entry_price or 0
+    high = getattr(bot, "_entry_high", entry) or entry
+    low = getattr(bot, "_entry_low", entry) or entry
+    mae = (low / entry - 1) * 100 if entry else None
+    mfe = (high / entry - 1) * 100 if entry else None
+    hold = None
+    ts = getattr(bot, "_entry_ts", None)
+    if ts:
+        try:
+            t0 = datetime.fromisoformat(ts)
+            hold = (now_tr().replace(tzinfo=None) - t0).total_seconds() / 86400
+        except Exception:
+            pass
+    return {"ret_pct": round(ret_pct, 3), "mae": round(mae, 3) if mae is not None else None,
+            "mfe": round(mfe, 3) if mfe is not None else None,
+            "hold": round(hold, 2) if hold is not None else None}
+
+
+def risk_guard(state, n, value):
+    today = n.strftime("%Y-%m-%d")
+    todays = [t for t in state["trades"]
+              if str(t.get("ts", "")).startswith(today) and t.get("action") == "AL"]
+    if len(todays) >= state["max_daily_trades"]:
+        return f"gunluk alis limiti ({len(todays)}/{state['max_daily_trades']})"
+    if todays:
+        try:
+            last_ts = datetime.fromisoformat(todays[-1]["ts"])
+            if n - last_ts < timedelta(minutes=state["cooldown_min"]):
+                return f"bekleme suresi ({state['cooldown_min']} dk)"
+        except Exception:
+            pass
+    peak = max(state["peak_value"], value)
+    dd = (1 - value / peak) * 100 if peak else 0
+    if dd >= state["max_drawdown_pct"]:
+        return f"devre kesici: zirveden %{dd:.1f} dusus"
+    return None
+
+
+def gh_summary(msg):
+    p = os.getenv("GITHUB_STEP_SUMMARY")
+    if p:
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    args = ap.parse_args(argv)
+
     state = load_state()
     n = now_tr()
-    try:
-        raw = yf.Ticker("THYAO.IS").history(period="2y", interval="1d")
-        if raw.empty: print("Veri yok"); return
-        raw = raw.reset_index()
-        raw["Date"] = pd.to_datetime(raw["Date"]).dt.tz_localize(None)
-        df = add_ind(raw)
-        if df.empty: print("Yetersiz veri"); return
-        last = df.iloc[-1]; price = float(last["Close"])
-    except Exception as e:
-        print(f"Veri hatasi: {e}"); return
 
-    bot = Bot("Alpha", state["cash"], "balanced")
-    bot.shares = state["shares"]; bot.initial = state["initial"]
-    bot.wins = state.get("wins", 0); bot.losses = state.get("losses", 0)
-    bot.tp_pct = state.get("tp_pct", 6.0); bot.sl_pct = state.get("sl_pct", 3.0)
-    bot.risk_pct = state.get("risk_pct", 0.25); bot.min_conf = state.get("min_conf", 0.25)
+    raw = fetch("2y", "1d")
+    if raw is None:
+        log.error("Gunluk veri alinamadi")
+        return 1
+    raw = raw.reset_index()
+    raw["Date"] = pd.to_datetime(raw["Date"]).dt.tz_localize(None)
+    df = add_ind(raw)
+    if df.empty:
+        log.error("Yetersiz veri")
+        return 1
+    last = df.iloc[-1]
+
+    live = live_price()
+    price, age = (live if live else (float(last["Close"]), None))
+
+    bot = restore_bot(state, df)
+    bot.last_price = price
+
+    # v12: her calismada entry_high/entry_low guncelle (MAE/MFE)
+    track_excursion(bot, price)
 
     action, probs, feat = bot.decide(last, price)
     gs = guru_score(last, "BUY" if action == "AL" else "SELL")
-    print(f"Fiyat: {price:.2f} | Karar: {action} | P(AL): {probs[2]:.2f} | Usta: %{gs*100:.0f}")
+    log.info("%s %.2f | Karar: %s | P(AL): %.2f | Usta: %%%.0f",
+             SYMBOL, price, action, probs[2], gs * 100)
 
-    if not market_open():
-        print("Borsa kapali.")
+    fresh = age is not None and age <= state["max_stale_min"]
+    if args.force:
+        tradeable, why = True, ""
+    elif not market_open():
+        tradeable, why = False, "Borsa kapali"
+    elif not fresh:
+        tradeable, why = False, f"Canli veri bayat/yok (yas: {age if age is None else round(age)} dk)"
     else:
-        ok = bot.execute(action, price, last["Date"], feat, reason=f"AI {action} | Usta %{gs*100:.0f}")
+        tradeable, why = True, ""
+
+    traded = None
+    if not tradeable:
+        log.info("%s - islem yok", why)
+    else:
+        exec_action = action
+        if action == "AL":
+            block = risk_guard(state, n, bot.value(price))
+            if block:
+                log.info("AL engellendi: %s", block)
+                exec_action = "TUT"
+
+        # v12: MAE/MFE icin giris bilgisi state'e kaydedilecek
+        prev_cost = bot.entry_cost
+        prev_entry = bot.entry_price
+
+        ok = bot.execute(exec_action, price, last["Date"], feat,
+                         reason=f"AI {exec_action} | Usta %{gs*100:.0f}")
         if ok:
-            state["cash"] = bot.cash; state["shares"] = bot.shares
-            state["wins"] = bot.wins; state["losses"] = bot.losses
             t = bot.trades[-1]
-            state["trades"].append({"date": str(t["date"]), "action": t["action"],
-                                     "price": round(t["price"], 2), "qty": t["qty"],
-                                     "value": round(t["value"], 2), "reason": t["reason"],
-                                     "pnl": round(t.get("pnl", 0), 2)})
-            print(f"ISLEM: {action} @ {price:.2f}")
+            extras = {}
+            if t["action"] == "SAT":
+                extras = trade_extras(bot, price, t.get("pnl") or 0,
+                                      prev_cost or 0, last["Date"])
+            elif t["action"] == "AL":
+                bot._entry_high = t["price"]
+                bot._entry_low = t["price"]
+                bot._entry_ts = n.isoformat(timespec="seconds")
 
+            traded = {"date": str(t["date"]), "ts": n.isoformat(timespec="seconds"),
+                      "action": t["action"], "price": round(t["price"], 2), "qty": t["qty"],
+                      "value": round(t["value"], 2), "reason": t["reason"],
+                      "pnl": round(t.get("pnl") or 0, 2)}
+            traded.update(extras)
+            state["trades"].append(traded)
+            log.info("ISLEM: %s @ %.2f", t["action"], price)
+
+            # v12: Telegram bildirimi
+            try:
+                extra_txt = ""
+                if "ret_pct" in extras and extras.get("ret_pct") is not None:
+                    extra_txt = f" | PnL: {extras['ret_pct']:+.2f}%"
+                notify_send(f"🤖 {SYMBOL} {t['action']}\n"
+                            f"Fiyat: {t['price']:.2f} TL\n"
+                            f"Adet: {t['qty']}{extra_txt}\n"
+                            f"Usta: %{gs*100:.0f}\n"
+                            f"Portfoy: {bot.value(price):,.0f} TL")
+            except Exception as e:
+                log.warning("notify atlandi: %s", e)
+
+        try:
+            bot.train(3, 32)
+        except Exception as e:
+            log.warning("train atlandi: %s", e)
+
+    # durum guncelle
+    value = float(bot.value(price))
+    state.update(cash=bot.cash, shares=bot.shares, wins=bot.wins, losses=bot.losses,
+                 entry_price=bot.entry_price, entry_cost=bot.entry_cost,
+                 entry_high=getattr(bot, "_entry_high", None),
+                 entry_low=getattr(bot, "_entry_low", None),
+                 entry_ts=getattr(bot, "_entry_ts", None))
+    state["peak_value"] = max(state["peak_value"], value)
+    state["trades"] = state["trades"][-MAX_TRADES:]
     state["last_run"] = n.strftime("%Y-%m-%d %H:%M")
-    state["generation"] = state.get("generation", 0) + 1
+    state["generation"] += 1
+    state["last_price"], state["last_action"] = round(price, 2), action
+    if tradeable:
+        state["equity"].append({"ts": n.isoformat(timespec="minutes"),
+                                "value": round(value, 2), "price": round(price, 2)})
+        state["equity"] = state["equity"][-MAX_EQUITY:]
 
-    # Oneri motoru
+    # oneri motoru (v12: GitHub token varsa API ile de calisir)
     try:
-        imp = SelfImprover(state)
+        imp = SelfImprover(state,
+                           gh_token=os.getenv("GITHUB_TOKEN"),
+                           gh_repo=os.getenv("GITHUB_REPOSITORY", "devrantogtay0-blip/thyao_bot"))
         applied = imp.apply_approved_to_state()
-        if applied: print(f"Uygulanan oneriler: {applied}")
+        if applied:
+            log.info("Uygulanan oneriler: %s", applied)
         new = imp.analyze()
-        if new: print(f"{len(new)} yeni oneri")
+        if new:
+            log.info("%d yeni oneri", len(new))
     except Exception as e:
-        print(f"SelfImprove: {e}")
+        log.warning("SelfImprove: %s", e)
+
+    if args.dry_run:
+        log.info("DRY-RUN: dosyalara yazilmadi | Portfoy: %s TL", f"{value:,.0f}")
+        return 0
 
     save_state(state)
-    print(f"Portfoy: {bot.value(price):,.0f} TL")
+    try:
+        atomic_write(BOT_FILE, lambda f: pickle.dump(bot, f), "wb")
+    except Exception as e:
+        log.warning("Bot kaydedilemedi: %s", e)
+
+    ret = (value / state["initial"] - 1) * 100
+    log.info("Portfoy: %s TL (%+.2f%%)", f"{value:,.0f}", ret)
+    gh_summary(f"**{SYMBOL}** {price:.2f} | karar `{action}` | "
+               f"{'islem: ' + traded['action'] if traded else 'islem yok'} | "
+               f"portfoy {value:,.0f} TL ({ret:+.2f}%)")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
