@@ -16,6 +16,12 @@ from ai_brain import (BILGI, bilgi_ara, guru_score, guru_details, EnsemblePredic
 from self_improve import SelfImprover
 from indicators import add_ind
 
+try:
+    from analytics import perf, trade_stats, daily_curve, bootstrap_mean, perm_pvalue
+    HAS_ANALYTICS = True
+except ImportError:
+    HAS_ANALYTICS = False
+
 st.set_page_config(page_title="THYAO AI v11", page_icon="🧠", layout="wide")
 st.title("🧠 THYAO AI Trader v11")
 st.caption("Sinir Agi + Arena + Meta-Evrim + Yari-Otonom Oneri + 25 Usta  |  "
@@ -299,8 +305,9 @@ if auto_msgs:
     st.info(" | ".join(auto_msgs[:4]))
 
 tabs = st.tabs(["📈 Grafik", "🏟️ Arena", "🧠 NN", "🧬 Genetik", "🔬 Meta", "💭 Yansima",
-                "🔮 Tahmin", "📊 Ensemble", "📚 Bilgi", "📜 Islemler", "📋 Oneriler"])
-(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10) = tabs
+                "🔮 Tahmin", "📊 Ensemble", "📚 Bilgi", "📜 Islemler", "📋 Oneriler",
+                "📉 Analiz"])
+(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11) = tabs
 
 with t0:
     n_show = st.select_slider("Gun", options=[60, 120, 180, 250, 400], value=180)
@@ -360,7 +367,7 @@ with t2:
     pt = book.get("pretrain")
     if pt:
         st.caption(f"On-egitim: {pt['n']} ornek | dogrulama dogrulugu %{pt['val_acc']*100:.0f} "
-                   f"(taban %{pt['baseline']*100:.0f}). Tabana yakinsa ogrenilmis bir avantaj yok demektir.")
+                   f"(taban %{pt['baseline']*100:.0f})")
     if champion.nn.loss_history:
         st.line_chart(pd.DataFrame({"Loss": champion.nn.loss_history[-500:]}))
     a, p, f = decisions[champion.name]
@@ -484,11 +491,104 @@ with t10:
         if approved:
             st.subheader(f"Onaylanan ({len(approved)})")
             st.dataframe(pd.DataFrame([{"ID": p["id"], "Tip": p.get("tip"), "Baslik": p["baslik"],
-                                        "Durum": p.get("durum"), "Tarih": p.get("onay_tarih", "-")} for p in approved[-10:]]),
+                                        "Durum": p.get("durum"), "Tarih": p.get("onay_tarih", "-")}
+                                       for p in approved[-10:]]),
                          use_container_width=True, hide_index=True)
-            st.caption("Onaylananlar botun sonraki calismasinda state'e yazilir ve 'uygulandi' olur.")
     except Exception as e:
         st.error(f"Hata: {e}")
+
+with t11:
+    st.subheader("📉 Performans ve İstatistiksel Anlamlılık")
+    if not HAS_ANALYTICS:
+        st.warning("analytics.py yuklu degil. Once o dosyayi ekle.")
+    else:
+        remote = get_remote_state()
+        equity = remote.get("equity") or []
+        trades = remote.get("trades") or []
+
+        if not equity and not trades:
+            st.info("Henuz GitHub Actions verisi yok. Ilk calismayi bekle.")
+        else:
+            curve = daily_curve(equity)
+            st.markdown("### 📊 Varlık Eğrisi Metrikleri")
+            p = perf(curve) if curve else None
+            if p:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Toplam Getiri", f"%{p['toplam_pct']}")
+                c2.metric("CAGR", f"%{p['cagr_pct']}" if p['cagr_pct'] is not None else "-")
+                c3.metric("Sharpe", p['sharpe'] if p['sharpe'] is not None else "-")
+                c4.metric("Sortino", p['sortino'] if p['sortino'] is not None else "-")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Volatilite (yillik)", f"%{p['vol_pct']}")
+                c2.metric("Max Drawdown", f"%{p['maxdd_pct']}")
+                c3.metric("Calmar", p['calmar'] if p['calmar'] is not None else "-")
+                c4.metric("Gun", p['gun'])
+                with st.expander("Ham veri"):
+                    st.json(p)
+            else:
+                st.info("Yeterli equity verisi yok (en az 3 gun gerekli).")
+
+            st.divider()
+            st.markdown("### 💰 İşlem İstatistikleri")
+            ts = trade_stats(trades)
+            if ts:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("İşlem", ts["islem"])
+                c2.metric("Kazanma %", f"%{ts['kazanma_pct']}")
+                c3.metric("Kar Faktörü", ts["kar_faktoru"] if ts["kar_faktoru"] is not None else "-")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Beklenti (TL)", ts["beklenti_tl"])
+                c2.metric("Beklenti %", f"%{ts['beklenti_pct']}" if ts['beklenti_pct'] is not None else "-")
+                c3.metric("Ort. Kazanç (TL)", ts["ort_kazanc_tl"])
+                c4.metric("Ort. Kayıp (TL)", ts["ort_kayip_tl"])
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Ödeme Oranı", ts["odeme_orani"] if ts["odeme_orani"] is not None else "-")
+                c2.metric("Ort. Tutma (gün)", ts["ort_tutma_gun"] if ts["ort_tutma_gun"] is not None else "-")
+                c3.metric("Maks. Üst Üste Zarar", ts["maks_ust_uste_zarar"])
+                c1, c2 = st.columns(2)
+                c1.metric("Ort. MAE %", ts["ort_mae_pct"] if ts["ort_mae_pct"] is not None else "-")
+                c2.metric("Ort. MFE %", ts["ort_mfe_pct"] if ts["ort_mfe_pct"] is not None else "-")
+                st.caption("MAE: pozisyon açıkken görülen en kötü kayıp. MFE: en iyi kâr.")
+            else:
+                st.info("Henuz kapanmis islem yok.")
+
+            st.divider()
+            st.markdown("### 🎲 Bootstrap Güven Aralığı")
+            if len(curve) >= 10:
+                rets = np.diff(curve) / curve[:-1]
+                bs = bootstrap_mean(rets, block=5, seed=42)
+                if bs:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Ort. Günlük Getiri", f"{bs['mean']*100:.3f}%")
+                    c2.metric("%10-%90 CI", f"[{bs['lo']*100:.3f}%, {bs['hi']*100:.3f}%]")
+                    c3.metric("P(pozitif)", f"%{bs['p_pos']*100:.1f}")
+                    if bs["p_pos"] > 0.6:
+                        st.success("Güven aralığının çoğu pozitif — strateji muhtemelen gerçek edge taşıyor.")
+                    elif bs["p_pos"] > 0.4:
+                        st.warning("Sonuçlar kararsız — daha fazla veri lazım.")
+                    else:
+                        st.error("Günlük getiri büyük olasılıkla negatif — strateji şu an para kaybediyor.")
+            else:
+                st.info("Bootstrap için en az 10 gün gerekli.")
+
+            st.divider()
+            st.markdown("### 🧪 Permütasyon Testi")
+            if len(curve) >= 50:
+                rets = np.diff(curve) / curve[:-1]
+                pos = np.where(rets > 0, 1.0, 0.0)
+                pp = perm_pvalue(pos, rets, seed=7)
+                if pp:
+                    c1, c2 = st.columns(2)
+                    c1.metric("Gözlenen Ort. Getiri", f"{pp['obs']*100:.4f}%")
+                    c2.metric("p-değeri", f"{pp['p']:.3f}")
+                    if pp["p"] < 0.05:
+                        st.success(f"p={pp['p']:.3f} < 0.05 → Bu sonuç tesadüf olma ihtimali düşük. **İstatistiksel olarak anlamlı.**")
+                    elif pp["p"] < 0.10:
+                        st.warning(f"p={pp['p']:.3f} → SınırdA. Daha fazla veri topla.")
+                    else:
+                        st.error(f"p={pp['p']:.3f} → Sonuç tesadüfi olabilir.")
+            else:
+                st.info("Permütasyon testi için en az 50 gün gerekli.")
 
 st.divider()
 st.caption(f"{now_tr():%Y-%m-%d %H:%M:%S} - Borsa: {'ACIK' if market_open() else 'KAPALI'}")
