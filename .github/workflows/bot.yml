@@ -2,7 +2,7 @@ name: THYAO Bot
 
 on:
   schedule:
-    - cron: '*/15 7-14 * * 1-5'
+    - cron: '*/15 7-15 * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -20,23 +21,15 @@ jobs:
           cache: 'pip'
 
       - name: Install
-        run: pip install -r requirements.txt
+        run: pip install yfinance pandas numpy
 
       - name: Run bot
         run: python bot.py
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PROPOSALS_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROPOSALS_GH_REPO: ${{ github.repository }}
-          PROPOSALS_GH_BRANCH: main
 
       - name: Save state
         run: |
           git config user.name "thyao-bot"
           git config user.email "bot@thyao.local"
-          git add state.json
-          git add bot.pkl || true
-          git add proposals.json || true
-          git diff --staged --quiet || git commit -m "Bot: $(date -u +'%Y-%m-%d %H:%M') [skip ci]"
+          git add state_v25.pkl bot_v25.db || true
+          git diff --staged --quiet || git commit -m "Bot: $(date -u +'%Y-%m-%d %H:%M')"
           git push
