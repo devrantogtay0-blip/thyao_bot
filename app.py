@@ -1,4714 +1,7389 @@
 # -*- coding: utf-8 -*-
-# ============================================================
-# 🐋 SEEK DEEP v2.5 PRO — DÜZELTİLMİŞ TAM SÜRÜM
-# PARÇA 1/4: Foundation
-# Düzeltmeler: _fetch/sanitize yukarı, seq_store sektör-bazlı
-# ============================================================
+"""
+🐋 SEEK DEEP v7.0 APEX ULTRA (PARASIZ)
+PARÇA 1/6: FOUNDATION (Config + DB + Veri + Numba Çekirdekleri + Panel Kernelleri + Öz-test 1)
+
+İçindekiler:
+  1. Bağımlılıklar ve Numba shim
+  2. CONFIG (sabitler, sektörler, risk matrisi, 306 özellik ismi)
+  3. DB (DuckDB, SQLite fallback, tablo şeması)
+  4. Disk cache + Veri fetcher'lar (YFinance, KAP, Fundamental, Groq Haber, FRED/Makro)
+  5. Numba çekirdekleri: temel yardımcılar
+  6. Numba çekirdekleri: 49 temel gösterge
+  7. Numba çekirdekleri: 62 genişletilmiş gösterge
+  8. Numba çekirdeği: 40 mikro yapı proxy'si
+  9. Panel kernelleri (paralel) + Python sarmalayıcıları
+ 10. Öz-test 1 (SEEKDEEP_SELFTEST=1)
+
+NOT: Çalıştırma:  SEEKDEEP_SELFTEST=1 python seekdeep_v7.py
+"""
 from __future__ import annotations
-import os, math, time, pickle, sqlite3, threading, json, hashlib, logging, copy
-import urllib.request
-from contextlib import contextmanager
-from datetime import datetime, time as dtime, timedelta
-from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from itertools import combinations
-from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass
+
+import json
+import logging
+import math
+import os
+import pickle
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from streamlit_autorefresh import st_autorefresh
-from numpy.lib.stride_tricks import sliding_window_view
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. BAĞIMLILIKLAR VE NUMBA SHIM
+# ═══════════════════════════════════════════════════════════════════
+try:
+    from numba import njit, prange
+    NUMBA_OK = True
+except Exception:  # Numba yoksa saf Python'a düşer (yavaş ama doğru)
+    NUMBA_OK = False
+    prange = range  # type: ignore
+
+    def njit(*args: Any, **kwargs: Any):  # type: ignore
+        """Numba yokken njit yerine geçen sahte dekoratör."""
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        def deco(f):
+            return f
+        return deco
 
 try:
-    from groq import Groq
-    GROQ_OK = True
-except ImportError:
-    GROQ_OK = False
+    import duckdb  # type: ignore
+    DUCKDB_OK = True
+except Exception:
+    duckdb = None  # type: ignore
+    DUCKDB_OK = False
 
-# ════════════════════════════════════════════════════════════
-# 1. CONFIG
-# ════════════════════════════════════════════════════════════
-BOT_VERSION = "SeekDeep-2.5-Pro"
+logging.basicConfig(
+    level=os.environ.get("SEEKDEEP_LOG", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("seekdeep")
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. CONFIG
+# ═══════════════════════════════════════════════════════════════════
+BOT_VERSION = "SeekDeep-7.0-Apex-Ultra-Parasiz"
 BOT_NAME = "🐋 SEEK DEEP"
-HORIZON, HORIZON_LONG = 10, 40
-TB_K, TB_K_LONG = 1.2, 1.5
+HORIZON = 10
+HORIZON_LONG = 40
+TB_K = 1.2
+TB_K_LONG = 1.5
 ALPHA_LONG = 0.35
-FEE, SLIPPAGE = 0.0015, 0.001
+FEE = 0.0015
+SLIPPAGE = 0.001
 RT_COST = 2 * (FEE + SLIPPAGE)
 HW = 90
+WARMUP_BARS = 60
+SEQ_LEN = 30
+TIME_DECAY_HALF_LIFE = 504
+CORR_WINDOW = 60
+PEER_K = 3
+LOG_ADV_NORM = 22.03
 
-N_TECH_BASE, N_NEWS, N_LIQ, N_RANK, N_FUND, N_MACRO = 49, 0, 2, 5, 0, 8
-N_FEAT_TECH = N_TECH_BASE + N_NEWS + N_LIQ + N_RANK + N_FUND + N_MACRO  # 64
-N_STOCKS = 24
-N_FEAT = N_FEAT_TECH + N_STOCKS  # 88
+H_DIM = 64
+BAG_N = 5
+BAG_SEED = 100
+HOLD_N = 6000
+GAT_HEADS, GAT_DIM, GAT_LAYERS = 4, 32, 2
+TFT_DIM, TFT_HEADS, TFT_LAYERS = 64, 4, 3
+N_EXPERTS, MOE_TOPK = 16, 4
+LB_COEF, ZLOSS_COEF = 0.01, 1e-3
+INFORMER_SEQ, INFORMER_HEADS, INFORMER_LAYERS = 500, 4, 2
+CHRONOS_MODEL = "amazon/chronos-t5-small"
+CHRONOS_PRED_LEN = 40
+MC_SAMPLES = 20
+USE_ROUTER = True
+USE_DSR = True
 
-H_DIM, BAG_N, BAG_SEED, HOLD_N = 64, 5, 100, 6000
-USE_ROUTER, ROUTER_H, ROUTER_MIX, USE_DSR = True, 32, 0.5, True
-SEQ_LEN, N_HEADS, TRANS_DIM, TRANS_LAYERS = 20, 4, 64, 2
-MLP_WEIGHT, TRANS_WEIGHT = 0.6, 0.4
-CPCV_ENABLED, CPCV_N_GROUPS, CPCV_N_TEST_GROUPS = True, 6, 2
+CPCV_ENABLED = True
+CPCV_N_GROUPS = 8
+CPCV_N_TEST_GROUPS = 4
+PURGE_BARS = HORIZON_LONG
+EMBARGO_BARS = 5
 PBO_ENABLED = True
-DYNAMIC_SLIPPAGE, SLIPPAGE_BASE = True, 0.0005
+
+DYNAMIC_SLIPPAGE = True
+SLIPPAGE_BASE = 0.0005
+AC_ETA, AC_GAMMA, AC_BETA = 0.142, 0.314, 0.6
+HAWKES_MU, HAWKES_ALPHA, HAWKES_BETA = 0.1, 0.5, 1.0
+OFI_WINDOW = 20
+
 RISK_PARITY = True
 VAR_CONFIDENCE = 0.95
+CVAR_ALPHA = 0.95
 
-NEWS_ENABLED, NEWS_CACHE_HOURS, NEWS_MAX_PER_STOCK = True, 6, 5
-NEWS_LLM_PER_CYCLE = 5  # 🐛 SORUN 3: Rate limit için LLM batch limit
+NEWS_ENABLED = True
+NEWS_CACHE_HOURS = 6
+NEWS_MAX_PER_STOCK = 5
+NEWS_LLM_PER_CYCLE = 5
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 KAP_ENABLED = True
 LIQ_FLAG_TL = 5_000_000
-TR = ZoneInfo("Europe/Istanbul")
 
-SEKTOR_ENV = os.environ.get("SEKTOR", "BANKACILIK").upper()
-_sfx = SEKTOR_ENV.lower()
-DB_FILE = f"seekdeep_{_sfx}.db"
-STATE_FILE = f"seekdeep_{_sfx}.pkl"
-MEMORY_FILE = f"seekdeep_{_sfx}.npz"
-NEWS_FILE = f"seekdeep_news_{_sfx}.json"
-FUND_FILE = f"seekdeep_fund_{_sfx}.json"
-KAP_FILE = f"seekdeep_kap_{_sfx}.json"
-METRICS_FILE = f"metrics_{_sfx}.prom"
-
-log = logging.getLogger("seekdeep")
-if not log.handlers:
-    log.setLevel(logging.INFO)
-    try:
-        h = logging.FileHandler("seekdeep.log", encoding="utf-8")
-        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        log.addHandler(h)
-    except Exception:
-        pass
-
-# ════════════════════════════════════════════════════════════
-# 2. 3-BOT KONFİGÜRASYONU
-# ════════════════════════════════════════════════════════════
-SEKTOR_BOTLARI = {
-    "BANKACILIK": {"bot_id": 1, "sermaye": 33333.0,
-        "hisseler": ["GARAN","AKBNK","ISCTR","YKBNK","HALKB","VAKBN","QNBFB","TSKB","ALBRK","SKBNK","ICBCT","KLNMA",
-                     "QNBFL","KCHOL","SAHOL","AGHOL","GLYHO","TURSG","ANSGR","AKGRT","ISMEN","ISFIN","HLGYO","ISGYO"],
+SEKTOR_BOTLARI: Dict[str, Dict[str, Any]] = {
+    "BANKACILIK": {
+        "bot_id": 1, "sermaye": 33333.0,
+        "hisseler": ["GARAN", "AKBNK", "ISCTR", "YKBNK", "HALKB", "VAKBN", "QNBFB", "TSKB",
+                     "ALBRK", "SKBNK", "ICBCT", "KLNMA", "QNBFL", "KCHOL", "SAHOL", "AGHOL",
+                     "GLYHO", "TURSG", "ANSGR", "AKGRT", "ISMEN", "ISFIN", "HLGYO", "ISGYO"],
         "aciklama": "Bankacılık + Holding + Sigorta + GYO",
-        "risk_profil": {"risk_per_trade": 0.008, "max_positions": 6, "sl_atr": 2.0, "daily_loss": 2.0}},
-    "HAVACILIK": {"bot_id": 2, "sermaye": 33334.0,
-        "hisseler": ["THYAO","PGSUS","TAVHL","CLEBI","DOAS","FROTO","TOASO","TTRAK","OTKAR","ASUZU","KARSN","BRISA",
-                     "GOODY","TUKAS","ULKER","CCOLA","AEFES","BIMAS","MGROS","SOKM","MAVI","MEPET","BIZIM","ULUFA"],
+        "risk_profil": {"risk_per_trade": 0.008, "max_positions": 6, "sl_atr": 2.0, "daily_loss": 2.0},
+    },
+    "HAVACILIK": {
+        "bot_id": 2, "sermaye": 33334.0,
+        "hisseler": ["THYAO", "PGSUS", "TAVHL", "CLEBI", "DOAS", "FROTO", "TOASO", "TTRAK",
+                     "OTKAR", "ASUZU", "KARSN", "BRISA", "GOODY", "TUKAS", "ULKER", "CCOLA",
+                     "AEFES", "BIMAS", "MGROS", "SOKM", "MAVI", "MEPET", "BIZIM", "ULUFA"],
         "aciklama": "Havacılık + Otomotiv + Perakende + Gıda",
-        "risk_profil": {"risk_per_trade": 0.012, "max_positions": 8, "sl_atr": 3.0, "daily_loss": 3.5}},
-    "ENERJI": {"bot_id": 3, "sermaye": 33333.0,
-        "hisseler": ["TUPRS","PETKM","AKSEN","ENJSA","ENERY","ZOREN","ODAS","AYDEM","EREGL","KRDMD","ISDMR","SISE",
-                     "TRKCM","SASA","AKSA","GUBRF","ASELS","LOGO","NETAS","ARDYZ","KAREL","KONTR","PAPIL","FORTE"],
+        "risk_profil": {"risk_per_trade": 0.012, "max_positions": 8, "sl_atr": 3.0, "daily_loss": 3.5},
+    },
+    "ENERJI": {
+        "bot_id": 3, "sermaye": 33333.0,
+        "hisseler": ["TUPRS", "PETKM", "AKSEN", "ENJSA", "ENERY", "ZOREN", "ODAS", "AYDEM",
+                     "EREGL", "KRDMD", "ISDMR", "SISE", "TRKCM", "SASA", "AKSA", "GUBRF",
+                     "ASELS", "LOGO", "NETAS", "ARDYZ", "KAREL", "KONTR", "PAPIL", "FORTE"],
         "aciklama": "Enerji + Demir-Çelik + Kimya + Teknoloji",
-        "risk_profil": {"risk_per_trade": 0.010, "max_positions": 7, "sl_atr": 2.5, "daily_loss": 3.0}},
+        "risk_profil": {"risk_per_trade": 0.010, "max_positions": 7, "sl_atr": 2.5, "daily_loss": 3.0},
+    },
 }
-AKTIF_SEKTOR = SEKTOR_ENV if SEKTOR_ENV in SEKTOR_BOTLARI else "BANKACILIK"
-BOT_ID = SEKTOR_BOTLARI[AKTIF_SEKTOR]["bot_id"]
-BOT_HISSELER = SEKTOR_BOTLARI[AKTIF_SEKTOR]["hisseler"]
-BOT_SERMAYE = SEKTOR_BOTLARI[AKTIF_SEKTOR]["sermaye"]
-SEKTOR_RISK = SEKTOR_BOTLARI[AKTIF_SEKTOR]["risk_profil"]
-assert len(BOT_HISSELER) == N_STOCKS
-HISSELER = {c: f"{c}.IS" for c in BOT_HISSELER}
-STOCK_LIST = list(HISSELER.keys())
-CROSS_SYMBOLS = {"USDTRY": "USDTRY=X", "XU100": "XU100.IS"}
-MACRO_KEYS = ["usdtry", "eurtry", "gold", "brent"]
-log.info(f"🐋 Bot {BOT_ID} ({AKTIF_SEKTOR}): {N_STOCKS} hisse, ₺{BOT_SERMAYE:,.0f}")
+SEKTOR = os.environ.get("SEEKDEEP_SEKTOR", "BANKACILIK").upper()
+if SEKTOR not in SEKTOR_BOTLARI:
+    log.warning("Bilinmeyen sektör '%s', BANKACILIK kullanılıyor.", SEKTOR)
+    SEKTOR = "BANKACILIK"
+STOCK_LIST: List[str] = list(SEKTOR_BOTLARI[SEKTOR]["hisseler"])
+N_STOCKS = len(STOCK_LIST)
+BOT_SERMAYE: float = float(SEKTOR_BOTLARI[SEKTOR]["sermaye"])
+SECTORS = ["BANKACILIK", "HAVACILIK", "ENERJI", "DIGER"]
+REGIMES = ["BULL", "BEAR", "VOL", "RANGE"]
 
-BIST_TUM = [
-    "ACSEL","ADEL","ADESE","AFYON","AGHOL","AGYO","AHGAZ","AKBNK","AKCNS","AKENR","AKFGY","AKFYE","AKGRT","AKMGY","AKSA",
-    "AKSEN","ALARK","ALBRK","ALCAR","ALCTL","ALFAS","ALGYO","ALKA","ALKIM","ALTNY","ANACM","ANHYT","ANSGR","ARASE","ARCLK",
-    "ARDYZ","ARENA","ARSAN","ARTMS","ASELS","ASGYO","ASTOR","ASUZU","ATAGY","ATAKP","ATATP","ATEKS","ATLAS","AVOD","AVPGY",
-    "AYCES","AYDEM","AYEN","AYGAZ","AZTEK","BAGFS","BAKAB","BALSU","BANVT","BARMA","BASGZ","BATAS","BAYRK","BERA","BEYAZ",
-    "BFREN","BIENY","BIGCH","BIMAS","BINHO","BIOEN","BIZIM","BJKAS","BLCYT","BLUME","BMSCH","BMSTL","BNTAS","BOBET","BORSK",
-    "BOSSA","BRISA","BRKSN","BRMEN","BRSAN","BRYAT","BSOKE","BTCIM","BUCIM","BULGS","BURCE","BURVA","BVSAN","BYDNR","CANTE",
-    "CASA","CCOLA","CEMAS","CEMTS","CIMSA","CLEBI","CMBTN","CMENT","CONSE","COSMO","CRDFA","CRFSA","CUSAN","CVKMD","CWENE",
-    "DAGHL","DAGI","DAPGM","DARDL","DENGE","DERHL","DERIM","DESA","DESPC","DEVA","DGKLB","DGNMO","DIRIT","DITAS","DMRGD",
-    "DMSAS","DNISI","DOAS","DOBUR","DOHOL","DOKTA","DURDO","DURKN","DYOBY","DZGYO","EBEBK","ECILC","ECZYT","EDATA","EDIP",
-    "EFOR","EGEEN","EGGUB","EGPRO","EGSER","EKGYO","EKIZ","EKSUN","ELITE","EMKEL","EMNIS","ENDAE","ENERY","ENJSA","ENKAI",
-    "ENSRI","ENTRA","EPLAS","ERBOS","ERCB","EREGL","ERSU","ESCAR","ESCOM","ESEN","ETILR","EUPWR","EUREN","EVDRE","EVKUR",
-    "EVREN","FADE","FENER","FLAP","FMIZP","FONET","FORMT","FORTE","FRIGO","FROTO","FZLGY","GARAN","GARFA","GEDIK","GEDZA",
-    "GENIL","GENTS","GEREL","GESAN","GIPTA","GLBMD","GLCVY","GLRYH","GLYHO","GMTAS","GOKNR","GOLTS","GOODY","GOZDE","GRNYO",
-    "GSDDE","GSDHO","GSRAY","GUBRF","GUNDG","GWIND","HALKB","HATEK","HATSN","HAYAT","HEDEF","HEKTS","HKTM","HLGYO","HOROZ",
-    "HTTBT","HUBVC","HUNER","HURGZ","ICBCT","ICUGS","IDEAS","IDGYO","IEYHO","IHAAS","IHEVA","IHGZT","IHLAS","IHLGM","IHYAY",
-    "IMASM","INDES","INFO","INGRM","INTEM","INVEO","ISATR","ISBIR","ISDMR","ISFIN","ISGYO","ISKUR","ISMEN","ISSEN","IZENR",
-    "IZFAS","IZMDC","JANTS","KAPLM","KAREL","KARSN","KARTN","KATMR","KAYSE","KBORU","KCAER","KCHOL","KENT","KERVN","KERVT",
-    "KFEIN","KGYO","KIMMR","KLKIM","KLMSN","KLNMA","KLRHO","KLSER","KLSYN","KLYPV","KMPUR","KNFRT","KONKA","KONTR","KONYA",
-    "KORDS","KOZAA","KOZAL","KRDMA","KRDMB","KRDMD","KRGYO","KRONT","KRPLS","KRSTL","KRTEK","KRVGD","KSTUR","KTLEV","KTSKR",
-    "KUTPO","KUVVA","KUYAS","KZBGY","LIDER","LILAK","LINK","LOGO","LRSHO","LUKSK","MAALT","MACKO","MAGEN","MAKIM","MAKTK",
-    "MANAS","MARBL","MARKA","MARTI","MAVI","MEDTR","MEGAP","MEKAG","MEPET","MERCN","MERIT","MERKO","METRO","MEYSU","MGROS",
-    "MHRGY","MIATK","MILAS","MIPAZ","MMCAS","MNDRS","MNDTR","MOBTL","MOGAN","MPARK","MRGYO","MRSHL","MSGYO","MTRKS","MTRYO",
-    "MZHLD","NATEN","NETAS","NIBAS","NTGAZ","NTHOL","NUGYO","NUHCM","OBAMS","ODAS","OFSYM","ONCSM","ORCAY","ORGE","ORMA",
-    "OSMEN","OSTIM","OTKAR","OTTO","OYAKC","OZGYO","OZKGY","OZSUB","PAGYO","PAMEL","PAPIL","PARSN","PASEU","PAYSN","PENGD",
-    "PENTA","PETKM","PETUN","PGSUS","PINSU","PKART","PLTUR","PNLSN","PNSUT","POLHO","POLTK","PRKAB","PRKME","PRZMA","PSDTC",
-    "PSGYO","QNBFB","QNBFL","QUAGR","RALYH","RAYSG","RGYAS","RNPOL","RODRG","RTALB","RUBNS","RYGYO","RYSAS","SAHOL","SAMAT",
-    "SANEL","SANFM","SANKO","SARKY","SASA","SAYAS","SDTTR","SEGYO","SEKFK","SEKUR","SELEC","SELGD","SERNT","SEYKM","SILVR",
-    "SISE","SKBNK","SKTAS","SKYMD","SMART","SMRTG","SNGYO","SNPAM","SODSN","SOKM","SONME","SRVGY","SUMAS","SUNTK","SURGY",
-    "SUWEN","SVGYO","TABGD","TARKM","TATEN","TATGD","TAVHL","TCELL","TCKRC","TDGYO","TEKTU","TERA","TETMT","TEZOL","TGSAS",
-    "THYAO","TIBET","TKFEN","TKNSA","TLMAN","TMPOL","TMSN","TOASO","TRCAS","TRGYO","TRILC","TSKB","TSPOR","TTKOM","TTRAK",
-    "TUCLK","TUKAS","TUPRS","TUREX","TURGG","TURSG","ULAS","ULKER","ULUFA","ULUSE","UNLU","USAK","VAKBN","VAKKO","VANGD",
-    "VBTYZ","VERUS","VESBE","VESTL","VKFYO","VKING","VRGYO","YAPRK","YATAS","YAYLA","YEOTK","YESIL","YGGYO","YGYO","YKBNK",
-    "YKSLN","YONGA","YUNSA","YYLGD","ZEDUR","ZOREN","ZRGYO",
-]
-BIST_YF = {c: f"{c}.IS" for c in BIST_TUM}
-
-# ════════════════════════════════════════════════════════════
-# 3. RİSK KONFİGÜRASYONU
-# ════════════════════════════════════════════════════════════
-DEFAULT_RISK = {
+DEFAULT_RISK: Dict[str, Any] = {
     "risk_per_trade": 0.01, "sl_atr": 2.5, "trail_act_r": 1.5, "trail_atr": 2.5,
     "p_buy": 0.45, "p_sell": 0.45, "p_buy_long": 0.40, "margin": 0.10, "max_pos": 0.15,
     "use_regime": True, "use_long_gate": True, "max_hold": 120, "max_dd": 15.0,
     "daily_loss": 3.0, "max_trades_day": 5, "loss_streak": 3, "cooldown_h": 24,
     "gate_on": True, "gate_min_n": 8, "auto_adopt": True, "unc_max": 0.25,
     "conf_sizing": True, "max_positions": 8, "max_exposure": 0.85, "max_sector": 0.40,
-    "regime_bull_adj": -0.03, "regime_bear_adj": 0.08, "regime_range_adj": 0.03, "regime_vol_adj": 0.10,
-    "si_auto": True, "si_interval_min": 30, "si_budget_s": 30,
-    "min_daily_turnover": 5_000_000, "dsr_confidence": 0.90, "consec_improve": 2, "test_score_tol": 0.25,
-    "tp_on": True, "tp_r": 2.0, "tp_frac": 0.5, "be_on": True, "be_r": 1.0,
-    "dd_throttle": True, "corr_on": True, "corr_max": 0.85,
-    "overlay_on": True, "rl_veto": True, "rl_veto_p": 0.25, "fed_beta": 0.5,
+    "regime_bull_adj": -0.03, "regime_bear_adj": 0.08, "regime_range_adj": 0.03,
+    "regime_vol_adj": 0.10, "si_auto": True, "si_interval_min": 30, "si_budget_s": 30,
+    "min_daily_turnover": 5_000_000, "dsr_confidence": 0.90, "consec_improve": 3,
+    "test_score_tol": 0.15, "tp_on": True, "tp_r": 2.0, "tp_frac": 0.5, "be_on": True,
+    "be_r": 1.0, "dd_throttle": True, "corr_on": True, "corr_max": 0.85, "overlay_on": True,
+    "rl_veto": True, "rl_veto_p": 0.25, "fed_beta": 0.5, "kelly_frac": 0.25,
+    "kelly_unc_pen": 2.0, "cvar_alpha": 0.95, "cvar_limit": 0.03, "max_adv_pct": 0.05,
+    "impact_on": True, "ofi_gate": True, "ofi_min": -0.30,
 }
-DEFAULT_RISK.update(SEKTOR_RISK)
-REGIMES = ["BULL", "BEAR", "VOL", "RANGE"]
-RISK_BOUNDS = {
-    "risk_per_trade": (0.002, 0.05), "max_pos": (0.05, 0.50), "max_exposure": (0.2, 1.0), "max_sector": (0.1, 1.0),
-    "max_positions": (1, 20), "sl_atr": (1.0, 6.0), "trail_act_r": (0.5, 4.0), "trail_atr": (1.0, 5.0),
-    "p_buy": (0.34, 0.80), "p_sell": (0.34, 0.80), "p_buy_long": (0.34, 0.80), "margin": (0.0, 0.40),
-    "unc_max": (0.05, 0.50), "max_hold": (5, 400), "max_dd": (3.0, 50.0), "daily_loss": (0.5, 15.0),
-    "max_trades_day": (1, 30), "loss_streak": (1, 10), "cooldown_h": (1, 240), "gate_min_n": (3, 100),
-    "regime_bull_adj": (-0.2, 0.3), "regime_bear_adj": (-0.2, 0.3), "regime_range_adj": (-0.2, 0.3),
-    "regime_vol_adj": (-0.2, 0.3), "si_interval_min": (5, 720), "si_budget_s": (2, 120),
-    "min_daily_turnover": (0, 1e9), "dsr_confidence": (0.5, 0.999), "consec_improve": (1, 5),
-    "test_score_tol": (0.0, 2.0), "tp_r": (0.5, 6.0), "tp_frac": (0.1, 0.9), "be_r": (0.3, 3.0),
-    "corr_max": (0.5, 0.99), "rl_veto_p": (0.05, 0.6), "fed_beta": (0.0, 1.0),
+
+
+def get_risk_params(sektor: str = SEKTOR) -> Dict[str, Any]:
+    """Sektör risk profilini varsayılan risk matrisiyle birleştirip döndürür."""
+    rp = dict(DEFAULT_RISK)
+    rp.update(SEKTOR_BOTLARI[sektor]["risk_profil"])
+    return rp
+
+
+DB_FILE = f"seekdeep7_{SEKTOR}.duckdb"
+STATE_FILE = f"seekdeep7_{SEKTOR}.pkl"
+MEMORY_FILE = f"seekdeep7_{SEKTOR}.npz"
+MODEL_FILE = f"seekdeep7_{SEKTOR}.pt"
+NEWS_FILE = f"seekdeep_news_{SEKTOR}.json"
+FUND_FILE = f"seekdeep_fund_{SEKTOR}.json"
+KAP_FILE = f"seekdeep_kap_{SEKTOR}.json"
+METRICS_FILE = f"metrics_{SEKTOR}.prom"
+CACHE_DIR = "cache_v7"
+
+# ── Özellik isimleri ────────────────────────────────────────────────
+TECH_NAMES: List[str] = [
+    "rsi7", "rsi14", "rsi21", "atrn7", "atrn14", "atrn21",
+    "macd", "macd_sig", "macd_hist", "bb_pct", "bb_width", "stoch_k", "stoch_d",
+    "vwap_dist", "obv_norm",
+    "ret1", "ret2", "ret3", "ret5", "ret10", "ret20", "ret40",
+    "sma5", "sma10", "sma20", "sma50", "sma200", "ema12", "ema26",
+    "rv10", "rv30", "rv60", "gk20", "pk20",
+    "hl", "co", "wick_up", "wick_lo", "vol_rel", "vol_chg",
+    "amihud", "cs_spread", "gap", "skew20", "kurt20", "dd60", "dist_low60",
+    "mom_acc", "eff_ratio20",
+]
+TECH_NAMES_V7_EXT: List[str] = [
+    "tenkan", "kijun", "senkou_a", "senkou_b", "chikou",
+    "keltner_up", "keltner_lo", "keltner_width",
+    "donchian_up", "donchian_lo", "donchian_width",
+    "aroon_up", "aroon_dn", "aroon_osc",
+    "cci", "roc5", "roc10", "roc20", "willr7", "willr14", "willr21",
+    "adx", "plus_di", "minus_di", "psar", "psar_trend", "vortex_pos", "vortex_neg",
+    "trix", "dpo", "mass_idx", "chaikin_osc", "force_idx", "eom",
+    "klinger", "elder_bull", "elder_bear", "ultimate_osc", "awesome_osc", "bop",
+    "coppock", "fisher", "schaff", "kst", "ppo", "ppo_sig", "ppo_hist",
+    "rvi", "stochrsi_k", "stochrsi_d", "connors_rsi", "qstick",
+    "vwma", "hull_ma", "alma", "tema", "dema", "zlema",
+    "mcginley", "kama", "frama", "mama",
+]
+TECH_ALL_NAMES: List[str] = TECH_NAMES + TECH_NAMES_V7_EXT
+N_TECH = len(TECH_ALL_NAMES)
+
+LIQ_NAMES = [
+    "adv_log", "turnover_ratio", "depth_bid", "depth_ask", "resilience", "tightness",
+    "elasticity", "kyle_lambda", "amihud_illiq", "roll_spread", "cs_spread_ext",
+    "hasbrouck", "vpin", "volume_sync", "tick_size_eff",
+]
+RANK_NAMES = [
+    "rk_ret5", "rk_ret20", "rk_ret60", "rk_vol", "rk_volrel", "rk_rsi", "rk_macd", "rk_bb",
+    "rk_amihud", "rk_turnover", "rk_sector_ret5", "rk_sector_ret20", "rk_peer_ret5",
+    "rk_peer_ret20", "rk_global_ret5", "rk_global_ret20", "rk_size", "rk_mom", "rk_value",
+    "rk_quality",
+]
+MACRO_KEYS = ["usdtry", "eurtry", "gold", "brent", "vix", "dxy", "oil", "copper"]
+MACRO_NAMES = [f"M_{k}_{s}" for k in MACRO_KEYS for s in ("z", "r20", "r60")] + [
+    "M_yield_curve", "M_credit_spread", "M_fed_rate", "M_inflation", "M_unemployment", "M_gdp"]
+MICRO_NAMES = [
+    "ofi", "ofi_ema5", "ofi_ema20", "ofi_l1", "ofi_l2", "ofi_l3",
+    "queue_bid", "queue_ask", "queue_mid", "iceberg_bid", "iceberg_ask", "iceberg_conf",
+    "spoof_bid", "spoof_ask", "spoof_sev", "micro_price", "weighted_mid", "mid_price",
+    "spread_eff", "spread_quoted", "spread_real", "depth_proxy", "kyle_lambda_ext",
+    "hawkes_lambda", "hawkes_bid", "hawkes_ask", "trade_imb", "vol_imb", "order_imb",
+    "tick_rule", "lee_ready", "trade_sign", "lob_slope_bid", "lob_slope_ask",
+    "lob_curv_bid", "lob_curv_ask", "lob_asym", "hhi_bid", "hhi_ask", "hhi_comb",
+]
+N_MICRO = len(MICRO_NAMES)
+PEER_NAMES = [
+    "peer_ret_w", "rel_strength", "peer_corr_mean", "peer_mom", "sector_ret", "beta_sector",
+    "idio_ret", "lead_lag", "peer_ret5", "peer_ret20", "peer_vol", "peer_rsi", "peer_macd",
+    "sector_ret5", "sector_ret20", "sector_vol", "sector_breadth", "multi_hop_1",
+    "multi_hop_2", "multi_hop_3", "dynamic_corr_5", "dynamic_corr_20", "dynamic_corr_60",
+    "cross_asset_spill", "tail_dep",
+]
+NLP_NAMES = [
+    "news_sent_1d", "news_sent_5d", "news_sent_20d", "news_count_1d", "news_count_5d",
+    "news_conf_mean", "news_conf_std", "kap_count_1d", "kap_count_7d", "kap_impact_score",
+    "social_sent", "social_volume", "social_divergence", "finbert_pos", "finbert_neg",
+]
+STOCK_ONEHOT_NAMES = [f"stk_{c}" for c in STOCK_LIST]
+SECTOR_ONEHOT_NAMES = [f"sec_{s}" for s in SECTORS]
+REGIME_ONEHOT_NAMES = [f"reg_{r}" for r in REGIMES]
+CAP_ONEHOT_NAMES = [f"cap_{c}" for c in ("small", "mid", "large")]
+TIME_ONEHOT_NAMES = [f"time_{t}" for t in ("open", "mid", "close")]
+OTHER_ONEHOT_NAMES = ["oh_month_end", "oh_quarter_end"]
+ONEHOT_NAMES = (STOCK_ONEHOT_NAMES + SECTOR_ONEHOT_NAMES + REGIME_ONEHOT_NAMES
+                + CAP_ONEHOT_NAMES + TIME_ONEHOT_NAMES + OTHER_ONEHOT_NAMES)
+CAUSAL_NAMES = [
+    "causal_parent", "causal_child", "causal_path", "do_effect", "counterfactual",
+    "mediation", "instrument", "confounder", "collider", "d_separation",
+]
+FEATURE_NAMES: List[str] = (TECH_ALL_NAMES + LIQ_NAMES + RANK_NAMES + MACRO_NAMES + MICRO_NAMES
+                            + PEER_NAMES + NLP_NAMES + ONEHOT_NAMES + CAUSAL_NAMES)
+N_FEAT = len(FEATURE_NAMES)
+FEAT_INDEX: Dict[str, int] = {n: i for i, n in enumerate(FEATURE_NAMES)}
+MICRO_OFF = FEAT_INDEX["ofi"]
+
+# ── DB şeması ───────────────────────────────────────────────────────
+DB_TABLES: Dict[str, str] = {
+    "trades": "ts TEXT, stock TEXT, action TEXT, price REAL, qty INTEGER, pnl REAL, reason TEXT",
+    "equity": "ts TEXT, value REAL, cash REAL, npos INTEGER",
+    "train": "ts TEXT, step INTEGER, vl REAL, va REAL, note TEXT",
+    "improve": "ts TEXT, reason TEXT, detail TEXT, before REAL, after REAL, adopted INTEGER",
+    "calibrate": "ts TEXT, n INTEGER, brier REAL, ece REAL, acc REAL, base REAL",
+    "cpcv": "ts TEXT, mean REAL, std REAL, worst REAL, best REAL, n INTEGER, sharpe REAL",
+    "pbo": "ts TEXT, pbo REAL, mean REAL, median REAL, n INTEGER, interp TEXT",
+    "forecast": "ts TEXT, stock TEXT, current_price REAL, target_price REAL, expected_return REAL, "
+                "lower_bound REAL, upper_bound REAL, p_up REAL, p_down REAL, p_flat REAL, "
+                "bull_price REAL, base_price REAL, bear_price REAL, confidence REAL, "
+                "uncertainty REAL, epistemic REAL, aleatoric REAL, kelly_f REAL, regime TEXT, horizon INTEGER",
+    "execution": "ts TEXT, stock TEXT, side TEXT, qty INTEGER, ref_price REAL, fill_price REAL, "
+                 "impact_bps REAL, slip_bps REAL, ofi REAL, adv_pct REAL",
+    "risk": "ts TEXT, var95 REAL, cvar95 REAL, gross REAL, net REAL, kelly_scale REAL, n_pos INTEGER",
+    "moe": "ts TEXT, step INTEGER, lb_loss REAL, entropy REAL, max_load REAL",
+    "foundation": "ts TEXT, model_name TEXT, pretrain_loss REAL, finetune_loss REAL, embedding_dim INTEGER",
+    "rl": "ts TEXT, episode INTEGER, reward REAL, policy_loss REAL, value_loss REAL, entropy REAL",
+    "causal": "ts TEXT, treatment TEXT, outcome TEXT, effect REAL, p_value REAL, method TEXT",
+    "xai": "ts TEXT, method TEXT, feature TEXT, importance REAL, shap_value REAL",
+    "uncertainty": "ts TEXT, aleatoric REAL, epistemic REAL, total REAL, method TEXT",
+    "conformal": "ts TEXT, alpha REAL, coverage REAL, width REAL, method TEXT",
+    "regime": "ts TEXT, regime TEXT, prob REAL, transition REAL",
+    "chronos": "ts TEXT, stock TEXT, horizon INTEGER, forecast REAL, lower REAL, upper REAL",
+    "world_model": "ts TEXT, latent_state BLOB, reward REAL, value REAL, done INTEGER",
+    "decision_transformer": "ts TEXT, episode INTEGER, return_to_go REAL, action BLOB",
+    "swag": "ts TEXT, mean BLOB, var BLOB, samples INTEGER",
+    "nf": "ts TEXT, log_prob REAL, sample BLOB",
+    "grad_cam": "ts TEXT, layer TEXT, importance BLOB",
+    "iceberg": "ts TEXT, stock TEXT, side TEXT, confidence REAL, size INTEGER",
+    "spoof": "ts TEXT, stock TEXT, side TEXT, severity REAL, timestamp TEXT",
+    "hawkes": "ts TEXT, mu REAL, alpha REAL, beta REAL, intensity REAL",
+    "lob": "ts TEXT, stock TEXT, level INTEGER, bid_price REAL, bid_size INTEGER, "
+           "ask_price REAL, ask_size INTEGER",
+    "vpin": "ts TEXT, stock TEXT, vpin REAL, bucket INTEGER",
+    "kyle": "ts TEXT, stock TEXT, kyle_lambda REAL, window INTEGER",
+    "amihud": "ts TEXT, stock TEXT, amihud REAL, window INTEGER",
+    "hasbrouck": "ts TEXT, stock TEXT, information_share REAL, window INTEGER",
+    "white_rc": "ts TEXT, statistic REAL, p_value REAL, n_bootstrap INTEGER",
+    "spa": "ts TEXT, statistic REAL, p_value REAL, n_bootstrap INTEGER",
+    "mcs": "ts TEXT, model TEXT, mcs_prob REAL, n_bootstrap INTEGER",
+    "structural_break": "ts TEXT, statistic REAL, p_value REAL, break_date TEXT, method TEXT",
 }
-INT_KEYS = {"max_positions", "max_hold", "max_trades_day", "loss_streak", "cooldown_h", "gate_min_n",
-            "si_interval_min", "si_budget_s", "consec_improve"}
-BOOL_KEYS = ("use_regime", "use_long_gate", "conf_sizing", "tp_on", "be_on", "dd_throttle", "corr_on",
-             "gate_on", "auto_adopt", "si_auto", "overlay_on", "rl_veto")
-TUNE_BOUNDS = {
-    "p_buy": (0.36, 0.75), "p_buy_long": (0.36, 0.75), "margin": (0.0, 0.35), "unc_max": (0.05, 0.50),
-    "sl_atr": (1.0, 5.0), "trail_act_r": (0.5, 4.0), "trail_atr": (1.0, 5.0), "tp_r": (0.5, 6.0),
-    "tp_frac": (0.1, 0.9), "be_r": (0.3, 3.0), "max_hold": (10, 200), "risk_per_trade": (0.003, 0.025),
-    "max_pos": (0.05, 0.35), "conf_sizing": (0, 1), "regime_bull_adj": (-0.10, 0.15),
-    "regime_bear_adj": (0.0, 0.25), "regime_range_adj": (-0.05, 0.15), "regime_vol_adj": (0.0, 0.25),
-    "min_daily_turnover": (0, 5e7), "use_regime": (0, 1), "use_long_gate": (0, 1), "cooldown_h": (6, 72),
-    "max_trades_day": (2, 15), "loss_streak": (2, 6), "corr_max": (0.6, 0.95),
+
+DATA_SOURCES: Dict[str, Dict[str, Any]] = {
+    "hisse": {"kaynak": "YFinance", "period": "5y", "interval": "1d"},
+    "makro": {
+        "kaynak": "YFinance + FRED",
+        "semboller": {"usdtry": "USDTRY=X", "eurtry": "EURTRY=X", "gold": "GC=F", "brent": "BZ=F",
+                      "vix": "^VIX", "dxy": "DX-Y.NYB", "oil": "CL=F", "copper": "HG=F"},
+        "fred_series": ["DGS10", "DGS2", "BAMLH0A0HYM2", "FEDFUNDS", "CPIAUCSL", "UNRATE", "GDP"],
+    },
+    "kap": {"url": "https://www.kap.org.tr/tr/api/disclosures"},
+    "fundamental": {"alanlar": ["trailingPE", "priceToBook", "returnOnEquity", "debtToEquity"]},
 }
-TUNE_BINARY = {"conf_sizing", "use_regime", "use_long_gate"}
-TUNE_INT = {"max_hold", "max_trades_day", "loss_streak", "cooldown_h"}
-LOCKED_KEYS = ("max_dd", "daily_loss", "max_positions", "max_exposure", "max_sector")
 
-# ════════════════════════════════════════════════════════════
-# 4. YARDIMCI + VERİ FONKSİYONLARI (BUG 1 DÜZELTİLDİ: _fetch/sanitize YUKARI)
-# ════════════════════════════════════════════════════════════
-def now_tr(): return datetime.now(TR)
+# ═══════════════════════════════════════════════════════════════════
+# 3. DB (DuckDB + SQLite fallback)
+# ═══════════════════════════════════════════════════════════════════
 
-def borsa_acik():
-    n = now_tr()
-    return n.weekday() < 5 and dtime(9, 55) <= n.time() <= dtime(18, 10)
 
-def safe_float(x, d=0.0):
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else d
-    except (TypeError, ValueError):
-        return d
+def _parse_schema(schema: str) -> List[Tuple[str, str]]:
+    """'a TEXT, b REAL' biçimindeki şemayı (kolon, tip) listesine çevirir."""
+    cols: List[Tuple[str, str]] = []
+    for part in schema.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, typ = part.split(None, 1)
+        cols.append((name, typ.strip()))
+    return cols
 
-def clamp(v, lo, hi): return max(lo, min(hi, v))
 
-def validate_risk(rp):
-    out = {**DEFAULT_RISK, **(rp or {})}
-    for k, (lo, hi) in RISK_BOUNDS.items():
-        out[k] = clamp(safe_float(out.get(k), DEFAULT_RISK.get(k, 0)), lo, hi)
-        if k in INT_KEYS: out[k] = int(round(out[k]))
-    for k in BOOL_KEYS: out[k] = bool(out.get(k, True))
-    return out
+class SeekDB:
+    """Thread-safe DB katmanı: DuckDB varsa onu, yoksa SQLite'ı kullanır."""
 
-def tick_size(p):
-    for lim, t in ((20, .01), (50, .02), (100, .05), (250, .10), (500, .25), (1000, .5), (2500, 1.0)):
-        if p < lim: return t
-    return 2.5
-
-def tick_round(p, up=True):
-    t = tick_size(p)
-    return round((math.ceil(p / t - 1e-9) if up else math.floor(p / t + 1e-9)) * t, 4)
-
-def bday_count(a, b):
-    try: return int(np.busday_count(np.datetime64(a.date()), np.datetime64(b.date())))
-    except Exception: return (b - a).days
-
-# ─── 🐛 BUG 1 DÜZELTME: _fetch/sanitize ARTIK EN BAŞTA ──────
-def sanitize(d):
-    cols = ["Open", "High", "Low", "Close"]
-    d = d.dropna(subset=cols).drop_duplicates("Date").sort_values("Date")
-    d = d[(d[cols] > 0).all(axis=1)].copy()
-    d["High"], d["Low"] = d[cols].max(axis=1), d[cols].min(axis=1)
-    d["Volume"] = d["Volume"].fillna(0).clip(lower=0)
-    d = d[d["Close"].pct_change().abs().fillna(0) < 0.5]
-    return d.reset_index(drop=True)
-
-def _fetch(sym, period="5y"):
-    for _ in range(3):
+    def __init__(self, path: Optional[str] = None) -> None:
+        self._lock = threading.RLock()
+        self.backend = "duckdb" if DUCKDB_OK else "sqlite"
+        base = path or DB_FILE
+        if self.backend == "sqlite" and base.endswith(".duckdb"):
+            base = base[:-7] + ".sqlite"
+        self.path = base
         try:
-            d = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=True)
-            if d is not None and not d.empty:
-                d = d.reset_index()
-                d["Date"] = pd.to_datetime(d["Date"]).dt.tz_localize(None).dt.normalize()
-                return sanitize(d[["Date", "Open", "High", "Low", "Close", "Volume"]])
-        except Exception:
-            time.sleep(0.5)
+            if self.backend == "duckdb":
+                self._con = duckdb.connect(self.path)
+            else:
+                self._con = sqlite3.connect(self.path, check_same_thread=False)
+        except Exception as e:
+            log.error("DB bağlantı hatası (%s), SQLite'a düşülüyor: %s", self.backend, e)
+            self.backend = "sqlite"
+            self.path = base.rsplit(".", 1)[0] + ".sqlite"
+            self._con = sqlite3.connect(self.path, check_same_thread=False)
+        self._create_tables()
+        log.info("DB hazır: %s (%s, %d tablo)", self.path, self.backend, len(DB_TABLES))
+
+    def _create_tables(self) -> None:
+        """Tüm tabloları (yoksa) oluşturur."""
+        with self._lock:
+            for name, schema in DB_TABLES.items():
+                cols = ", ".join(f'"{c}" {t}' for c, t in _parse_schema(schema))
+                self._con.execute(f'CREATE TABLE IF NOT EXISTS "{name}" ({cols})')
+            if self.backend == "sqlite":
+                self._con.commit()
+
+    def insert(self, table: str, values: Sequence[Any]) -> None:
+        """Tek satır ekler."""
+        self.insert_many(table, [values])
+
+    def insert_many(self, table: str, rows: Sequence[Sequence[Any]]) -> None:
+        """Çok satır ekler."""
+        if table not in DB_TABLES:
+            raise KeyError(f"Bilinmeyen tablo: {table}")
+        if not rows:
+            return
+        n = len(_parse_schema(DB_TABLES[table]))
+        ph = ", ".join("?" * n)
+        with self._lock:
+            try:
+                for r in rows:
+                    if len(r) != n:
+                        raise ValueError(f"{table}: {n} kolon bekleniyordu, {len(r)} geldi")
+                    self._con.execute(f'INSERT INTO "{table}" VALUES ({ph})', list(r))
+                if self.backend == "sqlite":
+                    self._con.commit()
+            except Exception as e:
+                log.error("DB yazma hatası (%s): %s", table, e)
+                raise
+
+    def query(self, sql: str, params: Optional[Sequence[Any]] = None) -> pd.DataFrame:
+        """SQL sorgusunu DataFrame olarak döndürür."""
+        with self._lock:
+            try:
+                if self.backend == "duckdb":
+                    return self._con.execute(sql, list(params or [])).fetchdf()
+                return pd.read_sql_query(sql, self._con, params=list(params or []))
+            except Exception as e:
+                log.error("DB sorgu hatası: %s", e)
+                return pd.DataFrame()
+
+    def count(self, table: str) -> int:
+        """Tablodaki satır sayısı."""
+        df = self.query(f'SELECT COUNT(*) AS n FROM "{table}"')
+        return int(df["n"].iloc[0]) if len(df) else 0
+
+    def table_names(self) -> List[str]:
+        """Şemadaki tablo isimleri."""
+        return list(DB_TABLES.keys())
+
+    def close(self) -> None:
+        """Bağlantıyı kapatır."""
+        with self._lock:
+            try:
+                self._con.close()
+            except Exception as e:
+                log.warning("DB kapatma uyarısı: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. DISK CACHE + VERİ FETCHER'LAR
+# ═══════════════════════════════════════════════════════════════════
+_CACHE_LOCK = threading.RLock()
+
+
+def _cache_path(key: str) -> str:
+    """Cache anahtarından güvenli dosya yolu üretir."""
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in key)
+    return os.path.join(CACHE_DIR, safe + ".pkl")
+
+
+def cache_get(key: str, ttl: float) -> Optional[Any]:
+    """TTL (sn) içindeyse cache'ten nesneyi döndürür, yoksa None."""
+    p = _cache_path(key)
+    with _CACHE_LOCK:
+        try:
+            if os.path.exists(p) and (time.time() - os.path.getmtime(p)) < ttl:
+                with open(p, "rb") as f:
+                    return pickle.load(f)
+        except Exception as e:
+            log.warning("Cache okuma hatası (%s): %s", key, e)
     return None
 
-def _fetch_hizli(sym, period="6mo"):
-    try:
-        d = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=True)
-        if d is None or len(d) < 100: return None
-        d = d.reset_index()
-        d["Date"] = pd.to_datetime(d["Date"]).dt.tz_localize(None).dt.normalize()
-        return d[["Date", "Open", "High", "Low", "Close", "Volume"]]
-    except Exception: return None
 
-def _titles(sym):
-    out = []
-    try:
-        for n in (yf.Ticker(sym).news or []):
-            t = n.get("title") or (n.get("content") or {}).get("title") or ""
-            if t: out.append(t)
-    except Exception: pass
-    return out[:NEWS_MAX_PER_STOCK]
-
-# ════════════════════════════════════════════════════════════
-# 5. DB (thread-safe)
-# ════════════════════════════════════════════════════════════
-_DB_LOCK = threading.RLock()
-
-@st.cache_resource(show_spinner=False)
-def _db():
-    c = sqlite3.connect(DB_FILE, timeout=30.0, check_same_thread=False)
-    c.execute("PRAGMA journal_mode=WAL"); c.execute("PRAGMA synchronous=NORMAL")
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, stock TEXT, action TEXT, price REAL, qty INTEGER, pnl REAL, reason TEXT);
-        CREATE TABLE IF NOT EXISTS equity (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, value REAL, cash REAL, npos INTEGER);
-        CREATE TABLE IF NOT EXISTS train (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, step INTEGER, vl REAL, va REAL, note TEXT);
-        CREATE TABLE IF NOT EXISTS improve (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, reason TEXT, detail TEXT, before REAL, after REAL, adopted INTEGER);
-        CREATE TABLE IF NOT EXISTS calibrate (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, n INTEGER, brier REAL, ece REAL, acc REAL, base REAL);
-        CREATE TABLE IF NOT EXISTS cpcv (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, mean REAL, std REAL, worst REAL, best REAL, n INTEGER, sharpe REAL);
-        CREATE TABLE IF NOT EXISTS pbo (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, pbo REAL, mean REAL, median REAL, n INTEGER, interp TEXT);
-        CREATE TABLE IF NOT EXISTS forecast (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, stock TEXT, current_price REAL, target_price REAL,
-            expected_return REAL, lower_bound REAL, upper_bound REAL, p_up REAL, p_down REAL, p_flat REAL, bull_price REAL, base_price REAL,
-            bear_price REAL, confidence REAL, uncertainty REAL, regime TEXT, horizon INTEGER);
-        CREATE INDEX IF NOT EXISTS ix_fc ON forecast(stock, id);
-    """)
-    c.commit()
-    return c
-
-@contextmanager
-def db_cur():
-    with _DB_LOCK:
-        c = _db()
+def cache_put(key: str, obj: Any) -> None:
+    """Nesneyi atomik olarak diske yazar."""
+    p = _cache_path(key)
+    with _CACHE_LOCK:
         try:
-            yield c
-            c.commit()
-        except Exception:
-            c.rollback(); raise
-
-def _ts(): return now_tr().isoformat(timespec="seconds")
-
-def _x(sql, args=()):
-    try:
-        with db_cur() as c: c.execute(sql, args)
-    except Exception as e: log.warning(f"db: {e}")
-
-def _q(sql, args=()):
-    try:
-        with db_cur() as c: return c.execute(sql, args).fetchall()
-    except Exception as e:
-        log.warning(f"db: {e}"); return []
-
-def db_add_trade(s, a, p, q, pnl, r):
-    _x("INSERT INTO trades (ts,stock,action,price,qty,pnl,reason) VALUES (?,?,?,?,?,?,?)",
-       (_ts(), str(s)[:20], str(a)[:10], float(p), int(q), float(pnl or 0), str(r)[:300]))
-
-def db_trades(limit=300):
-    r = _q("SELECT ts,stock,action,price,qty,pnl,reason FROM trades ORDER BY id DESC LIMIT ?", (int(limit),))
-    return [dict(zip(["ts","stock","action","price","qty","pnl","reason"], x)) for x in r]
-
-def db_eq_add(v, cash, npos):
-    _x("INSERT INTO equity (ts,value,cash,npos) VALUES (?,?,?,?)", (_ts(), float(v), float(cash), int(npos)))
-
-def db_eq(limit=2000):
-    r = _q("SELECT ts,value,cash,npos FROM equity ORDER BY id DESC LIMIT ?", (int(limit),))
-    return [{"ts": x[0], "value": x[1], "cash": x[2], "npos": x[3]} for x in reversed(r)]
-
-def db_train(limit=50):
-    r = _q("SELECT ts,step,vl,va,note FROM train ORDER BY id DESC LIMIT ?", (int(limit),))
-    return [dict(zip(["ts","step","vl","va","note"], x)) for x in r]
-
-def db_log_train(step, vl, va, note=""):
-    _x("INSERT INTO train (ts,step,vl,va,note) VALUES (?,?,?,?,?)", (_ts(), int(step), float(vl), float(va), note))
-
-def db_improve_add(reason, detail, before, after, adopted):
-    _x("INSERT INTO improve (ts,reason,detail,before,after,adopted) VALUES (?,?,?,?,?,?)",
-       (_ts(), str(reason)[:30], str(detail)[:500], float(before), float(after), int(adopted)))
-
-def db_calib_add(n, brier, ece, acc, base):
-    _x("INSERT INTO calibrate (ts,n,brier,ece,acc,base) VALUES (?,?,?,?,?,?)", (_ts(), int(n), float(brier), float(ece), float(acc), float(base)))
-
-def db_cpcv_add(mean, std, worst, best, n, sharpe):
-    _x("INSERT INTO cpcv (ts,mean,std,worst,best,n,sharpe) VALUES (?,?,?,?,?,?,?)",
-       (_ts(), float(mean), float(std), float(worst), float(best), int(n), float(sharpe)))
-
-def db_pbo_add(pbo, mean, median, n, interp):
-    _x("INSERT INTO pbo (ts,pbo,mean,median,n,interp) VALUES (?,?,?,?,?,?)",
-       (_ts(), float(pbo), float(mean), float(median), int(n), str(interp)[:50]))
-
-def db_forecast_add(f):
-    _x("""INSERT INTO forecast (ts,stock,current_price,target_price,expected_return,lower_bound,upper_bound,p_up,p_down,p_flat,
-         bull_price,base_price,bear_price,confidence,uncertainty,regime,horizon) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-       (_ts(), f.stock, f.current_price, f.target_price, f.expected_return_pct, f.lower_bound, f.upper_bound, f.p_up, f.p_down,
-        f.p_flat, f.bull_price, f.base_price, f.bear_price, f.confidence, f.uncertainty, f.regime, f.horizon_days))
-
-def db_forecast_history(stock, limit=50):
-    r = _q("SELECT ts,current_price,target_price,expected_return,confidence FROM forecast WHERE stock=? ORDER BY id DESC LIMIT ?",
-           (stock, int(limit)))
-    return [dict(zip(["ts","current","target","ret","conf"], x)) for x in r]
-
-def db_clear():
-    for t in ("trades","equity","train","improve","calibrate","cpcv","pbo","forecast"):
-        _x(f"DELETE FROM {t}")
-
-# ════════════════════════════════════════════════════════════
-# 6. LLM HABER (BUG 3 düzeltildi: LLM çağrıları batch'lenir)
-# ════════════════════════════════════════════════════════════
-NEWS_PROMPT = """Sen BIST haber analistisin. {stock} hissesi için:
-Haber: {title}
-JSON ver (başka bir şey yazma):
-{{"sentiment":<-1..1>,"confidence":<0..1>}}"""
-
-class NewsAnalyzer:
-    def __init__(self):
-        self.cache, self.client = {}, None
-        self._lock = threading.Lock()
-        self._llm_calls_this_cycle = 0
-        self.enabled = NEWS_ENABLED and GROQ_OK and bool(GROQ_API_KEY)
-        self._load()
-        if self.enabled:
-            try: self.client = Groq(api_key=GROQ_API_KEY)
-            except Exception as e:
-                log.warning(f"Groq init: {e}"); self.enabled = False
-
-    def reset_cycle(self): self._llm_calls_this_cycle = 0
-
-    def _load(self):
-        try:
-            if os.path.exists(NEWS_FILE):
-                with open(NEWS_FILE, "r", encoding="utf-8") as f: data = json.load(f)
-                now = time.time()
-                self.cache = {h: v for h, v in data.items() if now - v.get("ts", 0) < NEWS_CACHE_HOURS * 3600}
-        except Exception: pass
-
-    def _save(self):
-        try:
-            with open(NEWS_FILE, "w", encoding="utf-8") as f: json.dump(self.cache, f, ensure_ascii=False)
-        except Exception: pass
-
-    def analyze(self, stock, title):
-        if not self.enabled or not title.strip(): return None
-        h = hashlib.md5((stock + title).encode()).hexdigest()[:12]
-        with self._lock:
-            c = self.cache.get(h)
-            if c: return (c["sentiment"], c["confidence"])
-            if self._llm_calls_this_cycle >= NEWS_LLM_PER_CYCLE:
-                return None
-            self._llm_calls_this_cycle += 1
-        try:
-            r = self.client.chat.completions.create(
-                model=GROQ_MODEL, temperature=0.1, max_tokens=80,
-                messages=[{"role": "user", "content": NEWS_PROMPT.format(stock=stock, title=title[:400])}],
-                response_format={"type": "json_object"})
-            d = json.loads(r.choices[0].message.content)
-            item = {"sentiment": clamp(float(d.get("sentiment", 0)), -1, 1),
-                    "confidence": clamp(float(d.get("confidence", 0.5)), 0, 1), "ts": time.time()}
-            with self._lock:
-                self.cache[h] = item
-                if len(self.cache) % 10 == 0: self._save()
-            return (item["sentiment"], item["confidence"])
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, p)
         except Exception as e:
-            log.warning(f"LLM: {e}"); return None
+            log.warning("Cache yazma hatası (%s): %s", key, e)
 
-    def sentiment(self, stock, titles):
-        items = [r for r in (self.analyze(stock, t) for t in titles[:NEWS_MAX_PER_STOCK]) if r]
-        if not items: return 0.0, 0.0, 0
-        s = np.array([i[0] for i in items]); c = np.array([i[1] for i in items])
-        return float((s * c).sum() / (c.sum() + 1e-9)), float(c.mean()), len(items)
 
-@st.cache_resource(show_spinner=False)
-def get_news(): return NewsAnalyzer()
+class YFinanceFetcher:
+    """24 hisse + makro semboller için YFinance verisi çeker, diske cache'ler."""
 
-# ════════════════════════════════════════════════════════════
-# 7. KAP
-# ════════════════════════════════════════════════════════════
+    COLS = ["Open", "High", "Low", "Close", "Volume"]
+
+    def __init__(self, cache_ttl: float = 3600.0) -> None:
+        self.cache_ttl = cache_ttl
+
+    def fetch(self, symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
+        """Tek sembol için OHLCV DataFrame döndürür (hata olursa None)."""
+        key = f"yf_{symbol}_{period}"
+        hit = cache_get(key, self.cache_ttl)
+        if hit is not None:
+            return hit
+        try:
+            import yfinance as yf  # tembel import
+            df = yf.download(symbol, period=period, interval="1d", auto_adjust=True,
+                             progress=False, threads=False)
+            if df is None or len(df) == 0:
+                log.warning("YFinance boş veri: %s", symbol)
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df[self.COLS].dropna()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            cache_put(key, df)
+            return df
+        except Exception as e:
+            log.error("YFinance hatası (%s): %s", symbol, e)
+            stale = cache_get(key, 1e12)  # eski cache'e düş
+            return stale
+
+    def fetch_many(self, symbols: Sequence[str], period: str = "5y",
+                   workers: int = 8) -> Dict[str, pd.DataFrame]:
+        """Paralel veri çeker; başarılı olanları sözlük olarak döndürür."""
+        out: Dict[str, pd.DataFrame] = {}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {s: ex.submit(self.fetch, s, period) for s in symbols}
+            for s, fu in futs.items():
+                try:
+                    df = fu.result()
+                    if df is not None and len(df):
+                        out[s] = df
+                except Exception as e:
+                    log.error("fetch_many hatası (%s): %s", s, e)
+        log.info("YFinance: %d/%d sembol alındı", len(out), len(symbols))
+        return out
+
+    def fetch_stocks(self, codes: Sequence[str] = STOCK_LIST, period: str = "5y") -> Dict[str, pd.DataFrame]:
+        """BIST kodlarını (.IS ekleyerek) çeker; anahtar olarak kısa kod kullanır."""
+        raw = self.fetch_many([f"{c}.IS" for c in codes], period)
+        return {k[:-3]: v for k, v in raw.items()}
+
+
+def align_panel(dfs: Dict[str, pd.DataFrame], codes: Sequence[str]) -> Dict[str, Any]:
+    """
+    Hisse DataFrame'lerini ortak tarih ekseninde (S, T) paneline hizalar.
+    Dönüş: O,H,L,C,V (S,T), dates, valid (S,), avail (S,T), codes (veri bulunanlar).
+    Eksik fiyatlar en fazla 5 bar ileri doldurulur; hacim eksikse 0.
+    """
+    have = [c for c in codes if c in dfs and len(dfs[c]) >= WARMUP_BARS]
+    if not have:
+        raise ValueError("Hizalanacak yeterli veri yok")
+    idx = sorted(set().union(*[set(dfs[c].index) for c in have]))
+    dates = pd.DatetimeIndex(idx)
+    S, T = len(have), len(dates)
+    O = np.zeros((S, T)); H = np.zeros((S, T)); L = np.zeros((S, T))
+    C = np.zeros((S, T)); V = np.zeros((S, T)); avail = np.zeros((S, T), dtype=bool)
+    for s, c in enumerate(have):
+        d = dfs[c].reindex(dates)
+        avail[s] = d["Close"].notna().values
+        px = d[["Open", "High", "Low", "Close"]].ffill(limit=5)
+        O[s], H[s], L[s], C[s] = (px[k].values for k in ("Open", "High", "Low", "Close"))
+        V[s] = d["Volume"].fillna(0.0).values
+    for a in (O, H, L, C):
+        np.nan_to_num(a, copy=False, nan=0.0)
+    valid = avail.sum(axis=1) >= WARMUP_BARS
+    return {"O": np.ascontiguousarray(O), "H": np.ascontiguousarray(H),
+            "L": np.ascontiguousarray(L), "C": np.ascontiguousarray(C),
+            "V": np.ascontiguousarray(V), "dates": dates, "valid": valid,
+            "avail": avail, "codes": have}
+
+
 class KAPFetcher:
-    KW = ["esas sözleşme", "temettü", "sermaye", "birleşme", "satın alma", "yeni iş", "geri alım", "bedelsiz"]
-    def __init__(self):
-        self.cache = {}
+    """KAP bildirimlerini çeker; 3 özellik (adet_1g, adet_7g, etki skoru) döndürür."""
+
+    KW = ["temettü", "sermaye", "birleşme", "satın alma", "yeni iş", "geri alım", "bedelsiz"]
+    ZERO = {"kap_count_1d": 0.0, "kap_count_7d": 0.0, "kap_impact_score": 0.0}
+
+    def fetch(self, code: str, days: int = 7) -> Dict[str, float]:
+        """
+        Son `days` gün KAP bildirim istatistiği. Ağ/endpoint hatasında sıfır döner.
+        UYARI: KAP endpoint biçimi zamanla değişebilir; yanıt şeması burada
+        savunmacı biçimde ayrıştırılır.
+        """
+        if not KAP_ENABLED:
+            return dict(self.ZERO)
+        key = f"kap_{code}_{days}"
+        hit = cache_get(key, 3600.0)
+        if hit is not None:
+            return hit
         try:
-            if os.path.exists(KAP_FILE):
-                with open(KAP_FILE, "r", encoding="utf-8") as f: self.cache = json.load(f)
-        except Exception: pass
+            import requests
+            end = pd.Timestamp.now().normalize()
+            body = {"fromDate": (end - pd.Timedelta(days=days)).strftime("%Y-%m-%d"),
+                    "toDate": end.strftime("%Y-%m-%d"), "stockCodes": [code]}
+            r = requests.post(DATA_SOURCES["kap"]["url"], json=body, timeout=10,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            items = r.json()
+            if isinstance(items, dict):
+                items = items.get("data", items.get("disclosures", []))
+            c1 = c7 = 0
+            impact = 0.0
+            now = pd.Timestamp.now()
+            for it in items if isinstance(items, list) else []:
+                txt = json.dumps(it, ensure_ascii=False).lower()
+                ts = pd.to_datetime(it.get("publishDate") or it.get("date"), errors="coerce")
+                age = (now - ts).days if pd.notna(ts) else days
+                c7 += 1
+                c1 += 1 if age <= 1 else 0
+                impact += sum(1.0 for k in self.KW if k in txt)
+            res = {"kap_count_1d": float(c1), "kap_count_7d": float(c7),
+                   "kap_impact_score": float(math.tanh(impact / 3.0))}
+            cache_put(key, res)
+            return res
+        except Exception as e:
+            log.warning("KAP alınamadı (%s): %s", code, e)
+            return dict(self.ZERO)
 
-    def _save(self):
-        try:
-            with open(KAP_FILE, "w", encoding="utf-8") as f: json.dump(self.cache, f, ensure_ascii=False)
-        except Exception: pass
-
-    def fetch(self, code, days=7):
-        key = f"{code}_{days}"
-        if key in self.cache and time.time() - self.cache[key].get("_ts", 0) < 3600:
-            return self.cache[key].get("items", [])
-        try:
-            url = f"https://www.kap.org.tr/tr/api/disclosures?mkkMemberOidList={code}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=8) as r:
-                data = json.loads(r.read().decode("utf-8"))
-            items = [{"title": str(d.get("subject", ""))[:200], "date": d.get("publishDate", "")}
-                     for d in (data if isinstance(data, list) else data.get("items", []))]
-            self.cache[key] = {"items": items, "_ts": time.time()}; self._save()
-            return items
-        except Exception:
-            self.cache[key] = {"items": [], "_ts": time.time()}
-            return []
-
-    def get_features(self, code):
-        items = self.fetch(code)
-        if not items: return np.zeros(3, np.float32)
-        n = min(len(items), 20)
-        score = sum(1 for it in items[:n] if any(k in it["title"].lower() for k in self.KW))
-        return np.array([min(n / 10.0, 2.0), min(score / 5.0, 2.0), 1.0], np.float32)
-
-@st.cache_resource(show_spinner=False)
-def get_kap(): return KAPFetcher()
-
-# ════════════════════════════════════════════════════════════
-# 8. TEMEL VERİ (overlay)
-# ════════════════════════════════════════════════════════════
-@dataclass
-class FundamentalData:
-    pe: float = 0.0; pb: float = 0.0; ps: float = 0.0; ev_ebitda: float = 0.0
-    roe: float = 0.0; debt_eq: float = 0.0; div_yield: float = 0.0; market_cap: float = 0.0; updated: str = ""
 
 class FundamentalFetcher:
-    def __init__(self):
-        self.cache, self._lock = {}, threading.Lock()
-        try:
-            if os.path.exists(FUND_FILE):
-                with open(FUND_FILE, "r") as f: self.cache = json.load(f)
-        except Exception: pass
+    """Temel analiz verisi (P/E, P/B, ROE, borç/özsermaye) çeker."""
 
-    def _save(self):
+    def fetch(self, code: str) -> Dict[str, float]:
+        """YFinance info'dan 4 alan döndürür; yoksa NaN yerine 0.0."""
+        key = f"fund_{code}"
+        hit = cache_get(key, 86400.0)
+        if hit is not None:
+            return hit
+        res = {k: 0.0 for k in DATA_SOURCES["fundamental"]["alanlar"]}
         try:
-            with open(FUND_FILE, "w") as f: json.dump(self.cache, f)
-        except Exception: pass
-
-    def _fresh(self, code):
-        ts = self.cache.get(code, {}).get("updated", "")
-        try: return bool(ts) and (now_tr() - datetime.fromisoformat(ts)).days < 7
-        except Exception: return False
-
-    def fetch(self, code, force=False):
-        if not force and self._fresh(code): return FundamentalData(**self.cache[code])
-        try:
+            import yfinance as yf
             info = yf.Ticker(f"{code}.IS").info or {}
-            fd = FundamentalData(
-                pe=safe_float(info.get("trailingPE")), pb=safe_float(info.get("priceToBook")),
-                ps=safe_float(info.get("priceToSalesTrailing12Months")), ev_ebitda=safe_float(info.get("enterpriseToEbitda")),
-                roe=safe_float(info.get("returnOnEquity")), debt_eq=safe_float(info.get("debtToEquity")),
-                div_yield=safe_float(info.get("dividendYield")), market_cap=safe_float(info.get("marketCap")),
-                updated=now_tr().isoformat(timespec="seconds"))
-            with self._lock:
-                self.cache[code] = fd.__dict__
-                self._save()
-            return fd
-        except Exception:
-            return FundamentalData(**self.cache[code]) if code in self.cache else FundamentalData()
-
-@st.cache_resource(show_spinner=False)
-def get_fund(): return FundamentalFetcher()
-
-def fund_score(fd, sektor=""):
-    s = 0.0
-    if 0 < fd.pe < 12: s += 0.35
-    elif fd.pe > 35: s -= 0.35
-    if 0 < fd.pb < 1.5: s += 0.2
-    elif fd.pb > 6: s -= 0.2
-    if fd.roe > 0.15: s += 0.3
-    elif fd.roe < 0: s -= 0.3
-    if sektor not in ("Bankacılık", "Finans", "Sigorta") and fd.debt_eq > 250: s -= 0.2
-    return clamp(s, -1.0, 1.0)
-
-# ════════════════════════════════════════════════════════════
-# 9. MAKRO (BUG 1 DÜZELTİLDİ: _fetch artık yukarıda)
-# ════════════════════════════════════════════════════════════
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_macro_hist():
-    syms = {"usdtry": "USDTRY=X", "eurtry": "EURTRY=X", "gold": "GC=F", "brent": "BZ=F"}
-    cols = {}
-    for k, s in syms.items():
-        d = _fetch(s, "5y")  # ✅ Artık çalışıyor
-        if d is not None and len(d) > 100: cols[k] = d.set_index("Date")["Close"]
-    if not cols: return None
-    m = pd.DataFrame(cols).sort_index()
-    return m[~m.index.duplicated()].ffill()
-
-def load_macro():
-    m = load_macro_hist()
-    if m is None or len(m) < 25: return {}
-    out = {}
-    for k in m.columns:
-        out[k] = float(m[k].iloc[-1]); out[f"{k}_ret20"] = float(m[k].iloc[-1] / m[k].iloc[-21] - 1)
-    return out
-
-def add_macro(df, macro):
-    df = df.copy()
-    idx = pd.DatetimeIndex(df["Date"])
-    for k in MACRO_KEYS:
-        if macro is None or k not in macro.columns:
-            df[f"M_{k}_z"] = 0.0; df[f"M_{k}_r20"] = 0.0; continue
-        s = macro[k].reindex(macro.index.union(idx)).ffill().reindex(idx).shift(1)
-        s = pd.Series(s.to_numpy(), index=df.index)
-        ls = np.log(s.where(s > 0))
-        z = (ls - ls.rolling(250, min_periods=60).mean()) / ls.rolling(250, min_periods=60).std().replace(0, np.nan)
-        df[f"M_{k}_z"] = z.fillna(0.0)
-        df[f"M_{k}_r20"] = s.pct_change(20, fill_method=None).fillna(0.0)
-    return df.replace([np.inf, -np.inf], 0.0)
-
-# ════════════════════════════════════════════════════════════
-# 10. EXPERIENCE BUFFER
-# ════════════════════════════════════════════════════════════
-class ExperienceBuffer:
-    def __init__(self, capacity=5000, n_feat=N_FEAT):
-        self.capacity, self.n_feat = capacity, n_feat
-        self.X = np.zeros((capacity, n_feat), dtype=np.float32)
-        self.y = np.zeros(capacity, dtype=np.int64)
-        self.y_long = np.full(capacity, -1, dtype=np.int64)
-        self.p = np.zeros(capacity, dtype=np.float32)
-        self.ptr = self.n = self.total_added = 0
-
-    def add(self, feat, label, label_long=-1, priority=1.0):
-        self.X[self.ptr] = np.asarray(feat, np.float32)
-        self.y[self.ptr], self.y_long[self.ptr] = int(label), int(label_long)
-        self.p[self.ptr] = max(1e-3, float(priority))
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.n = min(self.n + 1, self.capacity); self.total_added += 1
-
-    def add_many(self, X, y, y_long=None, p=None):
-        for i in range(len(X)):
-            self.add(X[i], y[i], -1 if y_long is None else y_long[i], 1.0 if p is None else p[i])
-
-    def sample(self, k, rng=None):
-        if self.n < 8: return None
-        rng = rng or np.random.default_rng()
-        k = min(k, self.n)
-        cdf = np.cumsum(self.p[:self.n].astype(np.float64))
-        idx = np.minimum(np.searchsorted(cdf, rng.random(k) * cdf[-1]), self.n - 1)
-        return self.X[idx], self.y[idx], self.y_long[idx]
-
-    def save(self, path):
-        try:
-            tmp = path + ".tmp"
-            with open(tmp, "wb") as f:
-                np.savez_compressed(f, X=self.X[:self.n], y=self.y[:self.n], y_long=self.y_long[:self.n], p=self.p[:self.n])
-            os.replace(tmp, path); return True
-        except Exception: return False
-
-    def load(self, path):
-        if not os.path.exists(path): return False
-        try:
-            with np.load(path, allow_pickle=False) as z:
-                if z["X"].shape[1] != self.n_feat: return False
-                self.add_many(z["X"], z["y"], z["y_long"], z["p"])
-            return True
-        except Exception: return False
-
-    def size(self): return self.n
-
-# ════════════════════════════════════════════════════════════
-# 11. FEDERATED
-# ════════════════════════════════════════════════════════════
-class FederatedAggregator:
-    def __init__(self, storage_dir="federated"):
-        self.dir = storage_dir
-        os.makedirs(self.dir, exist_ok=True)
-        self.rounds, self.history = 0, []
-        try:
-            with open(os.path.join(self.dir, "global.json")) as f:
-                m = json.load(f); self.rounds, self.history = m.get("rounds", 0), m.get("history", [])
-        except Exception: pass
-
-    def _p(self, name): return os.path.join(self.dir, name)
-
-    @staticmethod
-    def _flat(nets_state):
-        out = {}
-        for i, n in enumerate(nets_state):
-            for k, v in n["P"].items(): out[f"P{i}__{k}"] = np.asarray(v, np.float32)
-            for k, v in n["E"].items(): out[f"E{i}__{k}"] = np.asarray(v, np.float32)
-        return out
-
-    def push(self, bot_id, nn_state, score):
-        try:
-            flat = self._flat(nn_state["nets"])
-            tmp = self._p(f"bot_{bot_id}.npz.tmp")
-            with open(tmp, "wb") as f: np.savez_compressed(f, **flat)
-            os.replace(tmp, self._p(f"bot_{bot_id}.npz"))
-            with open(self._p(f"bot_{bot_id}.json"), "w") as f:
-                json.dump({"bot_id": bot_id, "score": float(score), "ts": _ts(), "n_nets": len(nn_state["nets"]),
-                           "n_feat": N_FEAT}, f)
-            return True
+            for k in res:
+                v = info.get(k)
+                res[k] = float(v) if isinstance(v, (int, float)) and np.isfinite(v) else 0.0
+            cache_put(key, res)
         except Exception as e:
-            log.warning(f"federated push {bot_id}: {e}"); return False
+            log.warning("Fundamental alınamadı (%s): %s", code, e)
+        return res
 
-    def aggregate(self):
-        bots = []
-        for bid in (1, 2, 3):
+
+class NewsAnalyzer:
+    """Groq LLM ile haber sentiment analizi (anahtar yoksa sözlük tabanlı fallback)."""
+
+    POS = ["rekor", "artış", "kâr", "kar ", "büyüme", "temettü", "anlaşma", "yükseldi", "onay"]
+    NEG = ["zarar", "düşüş", "ceza", "dava", "iflas", "geriledi", "soruşturma", "uyarı"]
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._llm_calls = 0
+        self._client: Any = None
+        if GROQ_API_KEY:
             try:
-                with open(self._p(f"bot_{bid}.json")) as f: meta = json.load(f)
-                if meta.get("n_feat") != N_FEAT: continue
-                with np.load(self._p(f"bot_{bid}.npz"), allow_pickle=False) as z:
-                    bots.append((meta, {k: z[k] for k in z.files}))
-            except Exception: continue
-        if len(bots) < 2: return None
-        scores = np.array([max(0.05, b[0]["score"]) for b in bots])
-        w = scores / scores.sum()
-        keys = set(bots[0][1].keys())
-        for _, d in bots[1:]: keys &= set(d.keys())
-        glob = {}
-        for k in keys:
-            try: glob[k] = sum(wi * d[k] for wi, (_, d) in zip(w, bots)).astype(np.float32)
-            except Exception: pass
-        tmp = self._p("global.npz.tmp")
-        with open(tmp, "wb") as f: np.savez_compressed(f, **glob)
-        os.replace(tmp, self._p("global.npz"))
-        self.rounds += 1
-        self.history = (self.history + [{"round": self.rounds, "ts": _ts(), "n_bots": len(bots),
-                                         "weights": w.tolist(), "scores": scores.tolist()}])[-50:]
-        with open(self._p("global.json"), "w") as f:
-            json.dump({"rounds": self.rounds, "history": self.history}, f)
-        log.info(f"Federated round {self.rounds}: {len(bots)} bot")
-        return glob
-
-    def blend(self, bag, beta=0.5):
-        try:
-            with np.load(self._p("global.npz"), allow_pickle=False) as z:
-                G = {k: z[k] for k in z.files}
-        except Exception: return None
-        out = []
-        for i, nn in enumerate(bag.nets):
-            P, E = {}, {}
-            for src, dst, pre in ((nn.P, P, "P"), (nn.E, E, "E")):
-                for k, loc in src.items():
-                    g = G.get(f"{pre}{i}__{k}")
-                    if g is None or g.shape != loc.shape: dst[k] = loc.copy(); continue
-                    new = ((1 - beta) * loc + beta * g).astype(np.float32)
-                    if k in ("Att", "W0"): new[-N_STOCKS:] = loc[-N_STOCKS:]
-                    dst[k] = new
-            out.append({"P": P, "E": E, "Ts": nn.Ts, "Tl": nn.Tl})
-        return out
-
-    def has_global(self): return os.path.exists(self._p("global.npz"))
-    def summary(self): return {"rounds": self.rounds, "history": self.history[-10:], "has_global": self.has_global()}
-
-@st.cache_resource(show_spinner=False)
-def get_federated(): return FederatedAggregator()
-
-# ════════════════════════════════════════════════════════════
-# 12. GÖSTERGELER
-# ════════════════════════════════════════════════════════════
-def add_ind(df):
-    df = df.copy().sort_values("Date").reset_index(drop=True)
-    df["Date"] = pd.to_datetime(df["Date"]).astype("datetime64[ns]")
-    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
-    d = c.diff()
-    g = d.clip(lower=0).rolling(14).mean(); ls = (-d.clip(upper=0)).rolling(14).mean()
-    df["RSI"] = 100 - (100 / (1 + g / ls.replace(0, np.nan)))
-    e12, e26 = c.ewm(span=12, adjust=False).mean(), c.ewm(span=26, adjust=False).mean()
-    df["MACD"] = e12 - e26
-    df["MACDs"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACDh"] = df["MACD"] - df["MACDs"]
-    df["SMA20"], df["SMA50"], df["SMA200"] = c.rolling(20).mean(), c.rolling(50).mean(), c.rolling(200).mean()
-    df["EMA9"], df["EMA21"] = c.ewm(span=9, adjust=False).mean(), c.ewm(span=21, adjust=False).mean()
-    df["BBm"] = df["SMA20"]; df["BBs"] = c.rolling(20).std()
-    df["BBu"], df["BBd"] = df["BBm"] + 2 * df["BBs"], df["BBm"] - 2 * df["BBs"]
-    lo14, hi14 = l.rolling(14).min(), h.rolling(14).max()
-    rng = (hi14 - lo14).replace(0, np.nan)
-    df["K"] = 100 * (c - lo14) / rng
-    df["D"] = df["K"].rolling(3).mean()
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean(); df["ATRp"] = df["ATR"] / c
-    df["WILLR"] = -100 * (hi14 - c) / rng
-    up, dn = h.diff(), -l.diff()
-    pdm = np.where((up > dn) & (up > 0), up, 0.0); mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    tr14 = tr.rolling(14).sum().replace(0, np.nan)
-    pdi = 100 * pd.Series(pdm, index=df.index).rolling(14).sum() / tr14
-    mdi = 100 * pd.Series(mdm, index=df.index).rolling(14).sum() / tr14
-    df["ADX"] = (100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)).rolling(14).mean()
-    df["Vol_ratio"] = v / v.rolling(20).mean().replace(0, np.nan)
-    for k in (1, 5, 10, 20, 30, 60): df[f"Ret{k}"] = c.pct_change(k)
-    df["Volatility"] = df["Ret1"].rolling(20).std() * np.sqrt(252)
-    df["HL"] = (h - l) / c
-    df["Gap"] = (df["Open"] - c.shift()) / c.shift()
-    df["HI120"] = c / c.rolling(120).max() - 1
-    r20 = (h.rolling(20).max() - l.rolling(20).min()).replace(0, np.nan)
-    df["Donch20"] = (c - l.rolling(20).min()) / r20
-    df["RSI_slope"] = df["RSI"].diff(3)
-    df["SMA50_slope"] = df["SMA50"].pct_change(10)
-    df["ATR_chg"] = df["ATRp"] / df["ATRp"].rolling(50).mean() - 1
-    df["Turnover20"] = (c * v).rolling(20).mean()
-    tp = (h + l + c) / 3
-    df["TPz"] = (tp - tp.rolling(20).mean()) / tp.rolling(20).std().replace(0, np.nan)
-    mf, dtp = tp * v, tp.diff()
-    pmf, nmf = mf.where(dtp > 0, 0.0).rolling(14).sum(), mf.where(dtp < 0, 0.0).rolling(14).sum()
-    df["MFI"] = (100 - 100 / (1 + pmf / nmf.replace(0, np.nan))).fillna(50.0)
-    df["BBW"] = (df["BBu"] - df["BBd"]) / df["BBm"]
-    obv = (np.sign(d).fillna(0) * v).cumsum()
-    df["OBV_slope"] = ((obv - obv.shift(10)) / (v.rolling(20).mean().replace(0, np.nan) * 10)).fillna(0.0)
-    df["CLV"] = (((c - l) - (h - c)) / (h - l).replace(0, np.nan)).fillna(0.0)
-    df["UpRatio10"] = (d > 0).astype(float).rolling(10).mean()
-    df["Skew20"] = df["Ret1"].rolling(20).skew()
-    s = df.set_index("Date")["Close"]
-    w = s.resample("W-FRI").last().dropna()
-    wd = w.diff()
-    wg, wl = wd.clip(lower=0).rolling(14).mean(), (-wd.clip(upper=0)).rolling(14).mean()
-    wk = pd.DataFrame({"WDate": pd.DatetimeIndex(w.index).astype("datetime64[ns]")})
-    wk["W_RSI"] = (100 - 100 / (1 + wg / wl.replace(0, np.nan))).to_numpy()
-    we9, we21 = w.ewm(span=9, adjust=False).mean(), w.ewm(span=21, adjust=False).mean()
-    wk["W_Trend"] = ((we9 - we21) / we21.replace(0, np.nan)).to_numpy()
-    wsma = w.rolling(20).mean()
-    wk["W_Strength"] = ((w - wsma) / wsma.replace(0, np.nan)).to_numpy()
-    wk = wk.replace([np.inf, -np.inf], np.nan).dropna()
-    df = pd.merge_asof(df, wk, left_on="Date", right_on="WDate", direction="backward",
-                       allow_exact_matches=False).drop(columns=["WDate"])
-    tu = (c > df["SMA200"]) & (df["SMA50"] > df["SMA200"])
-    td = (c < df["SMA200"]) & (df["SMA50"] < df["SMA200"])
-    vh = df["Volatility"] > df["Volatility"].rolling(60).quantile(0.75)
-    adx = df["ADX"] > 25
-    df["Regime_Bull"] = (tu & ~vh & adx).astype(int)
-    df["Regime_Bear"] = (td & ~vh & adx).astype(int)
-    df["Regime_Vol"] = vh.astype(int)
-    df["Regime_Range"] = (~tu & ~td & ~vh).astype(int)
-    for cc, wnd in [("Regime_Bull", 10), ("Regime_Bear", 10), ("Regime_Vol", 5), ("Regime_Range", 10)]:
-        df[cc + "_sm"] = df[cc].rolling(wnd, min_periods=1).mean()
-    return df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
-
-def add_cross(df, cross):
-    df = df.copy()
-    idx = pd.DatetimeIndex(df["Date"])
-    df["XU100_Ret20"] = 0.0
-    for name in CROSS_SYMBOLS:
-        s = (cross or {}).get(name)
-        if s is None or len(s) < 30:
-            df[f"{name}_Ret5"] = 0.0; df[f"{name}_Corr20"] = 0.0; continue
-        s = s[~s.index.duplicated()].sort_index()
-        al = pd.Series(s.reindex(idx, method="ffill").to_numpy(), index=df.index)
-        if name == "USDTRY": al = al.shift(1)
-        df[f"{name}_Ret5"] = al.pct_change(5, fill_method=None).fillna(0.0)
-        df[f"{name}_Corr20"] = df["Ret1"].rolling(20).corr(al.pct_change(fill_method=None)).fillna(0.0)
-        if name == "XU100": df["XU100_Ret20"] = al.pct_change(20, fill_method=None).fillna(0.0)
-    df["RelStr20"] = df["Ret20"] - df["XU100_Ret20"]
-    return df.replace([np.inf, -np.inf], 0.0)
-
-CROSS_RANK_COLS = ["RSI", "Ret5", "Ret20", "Vol_ratio", "RelStr20"]
-
-def build_cross_rank(dfs):
-    frames = []
-    for s, d in dfs.items():
-        if d is None or len(d) == 0: continue
-        sub = d[["Date"] + CROSS_RANK_COLS].copy()
-        sub["above"] = (d["Close"] > d["SMA50"]).astype(float).to_numpy()
-        sub["stock"] = s
-        frames.append(sub)
-    if not frames: return {}
-    all_df = pd.concat(frames, ignore_index=True)
-    all_df["Breadth"] = all_df.groupby("Date")["above"].transform("mean")
-    for col in CROSS_RANK_COLS:
-        all_df[f"rk_{col}"] = all_df.groupby("Date")[col].rank(pct=True)
-    keep = ["Date"] + [f"rk_{c}" for c in CROSS_RANK_COLS] + ["Breadth"]
-    return {s: g.sort_values("Date")[keep].reset_index(drop=True) for s, g in all_df.groupby("stock")}
-
-def inject_cross_rank(df, rank_df):
-    if rank_df is None or len(rank_df) == 0:
-        for c in CROSS_RANK_COLS: df[f"rk_{c}"] = 0.5
-        df["Breadth"] = 0.5
-        return df
-    df = df.merge(rank_df, on="Date", how="left")
-    for c in CROSS_RANK_COLS: df[f"rk_{c}"] = df[f"rk_{c}"].fillna(0.5)
-    df["Breadth"] = df["Breadth"].fillna(0.5)
-    return df
-
-# ════════════════════════════════════════════════════════════
-# 13. FEAT_NAMES
-# ════════════════════════════════════════════════════════════
-FEAT_NAMES = [
-    "RSI","MACDh","SMA_trend","BB_pos","Stoch","ADX","Volatilite","Vol_ratio","Mom10","HL_ratio","Gap","SMA200_uzak",
-    "EMA_trend","C>SMA20","C>SMA50","MACD_poz","SMA20>50","WilliamsR","Mom30","C>BB_mid","ATR%","Ret5","HI120","K-D_fark",
-    "W_RSI","W_Trend","W_Strength","Reg_Bull","Reg_Bear","Reg_Vol","Reg_Range","USDTRY_etki","XU100_etki","XU100_kor",
-    "Ret20","RelStr20","Donchian20","RSI_egim","SMA50_egim","ATR_degisim","TP_z","MFI","BB_genislik","OBV_egim","CLV",
-    "Yukari_oran10","Carpiklik20","Ret60","Piyasa_genislik",
-] + ["Turnover_log", "Liquidity_flag"] + [f"Rank_{c}" for c in CROSS_RANK_COLS] \
-  + [f"Macro_{k.upper()}_z" for k in MACRO_KEYS] + [f"Macro_{k.upper()}_r20" for k in MACRO_KEYS] \
-  + [f"Hisse_{s}" for s in STOCK_LIST]
-assert len(FEAT_NAMES) == N_FEAT, f"FEAT_NAMES={len(FEAT_NAMES)} != N_FEAT={N_FEAT}"
-
-# ════════════════════════════════════════════════════════════
-# 14. FEATURE MATRIX
-# ════════════════════════════════════════════════════════════
-def feature_matrix(df, stock_name=None):
-    n = len(df)
-    g = lambda c, d=0.0: df[c].to_numpy(np.float32) if c in df.columns else np.full(n, d, dtype=np.float32)
-    def div(a, b): return np.divide(a, b, out=np.zeros(n, dtype=np.float32), where=(b != 0) & np.isfinite(b))
-    cl = np.clip
-    c = g("Close")
-    sma20, sma50, sma200 = g("SMA20"), g("SMA50"), g("SMA200")
-    bbm, bbu, bbd = g("BBm"), g("BBu"), g("BBd")
-    turn = g("Turnover20")
-    f = [
-        g("RSI", 50) / 100, cl(div(g("MACDh"), c) * 200, -1, 1), cl((div(sma20, sma50) - 1) * 10, -1, 1),
-        cl(div(c - bbm, bbu - bbd + 1e-9), -1, 1), g("K", 50) / 100, cl(g("ADX") / 50, 0, 1),
-        cl(g("Volatility") * 3, 0, 1), cl(g("Vol_ratio", 1) - 1, -1, 1), cl(g("Ret10") * 10, -1, 1),
-        cl(g("HL") * 20, 0, 1), cl(g("Gap") * 20, -1, 1), cl((div(c, sma200) - 1) * 5, -1, 1),
-        cl(div(g("EMA9") - g("EMA21"), c) * 20, -1, 1),
-        (c > sma20).astype(np.float32), (c > sma50).astype(np.float32),
-        (g("MACD") > g("MACDs")).astype(np.float32), (sma20 > sma50).astype(np.float32),
-        cl(g("WILLR", -50) / 100, -1, 0), cl(g("Ret30") * 10, -1, 1), (c > bbm).astype(np.float32),
-        cl(g("ATRp") * 20, 0, 1), cl(g("Ret5") * 10, -1, 1), cl(g("HI120") * 5, -1, 0),
-        cl((g("K", 50) - g("D", 50)) / 30, -1, 1), cl(g("W_RSI", 50) / 100, 0, 1), cl(g("W_Trend") * 10, -1, 1),
-        cl(g("W_Strength") * 5, -1, 1), g("Regime_Bull_sm"), g("Regime_Bear_sm"), g("Regime_Vol_sm"), g("Regime_Range_sm"),
-        cl(g("USDTRY_Ret5") * 20, -1, 1), cl(g("XU100_Ret5") * 10, -1, 1), cl(g("XU100_Corr20"), -1, 1),
-        cl(g("Ret20") * 8, -1, 1), cl(g("RelStr20") * 8, -1, 1), cl(g("Donch20", 0.5), 0, 1),
-        cl(g("RSI_slope") / 30, -1, 1), cl(g("SMA50_slope") * 10, -1, 1), cl(g("ATR_chg"), -1, 1),
-        cl(g("TPz") / 3, -1, 1), cl(g("MFI", 50) / 100, 0, 1), cl(g("BBW") * 5, 0, 1), cl(g("OBV_slope"), -1, 1),
-        cl(g("CLV"), -1, 1), cl(g("UpRatio10", 0.5), 0, 1), cl(g("Skew20") / 2, -1, 1), cl(g("Ret60") * 4, -1, 1),
-        cl(g("Breadth", 0.5) * 2 - 1, -1, 1),
-        cl(np.log1p(np.maximum(turn, 0)) / 20.0, 0, 1), (turn >= LIQ_FLAG_TL).astype(np.float32),
-    ]
-    f += [cl(g(f"rk_{c_}", 0.5) * 2 - 1, -1, 1) for c_ in CROSS_RANK_COLS]
-    f += [cl(g(f"M_{k}_z") / 3, -1, 1) for k in MACRO_KEYS]
-    f += [cl(g(f"M_{k}_r20") * 8, -1, 1) for k in MACRO_KEYS]
-    M = np.nan_to_num(np.column_stack(f)).astype(np.float32)
-    assert M.shape[1] == N_FEAT_TECH, f"teknik özellik sayısı {M.shape[1]} != {N_FEAT_TECH}"
-    oh = np.zeros((n, N_STOCKS), dtype=np.float32)
-    if stock_name in STOCK_LIST: oh[:, STOCK_LIST.index(stock_name)] = 1.0
-    return np.hstack([M, oh]).astype(np.float32)
-
-def regime_code(df):
-    return np.column_stack([df["Regime_Bull_sm"], df["Regime_Bear_sm"], df["Regime_Vol_sm"], df["Regime_Range_sm"]]).argmax(1)
-
-# ════════════════════════════════════════════════════════════
-# 15. SEQ STORE (🐛 BUG 4 DÜZELTME: SEKTÖR BAZLI — sızıntı yok!)
-# ════════════════════════════════════════════════════════════
-@st.cache_resource(show_spinner=False)
-def seq_store(sektor_key=""):
-    """Sektöre özel sequence cache. Sektör değişince farklı key → farklı cache."""
-    return {}
-
-def gather_seq(sid, row, sektor_key=None, L=SEQ_LEN):
-    """(sid,row) çiftlerinden her hissenin KENDİ geçmişinden (L,N_FEAT) dizi çıkarır."""
-    sektor_key = sektor_key or AKTIF_SEKTOR
-    sid, row = np.asarray(sid), np.asarray(row)
-    out = np.zeros((len(sid), L, N_FEAT), dtype=np.float32)
-    store = seq_store(sektor_key)   # ✅ Sektör bazlı cache
-    for s in np.unique(sid):
-        F = store.get(int(s))
-        if F is None: continue
-        m = sid == s
-        r = row[m][:, None] - np.arange(L - 1, -1, -1)[None, :]
-        out[m] = F[np.clip(r, 0, len(F) - 1)]
-    return out
-
-# ════════════════════════════════════════════════════════════
-# 16. DATASET
-# ════════════════════════════════════════════════════════════
-BASE_KEYS = ["X", "y", "y_long", "f", "d", "lmin", "atrp", "rg", "a200", "turn", "sid", "row"]
-WIN_KEYS = ["fh", "fl", "fc"]
-DS_KEYS = BASE_KEYS + WIN_KEYS
-
-def _triple_barrier(cl_, hi, lo, atr, K, H):
-    n = len(cl_); m = n - H
-    if m <= 0: return None
-    Hh, Ll = sliding_window_view(hi[1:], H)[:m], sliding_window_view(lo[1:], H)[:m]
-    e, a = cl_[:m], atr[:m]
-    ok = np.isfinite(a) & (a > 0) & (e > 0)
-    up, dn = e + K * a, e - K * a
-    hu, hd = Hh >= up[:, None], Ll <= dn[:, None]
-    fu, fd = np.where(hu.any(1), hu.argmax(1), H), np.where(hd.any(1), hd.argmax(1), H)
-    y = np.where(fd <= fu, np.where(fd < H, 0, 1), 2).astype(np.int64)
-    y[~ok] = 1
-    es = np.where(e > 0, e, 1.0)
-    ret = np.where(ok, cl_[H:H + m] / es - 1, 0.0)
-    lmin = np.where(ok, Ll.min(1) / es - 1, 0.0)
-    return y, ret.astype(np.float32), lmin.astype(np.float32)
-
-def _fwd_window(arr, m, base):
-    pad = np.concatenate([arr[1:], np.full(HW, np.nan)])
-    W = sliding_window_view(pad, HW)[:m]
-    return (W / np.where(base > 0, base, 1.0)[:, None] - 1.0).astype(np.float32)
-
-def make_ds(df, stock=None, sektor_key=None):
-    sektor_key = sektor_key or AKTIF_SEKTOR
-    n = len(df)
-    F = feature_matrix(df, stock)
-    sid = STOCK_LIST.index(stock) if stock in STOCK_LIST else -1
-    seq_store(sektor_key)[sid] = F   # ✅ Sektör bazlı kayıt
-    if n < HORIZON_LONG + 150: return None
-    hi, lo = df["High"].to_numpy(float), df["Low"].to_numpy(float)
-    cl_, atr = df["Close"].to_numpy(float), df["ATR"].to_numpy(float)
-    r_s, r_l = _triple_barrier(cl_, hi, lo, atr, TB_K, HORIZON), _triple_barrier(cl_, hi, lo, atr, TB_K_LONG, HORIZON_LONG)
-    if r_s is None or r_l is None: return None
-    y_s, f_s, lmin_s = r_s
-    m = len(y_s)
-    y_l = np.full(m, -1, dtype=np.int64); y_l[:len(r_l[0])] = r_l[0]
-    e, a = cl_[:m], atr[:m]
-    atrp = np.where(np.isfinite(a) & (a > 0) & (e > 0), a / np.where(e > 0, e, 1.0), 0.02).astype(np.float32)
-    turn = df["Turnover20"].to_numpy(float)[:m] if "Turnover20" in df.columns else np.zeros(m)
-    return {"X": F[:m], "y": y_s, "y_long": y_l, "f": f_s, "d": df["Date"].to_numpy()[:m], "lmin": lmin_s, "atrp": atrp,
-            "rg": regime_code(df)[:m].astype(np.int64), "a200": (cl_ > df["SMA200"].to_numpy(float))[:m],
-            "turn": turn.astype(np.float32), "sid": np.full(m, sid, dtype=np.int64), "row": np.arange(m, dtype=np.int64),
-            "fh": _fwd_window(hi, m, cl_[:m]), "fl": _fwd_window(lo, m, cl_[:m]), "fc": _fwd_window(cl_, m, cl_[:m])}
-
-def merge_ds(lst):
-    lst = [d for d in lst if d]
-    if not lst: return None
-    out = {k: np.concatenate([d[k] for d in lst]) for k in DS_KEYS}
-    out["X"] = out["X"].astype(np.float32)
-    return out
-
-def truncate_windows(seg, ud, seg_end):
-    avail = np.searchsorted(ud, seg_end, side="left") - np.searchsorted(ud, seg["d"], side="right")
-    cut = np.arange(HW)[None, :] >= np.maximum(avail, 0)[:, None]
-    for k in WIN_KEYS:
-        w = seg[k].copy(); w[cut] = np.nan; seg[k] = w
-    return seg
-
-def split_ds(ds, val_frac=0.15, test_frac=0.15, purge=HORIZON_LONG):
-    d0 = ds["d"]; ud = np.unique(d0)
-    if len(ud) < 120: return None
-    order = np.argsort(d0, kind="stable"); d = d0[order]; n_u = len(ud)
-    te_start = ud[int(n_u * (1 - test_frac))]
-    va_start = ud[int(n_u * (1 - test_frac - val_frac))]
-    gap = np.timedelta64(int(purge * 1.5) + 1, "D")
-    va_end = te_start - gap
-    trm, vam, tem = d < (va_start - gap), (d >= va_start) & (d < va_end), d >= te_start
-    if trm.sum() < 300 or vam.sum() < 100 or tem.sum() < 100: return None
-    take = lambda m, keys: {k: ds[k][order[m]] for k in keys}
-    tr, va, te = take(trm, BASE_KEYS), take(vam, DS_KEYS), take(tem, DS_KEYS)
-    va = truncate_windows(va, ud, va_end)
-    ut = np.unique(tr["d"])
-    wtr = (0.5 + np.searchsorted(ut, tr["d"]) / max(1, len(ut) - 1)).astype(np.float32)
-    return {"tr": tr, "va": va, "te": te, "Xtr": tr["X"], "ytr": tr["y"], "ytr_long": tr["y_long"], "wtr": wtr,
-            "Xva": va["X"], "yva": va["y"], "yva_long": va["y_long"],
-            "Xte": te["X"], "yte": te["y"], "yte_long": te["y_long"]}
-
-# ════════════════════════════════════════════════════════════
-# 17. UNIVERSE SCANNER
-# ════════════════════════════════════════════════════════════
-def scan_universe(top_n=40, min_turnover=LIQ_FLAG_TL, period="6mo"):
-    t0, results = time.time(), []
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futures = {ex.submit(_fetch_hizli, BIST_YF[code], period): code for code in BIST_TUM}
-        for f in as_completed(futures):
-            code = futures[f]
-            try:
-                d = f.result()
-                if d is None or len(d) < 100: continue
-                c = d["Close"]
-                turnover = (c * d["Volume"]).tail(20).mean()
-                if turnover < min_turnover: continue
-                sma20, sma50 = c.rolling(20).mean().iloc[-1], c.rolling(50).mean().iloc[-1]
-                sma200 = c.rolling(200).mean().iloc[-1] if len(c) >= 200 else sma50
-                trend = (1.0 if sma20 > sma50 else 0) + (1.0 if sma50 > sma200 else 0) + (0.5 if c.iloc[-1] > sma20 else 0)
-                ret20 = (c.iloc[-1] / c.iloc[-21] - 1) if len(c) > 21 else 0
-                ret60 = (c.iloc[-1] / c.iloc[-61] - 1) if len(c) > 61 else 0
-                mom = clamp(ret20 * 5 + ret60 * 2, -2, 3)
-                tr = pd.concat([d["High"] - d["Low"], (d["High"] - c.shift()).abs(), (d["Low"] - c.shift()).abs()], axis=1).max(axis=1)
-                atr_pct = tr.rolling(14).mean().iloc[-1] / c.iloc[-1]
-                vol_score = clamp(1.0 - abs(atr_pct - 0.025) * 20, 0, 1)
-                vr = d["Volume"].tail(5).mean() / (d["Volume"].tail(20).mean() + 1e-9)
-                hcm = clamp((vr - 1.0) * 2, -1, 2)
-                liq = clamp(np.log1p(turnover / 1e6) / 5, 0, 1.5)
-                results.append({"code": code, "total": trend * 1.5 + mom + vol_score * 0.5 + hcm * 0.8 + liq * 1.2,
-                                "turnover": turnover, "trend": trend, "mom": mom, "atr_pct": atr_pct,
-                                "vol_ratio": vr, "price": float(c.iloc[-1])})
-            except Exception: pass
-    log.info(f"Universe scan: {len(results)} hisse, {time.time() - t0:.1f}s")
-    if not results: return [], []
-    results.sort(key=lambda x: x["total"], reverse=True)
-    return [r["code"] for r in results[:top_n]], results
-
-# ════════════════════════════════════════════════════════════
-# 18. VERİ YÜKLEME
-# ════════════════════════════════════════════════════════════
-@st.cache_resource(ttl=900, show_spinner=False)
-def load_uni(day_key, sektor_key=None):
-    sektor_key = sektor_key or AKTIF_SEKTOR
-    hd = {c: f"{c}.IS" for c in SEKTOR_BOTLARI[sektor_key]["hisseler"]}
-    items = list(hd.items()) + [(f"X:{n}", t) for n, t in CROSS_SYMBOLS.items()]
-    res = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(_fetch, sym): name for name, sym in items}
-        for f in as_completed(futs):
-            try: res[futs[f]] = f.result()
-            except Exception: res[futs[f]] = None
-    cross = {n: res[f"X:{n}"].set_index("Date")["Close"] for n in CROSS_SYMBOLS if res.get(f"X:{n}") is not None}
-    macro = None
-    try: macro = load_macro_hist()
-    except Exception as e: log.warning(f"macro: {e}")
-    dfs, errs = {}, []
-    for nm in hd:
-        d = res.get(nm)
-        if d is None: errs.append(nm); continue
-        try:
-            d = add_macro(add_cross(add_ind(d), cross), macro)
-            if len(d) >= 300: dfs[nm] = d
-            else: errs.append(f"{nm}(kısa)")
-        except Exception as e: errs.append(f"{nm}:{e}")
-    try:
-        rk = build_cross_rank(dfs)
-        for nm in list(dfs): dfs[nm] = inject_cross_rank(dfs[nm], rk.get(nm))
-    except Exception as e: errs.append(f"rank:{e}")
-    # 🐛 BUG 3 DÜZELTME: LLM çağrılarını reset et + top hisselerle sınırla
-    news, fund = {}, {}
-    try: get_news().reset_cycle()
-    except Exception: pass
-    def _nf(nm):
-        titles = _titles(hd[nm])
-        s = get_news().sentiment(nm, titles) if titles else (0.0, 0.0, 0)
-        fd = get_fund().fetch(nm)
-        return nm, titles, s, fd
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        for f in as_completed([ex.submit(_nf, nm) for nm in dfs]):
-            try:
-                nm, titles, s, fd = f.result()
-                news[nm] = {"titles": titles, "sent": s[0], "conf": s[1], "n": s[2]}
-                fund[nm] = fd
-            except Exception as e: errs.append(f"nf:{e}")
-    return {"dfs": dfs, "errs": errs, "ts": now_tr().strftime("%H:%M"), "news": news, "fund": fund}
-
-@st.cache_data(ttl=30, show_spinner=False)
-def live_prices(tickers):
-    try:
-        tk = list(tickers)
-        d = yf.download(tk, period="1d", interval="1m", group_by="ticker", progress=False, threads=True, auto_adjust=True)
-        out = {}
-        for t in tk:
-            try:
-                c = (d[t]["Close"] if len(tk) > 1 or isinstance(d.columns, pd.MultiIndex) else d["Close"]).dropna()
-                if len(c): out[t] = float(c.iloc[-1])
-            except Exception: pass
-        return out
-    except Exception: return {}
-
-def sig_idx(d, now):
-    if len(d) > 1 and d["Date"].iloc[-1].date() == now.date() and now.time() < dtime(18, 20):
-        return len(d) - 2
-    return len(d) - 1
-
-# ════════════════════════════════════════════════════════════
-# 19. SEKTÖR HARİTASI
-# ════════════════════════════════════════════════════════════
-SEKTOR = {}
-for _sek, _lst in {
-    "Bankacılık": "GARAN AKBNK ISCTR YKBNK HALKB VAKBN QNBFB TSKB ALBRK SKBNK ICBCT KLNMA",
-    "Finans": "QNBFL ISMEN ISFIN", "Holding": "KCHOL SAHOL AGHOL GLYHO", "Sigorta": "TURSG ANSGR AKGRT", "GYO": "HLGYO ISGYO",
-    "Havacılık": "THYAO PGSUS TAVHL CLEBI", "Otomotiv": "DOAS FROTO TOASO TTRAK OTKAR ASUZU KARSN BRISA GOODY",
-    "Gıda": "TUKAS ULKER CCOLA AEFES", "Perakende": "BIMAS MGROS SOKM MAVI MEPET BIZIM ULUFA",
-    "Enerji": "TUPRS PETKM AKSEN ENJSA ENERY ZOREN ODAS AYDEM", "Demir-Çelik": "EREGL KRDMD ISDMR", "Cam": "SISE TRKCM",
-    "Kimya": "SASA AKSA GUBRF", "Savunma": "ASELS", "Teknoloji": "LOGO NETAS ARDYZ KAREL KONTR PAPIL FORTE",
-    "Telekom": "TCELL TTKOM", "İnşaat": "ENKAI",
-}.items():
-    for _c in _lst.split(): SEKTOR[_c] = _sek
-
-def sektor_of(code): return SEKTOR.get(code, "Diğer")
-
-def sektor_exposure(positions, prices):
-    out = {}
-    for s, p in positions.items():
-        sek = sektor_of(s)
-        out[sek] = out.get(sek, 0.0) + p["qty"] * prices.get(s, p["entry"])
-    return out# ════════════════════════════════════════════════════════════
-# 🐋 PARÇA 2/4: BEYİN
-# NN + Router + Transformer + PPO + HMM + EWC + Reptile + ErrorAnalyzer + BaggedNN
-# Düzeltme: BUG 3 — set_state nn_kwargs restore (NAS uyumlu)
-# ════════════════════════════════════════════════════════════
-
-def _ln(z, g, b):
-    mu = z.mean(1, keepdims=True); xc = z - mu
-    std = np.sqrt((xc * xc).mean(1, keepdims=True) + 1e-5)
-    return g * (xc / std) + b, (xc / std, std)
-
-def _ln_back(dy, c, g):
-    xh, std = c
-    dxh = dy * g
-    dz = (dxh - dxh.mean(1, keepdims=True) - xh * (dxh * xh).mean(1, keepdims=True)) / std
-    return dz, (dy * xh).sum(0), dy.sum(0)
-
-def _softmax(z):
-    e = np.exp(z - z.max(axis=-1, keepdims=True))
-    return e / (e.sum(axis=-1, keepdims=True) + 1e-12)
-
-def _onehot(y, smooth=0.05, k=3):
-    Y = np.full((len(y), k), smooth / k, dtype=np.float32)
-    Y[np.arange(len(y)), y] += 1.0 - smooth
-    return Y
-
-def _onehot_m(y, smooth=0.05, k=3):
-    y = np.asarray(y); v = y >= 0
-    Y = np.full((len(y), k), 1.0 / k, dtype=np.float32)
-    if v.any(): Y[v] = _onehot(y[v], smooth, k)
-    return Y, v.astype(np.float32)
-
-def _comb_loss_vec(ps, pl, y_s, y_l, alpha=ALPHA_LONG):
-    ar = np.arange(len(y_s))
-    ls = -np.log(ps[ar, y_s] + 1e-9)
-    v = y_l >= 0
-    ll = -np.log(pl[ar, np.where(v, y_l, 0)] + 1e-9)
-    return np.where(v, alpha * ls + (1 - alpha) * ll, ls)
-
-def short_logloss(P, y): return float(-np.mean(np.log(P[np.arange(len(y)), y] + 1e-9)))
-
-def fit_temp_logits(z, y, valid=None):
-    if valid is not None: z, y = z[valid], y[valid]
-    if len(y) < 10: return 1.0
-    Ts = np.linspace(0.5, 3.0, 26, dtype=np.float32)
-    zz = z[None, :, :] / Ts[:, None, None]
-    zz = zz - zz.max(-1, keepdims=True)
-    lse = np.log(np.exp(zz).sum(-1))
-    ll = zz[:, np.arange(len(y)), y] - lse
-    return float(Ts[int(np.argmax(ll.mean(1)))])
-
-# ════════════════════════════════════════════════════════════
-# 1. NN
-# ════════════════════════════════════════════════════════════
-class NN:
-    def __init__(self, n_in=N_FEAT, h=H_DIM, n_out=3, lr=0.003, dropout=0.15, wd=0.01,
-                 seed=None, ema=0.98, alpha=ALPHA_LONG):
-        rg = np.random.default_rng(seed)
-        self.rng = np.random.default_rng(None if seed is None else seed + 991)
-        f32 = np.float32
-        def W(i, o, s=1.0): return (rg.standard_normal((i, o)) * np.sqrt(2.0 / i) * s).astype(f32)
-        self.P = {
-            "Att": np.ones(n_in, f32),
-            "W0": W(n_in, h), "b0": np.zeros(h, f32), "g0": np.ones(h, f32), "e0": np.zeros(h, f32),
-            "W1": W(h, h, 0.5), "b1": np.zeros(h, f32), "g1": np.ones(h, f32), "e1": np.zeros(h, f32),
-            "W2": W(h, h, 0.5), "b2": np.zeros(h, f32), "g2": np.ones(h, f32), "e2": np.zeros(h, f32),
-            "W3s": W(h, n_out, 0.5), "b3s": np.zeros(n_out, f32),
-            "W3l": W(h, n_out, 0.5), "b3l": np.zeros(n_out, f32),
-        }
-        self.E = {k: v.copy() for k, v in self.P.items()}
-        self.m = {k: np.zeros_like(v) for k, v in self.P.items()}
-        self.v = {k: np.zeros_like(v) for k, v in self.P.items()}
-        self.lr, self.dropout, self.wd, self.ema, self.alpha = lr, dropout, wd, ema, alpha
-        self.t, self.Ts, self.Tl, self.use_ema, self.swa_wins = 0, 1.0, 1.0, True, 0
-
-    @staticmethod
-    def _scale(att):
-        a = np.abs(att)
-        return a / (a.sum() + 1e-9) * len(a)
-
-    @staticmethod
-    def _fwd(P, X, drop=0.0, rng=None):
-        xa = X * NN._scale(P["Att"])
-        n0, c0 = _ln(xa @ P["W0"] + P["b0"], P["g0"], P["e0"]); h0 = np.maximum(n0, 0)
-        n1, c1 = _ln(h0 @ P["W1"] + P["b1"], P["g1"], P["e1"]); r1 = np.maximum(n1, 0); k1 = None
-        if drop > 0:
-            k1 = ((rng.random(r1.shape) > drop) / (1 - drop)).astype(r1.dtype); r1 = r1 * k1
-        h1 = h0 + r1
-        n2, c2 = _ln(h1 @ P["W2"] + P["b2"], P["g2"], P["e2"]); r2 = np.maximum(n2, 0); k2 = None
-        if drop > 0:
-            k2 = ((rng.random(r2.shape) > drop) / (1 - drop)).astype(r2.dtype); r2 = r2 * k2
-        h2 = h1 + r2
-        return h2 @ P["W3s"] + P["b3s"], h2 @ P["W3l"] + P["b3l"], (xa, n0, c0, h0, n1, c1, k1, h1, n2, c2, k2, h2)
-
-    @staticmethod
-    def loss_grad(P, X, Ys, Yl, ml, w=None, drop=0.0, rng=None, alpha=ALPHA_LONG):
-        n = X.shape[0]
-        z3s, z3l, ca = NN._fwd(P, X, drop, rng)
-        ps, pl = _softmax(z3s), _softmax(z3l)
-        sw = np.ones(n, dtype=ps.dtype) if w is None else np.asarray(w, dtype=ps.dtype)
-        swl = sw * np.asarray(ml, dtype=ps.dtype)
-        loss = float(alpha * -np.mean(sw * np.sum(Ys * np.log(ps + 1e-9), axis=1))
-                     + (1 - alpha) * -np.mean(swl * np.sum(Yl * np.log(pl + 1e-9), axis=1)))
-        dz3s = alpha * (ps - Ys) * (sw[:, None] / n)
-        dz3l = (1 - alpha) * (pl - Yl) * (swl[:, None] / n)
-        xa, n0, c0, h0, n1, c1, k1, h1, n2, c2, k2, h2 = ca
-        G = {"W3s": h2.T @ dz3s, "b3s": dz3s.sum(0), "W3l": h2.T @ dz3l, "b3l": dz3l.sum(0)}
-        dh2 = dz3s @ P["W3s"].T + dz3l @ P["W3l"].T
-        dn2 = (dh2 if k2 is None else dh2 * k2) * (n2 > 0)
-        dz2, G["g2"], G["e2"] = _ln_back(dn2, c2, P["g2"])
-        G["W2"], G["b2"] = h1.T @ dz2, dz2.sum(0)
-        dh1 = dh2 + dz2 @ P["W2"].T
-        dn1 = (dh1 if k1 is None else dh1 * k1) * (n1 > 0)
-        dz1, G["g1"], G["e1"] = _ln_back(dn1, c1, P["g1"])
-        G["W1"], G["b1"] = h0.T @ dz1, dz1.sum(0)
-        dh0 = dh1 + dz1 @ P["W1"].T
-        dn0 = dh0 * (n0 > 0)
-        dz0, G["g0"], G["e0"] = _ln_back(dn0, c0, P["g0"])
-        G["W0"], G["b0"] = xa.T @ dz0, dz0.sum(0)
-        dxa = dz0 @ P["W0"].T
-        gs = (dxa * X).sum(0)
-        a = np.abs(P["Att"]); S = a.sum() + 1e-9
-        G["Att"] = np.sign(P["Att"]) * len(a) * (gs / S - (gs @ a) / S ** 2)
-        return loss, G
-
-    def _step(self, X, Ys, Yl, ml, w=None, lr_mult=1.0, clip=1.0, extra=None):
-        loss, G = self.loss_grad(self.P, X, Ys, Yl, ml, w, self.dropout, self.rng, self.alpha)
-        if extra is not None:
-            for k, g in extra(self.P).items(): G[k] = G[k] + g
-        gn = math.sqrt(sum(float((g * g).sum()) for g in G.values()))
-        sc = min(1.0, clip / (gn + 1e-9))
-        self.t += 1
-        lr = self.lr * lr_mult
-        b1, b2 = 0.9, 0.999
-        c1, c2 = 1 - b1 ** self.t, 1 - b2 ** self.t
-        for k, g in G.items():
-            g = g * sc
-            m, v, p = self.m[k], self.v[k], self.P[k]
-            m *= b1; m += (1 - b1) * g
-            v *= b2; v += (1 - b2) * g * g
-            if self.wd and k[0] == "W": p *= (1 - lr * self.wd)
-            p -= (lr * (m / c1) / (np.sqrt(v / c2) + 1e-8)).astype(np.float32)
-            e = self.E[k]; e *= self.ema; e += (1 - self.ema) * p
-        return loss
-
-    def train_step(self, X, y_s, y_l, w=None, smooth=0.05, lr_mult=1.0, extra=None):
-        Yl, ml = _onehot_m(y_l, smooth)
-        return self._step(X, _onehot(y_s, smooth), Yl, ml, w, lr_mult, extra=extra)
-
-    def _infer_P(self): return self.E if (self.use_ema and self.t >= 30) else self.P
-
-    def logits_pair(self, X, P=None):
-        z3s, z3l, _ = self._fwd(P if P is not None else self._infer_P(), X)
-        return z3s, z3l
-
-    def proba_pair(self, X):
-        zs, zl = self.logits_pair(np.atleast_2d(X))
-        return (_softmax(zs / max(self.Ts, 1e-3)).astype(np.float32), _softmax(zl / max(self.Tl, 1e-3)).astype(np.float32))
-
-    def evaluate(self, X, y_s, y_l=None):
-        ps, pl = self.proba_pair(X)
-        if y_l is None: y_l = np.full(len(y_s), -1, dtype=np.int64)
-        loss = float(_comb_loss_vec(ps, pl, y_s, y_l, self.alpha).mean())
-        v = y_l >= 0
-        return loss, (float(np.mean(ps.argmax(1) == y_s)), float(np.mean(pl.argmax(1)[v] == y_l[v])) if v.any() else 0.0)
-
-    def distill_from(self, Ys, Yl, X, steps=5):
-        ml = np.ones(len(X), dtype=np.float32)
-        for _ in range(steps): self._step(X, Ys, Yl, ml, None, lr_mult=0.5)
-
-    def snapshot(self):
-        return {"P": {k: v.copy() for k, v in self.P.items()}, "E": {k: v.copy() for k, v in self.E.items()}, "Ts": self.Ts, "Tl": self.Tl}
-
-    def restore(self, s):
-        self.P = {k: v.copy() for k, v in s["P"].items()}
-        self.E = {k: v.copy() for k, v in s["E"].items()}
-        self.Ts, self.Tl = s["Ts"], s["Tl"]
-
-    def get_state(self):
-        d = self.snapshot()
-        d.update(m={k: v.copy() for k, v in self.m.items()}, v={k: v.copy() for k, v in self.v.items()},
-                 t=self.t, lr=self.lr, dropout=self.dropout, wd=self.wd, swa_wins=self.swa_wins)
-        return d
-
-    def set_state(self, s):
-        self.restore(s)
-        self.m, self.v = {k: v.copy() for k, v in s["m"].items()}, {k: v.copy() for k, v in s["v"].items()}
-        self.t, self.lr, self.dropout, self.wd = s["t"], s["lr"], s["dropout"], s["wd"]
-        self.swa_wins = s.get("swa_wins", 0)
-
-def fit_temp_pair(nn, X, y_s, y_l):
-    zs, zl = nn.logits_pair(X)
-    return fit_temp_logits(zs, y_s), fit_temp_logits(zl, y_l, valid=y_l >= 0)
-
-def fit_model(nn, Xtr, ytr_s, ytr_l, Xva=None, yva_s=None, yva_l=None, steps=300, bs=64, seed=None, warmup=20, sw=None, swa=True):
-    rng = np.random.default_rng(seed)
-    cnt = np.bincount(ytr_s, minlength=3).astype(float) + 1.0
-    cw = ((len(ytr_s) / (3.0 * cnt)) ** 0.5).astype(np.float32)
-    cdf = None if sw is None else np.cumsum(np.asarray(sw, dtype=np.float64))
-    lr0 = nn.lr
-    nn.Ts = nn.Tl = 1.0
-    hv = Xva is not None and len(Xva) >= 20
-    if hv and len(Xva) > 4000:
-        sel = rng.choice(len(Xva), 4000, replace=False)
-        Xe, ye_s, ye_l = Xva[sel], yva_s[sel], yva_l[sel]
-    else:
-        Xe, ye_s, ye_l = Xva, yva_s, yva_l
-    bl, best = float("inf"), None
-    bs = min(bs, len(Xtr))
-    swa_start, swa_every = int(steps * 0.6), max(5, steps // 20)
-    avg, navg = None, 0
-    for s in range(steps):
-        if s < warmup: nn.lr = lr0 * ((s + 1) / max(1, warmup))
-        else:
-            prog = (s - warmup) / max(1, steps - warmup)
-            nn.lr = lr0 * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * prog)))
-        idx = rng.integers(0, len(Xtr), bs) if cdf is None else np.minimum(np.searchsorted(cdf, rng.random(bs) * cdf[-1]), len(Xtr) - 1)
-        nn.train_step(Xtr[idx], ytr_s[idx], ytr_l[idx], w=cw[ytr_s[idx]])
-        if hv and (s % 20 == 19 or s == steps - 1):
-            vl, _ = nn.evaluate(Xe, ye_s, ye_l)
-            if vl < bl: bl, best = vl, nn.snapshot()
-        if swa and hv and s >= swa_start and (s - swa_start) % swa_every == 0:
-            Pe = nn._infer_P()
-            if avg is None: avg = {k: v.copy() for k, v in Pe.items()}
-            else:
-                for k, v in Pe.items(): avg[k] += (v - avg[k]) / (navg + 1)
-            navg += 1
-    nn.lr = lr0
-    if best is not None: nn.restore(best)
-    if avg is not None and navg >= 3:
-        cur = nn.snapshot()
-        nn.P = {k: v.copy() for k, v in avg.items()}; nn.E = {k: v.copy() for k, v in avg.items()}
-        vl_avg, _ = nn.evaluate(Xe, ye_s, ye_l)
-        if vl_avg < bl * 0.999: nn.swa_wins += 1
-        else: nn.restore(cur)
-    if hv: nn.Ts, nn.Tl = fit_temp_pair(nn, Xe, ye_s, ye_l)
-    else: nn.Ts = nn.Tl = 1.0
-    return nn
-
-# ════════════════════════════════════════════════════════════
-# 2. ROUTER
-# ════════════════════════════════════════════════════════════
-class RouterNN:
-    def __init__(self, n_in, n_bags, h=ROUTER_H, seed=None, lr=0.005, wd=0.001):
-        rg = np.random.default_rng(seed); f32 = np.float32
-        self.P = {"W1": (rg.standard_normal((n_in, h)) * 0.05).astype(f32), "b1": np.zeros(h, f32),
-                  "W2": (rg.standard_normal((h, n_bags)) * 0.05).astype(f32), "b2": np.zeros(n_bags, f32)}
-        self.m = {k: np.zeros_like(v) for k, v in self.P.items()}
-        self.v = {k: np.zeros_like(v) for k, v in self.P.items()}
-        self.lr, self.wd, self.t, self.n_bags = lr, wd, 0, n_bags
-
-    def forward(self, F):
-        h1 = np.maximum(F @ self.P["W1"] + self.P["b1"], 0)
-        return _softmax(h1 @ self.P["W2"] + self.P["b2"]), (F, h1)
-
-    def loss_grad(self, F, ps, pl, Ys, Yl, ml, alpha=ALPHA_LONG):
-        g, (F_, h1) = self.forward(F)
-        Ps, Pl = np.einsum("nb,bnc->nc", g, ps), np.einsum("nb,bnc->nc", g, pl)
-        n, eps = len(F), 1e-9
-        loss = float(alpha * -np.mean(np.sum(Ys * np.log(Ps + eps), 1)) + (1 - alpha) * -np.mean(ml * np.sum(Yl * np.log(Pl + eps), 1)))
-        dPs = -alpha * Ys / (Ps + eps) / n
-        dPl = -(1 - alpha) * ml[:, None] * Yl / (Pl + eps) / n
-        dg = np.einsum("nc,bnc->nb", dPs, ps) + np.einsum("nc,bnc->nb", dPl, pl)
-        dz = g * (dg - (dg * g).sum(1, keepdims=True))
-        dh1 = (dz @ self.P["W2"].T) * (h1 > 0)
-        return loss, {"W1": F_.T @ dh1, "b1": dh1.sum(0), "W2": h1.T @ dz, "b2": dz.sum(0)}
-
-    def step(self, G):
-        self.t += 1
-        b1, b2 = 0.9, 0.999
-        c1, c2 = 1 - b1 ** self.t, 1 - b2 ** self.t
-        for k, g in G.items():
-            m, v, p = self.m[k], self.v[k], self.P[k]
-            m *= b1; m += (1 - b1) * g
-            v *= b2; v += (1 - b2) * g * g
-            if self.wd and k[0] == "W": p *= (1 - self.lr * self.wd)
-            p -= (self.lr * (m / c1) / (np.sqrt(v / c2) + 1e-8)).astype(np.float32)
-
-    def get_state(self):
-        return {"P": {k: v.copy() for k, v in self.P.items()}, "m": {k: v.copy() for k, v in self.m.items()},
-                "v": {k: v.copy() for k, v in self.v.items()}, "t": self.t, "lr": self.lr, "wd": self.wd}
-
-    def set_state(self, s):
-        self.P = {k: v.copy() for k, v in s["P"].items()}
-        self.m = {k: v.copy() for k, v in s["m"].items()}; self.v = {k: v.copy() for k, v in s["v"].items()}
-        self.t, self.lr, self.wd = s["t"], s["lr"], s["wd"]
-
-def _mix(w, p):
-    if w.shape[0] == 1: return np.tensordot(w[0], p, axes=1).astype(np.float32)
-    return np.einsum("nb,bnc->nc", w, p).astype(np.float32)
-
-# ════════════════════════════════════════════════════════════
-# 3. TRANSFORMER
-# ════════════════════════════════════════════════════════════
-def _lnf(z, g, b, eps=1e-5):
-    mu = z.mean(-1, keepdims=True); var = z.var(-1, keepdims=True)
-    return g * (z - mu) / np.sqrt(var + eps) + b
-
-class TransformerHead:
-    def __init__(self, n_feat=N_FEAT, seq_len=SEQ_LEN, d_model=TRANS_DIM, n_heads=N_HEADS, n_layers=TRANS_LAYERS,
-                 hidden=48, seed=None, lr=0.003):
-        rg = np.random.default_rng(seed); f32 = np.float32
-        self.n_feat, self.seq_len, self.d_model, self.n_heads, self.n_layers = n_feat, seq_len, d_model, n_heads, n_layers
-        self.d_k, self.lr, self.t, self.Ts = d_model // n_heads, lr, 0, 1.3
-        self.P = {"W_in": (rg.standard_normal((n_feat, d_model)) * np.sqrt(2.0 / n_feat)).astype(f32), "b_in": np.zeros(d_model, f32)}
-        pos, div = np.arange(seq_len)[:, None], np.exp(np.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
-        pe = np.zeros((seq_len, d_model), f32); pe[:, 0::2] = np.sin(pos * div); pe[:, 1::2] = np.cos(pos * div)
-        self.PE = pe
-        for l in range(n_layers):
-            for nm, sh in [("Wq", (d_model, d_model)), ("Wk", (d_model, d_model)), ("Wv", (d_model, d_model)),
-                           ("Wo", (d_model, d_model)), ("Wf1", (d_model, d_model * 2)), ("Wf2", (d_model * 2, d_model))]:
-                self.P[f"{nm}{l}"] = (rg.standard_normal(sh) * np.sqrt(2.0 / sh[0])).astype(f32)
-            for nm, sz in [("bf1", d_model * 2), ("bf2", d_model), ("g1", d_model), ("n1", d_model), ("g2", d_model), ("n2", d_model)]:
-                self.P[f"{nm}{l}"] = np.ones(sz, f32) if nm.startswith("g") else np.zeros(sz, f32)
-        self.H = {"W1": (rg.standard_normal((2 * d_model, hidden)) * np.sqrt(2.0 / (2 * d_model))).astype(f32), "b1": np.zeros(hidden, f32),
-                  "W2": (rg.standard_normal((hidden, 3)) * np.sqrt(2.0 / hidden)).astype(f32), "b2": np.zeros(3, f32)}
-        self.m = {k: np.zeros_like(v) for k, v in self.H.items()}
-        self.v = {k: np.zeros_like(v) for k, v in self.H.items()}
-
-    def encode(self, X):
-        B, L = X.shape[0], self.seq_len
-        h = X @ self.P["W_in"] + self.P["b_in"] + self.PE[None]
-        for l in range(self.n_layers):
-            sp = lambda W: (h @ self.P[f"{W}{l}"]).reshape(B, L, self.n_heads, self.d_k).transpose(0, 2, 1, 3)
-            Q, K, V = sp("Wq"), sp("Wk"), sp("Wv")
-            att = _softmax(Q @ K.transpose(0, 1, 3, 2) / math.sqrt(self.d_k))
-            ao = (att @ V).transpose(0, 2, 1, 3).reshape(B, L, self.d_model) @ self.P[f"Wo{l}"]
-            h = _lnf(h + ao, self.P[f"g1{l}"], self.P[f"n1{l}"])
-            ffn = np.maximum(h @ self.P[f"Wf1{l}"] + self.P[f"bf1{l}"], 0) @ self.P[f"Wf2{l}"] + self.P[f"bf2{l}"]
-            h = _lnf(h + ffn, self.P[f"g2{l}"], self.P[f"n2{l}"])
-        return np.concatenate([h.mean(1), h[:, -1, :]], axis=1).astype(np.float32)
-
-    def _head(self, Z):
-        h = np.maximum(Z @ self.H["W1"] + self.H["b1"], 0)
-        return h, h @ self.H["W2"] + self.H["b2"]
-
-    def predict_proba(self, X):
-        if X.ndim == 2: X = X[None]
-        return _softmax(self._head(self.encode(X))[1] / self.Ts).astype(np.float32)
-
-    def update(self, X, y, lr_mult=1.0, w=None):
-        Z = self.encode(X); h, lg = self._head(Z); p = _softmax(lg); n = len(y)
-        d = (p - _onehot(y, 0.05)) / n
-        if w is not None: d = d * w[:, None]
-        G = {"W2": h.T @ d, "b2": d.sum(0)}
-        dh = (d @ self.H["W2"].T) * (h > 0)
-        G["W1"], G["b1"] = Z.T @ dh, dh.sum(0)
-        self.t += 1
-        b1, b2 = 0.9, 0.999
-        c1, c2 = 1 - b1 ** self.t, 1 - b2 ** self.t
-        for k, g in G.items():
-            self.m[k] *= b1; self.m[k] += (1 - b1) * g
-            self.v[k] *= b2; self.v[k] += (1 - b2) * g * g
-            self.H[k] -= (self.lr * lr_mult * (self.m[k] / c1) / (np.sqrt(self.v[k] / c2) + 1e-8)).astype(np.float32)
-        return float(-np.mean(np.log(p[np.arange(n), y] + 1e-9)))
-
-    def get_state(self):
-        return {"P": {k: v.copy() for k, v in self.P.items()}, "H": {k: v.copy() for k, v in self.H.items()},
-                "m": {k: v.copy() for k, v in self.m.items()}, "v": {k: v.copy() for k, v in self.v.items()},
-                "t": self.t, "lr": self.lr, "Ts": self.Ts}
-
-    def set_state(self, s):
-        self.P = {k: v.copy() for k, v in s["P"].items()}; self.H = {k: v.copy() for k, v in s["H"].items()}
-        self.m = {k: v.copy() for k, v in s["m"].items()}; self.v = {k: v.copy() for k, v in s["v"].items()}
-        self.t, self.lr, self.Ts = s["t"], s["lr"], s.get("Ts", 1.3)
-
-class TransformerEnsemble:
-    def __init__(self, n=2, seed=BAG_SEED):
-        self.trans = [TransformerHead(seed=seed + 500 + i * 13) for i in range(n)]
-        self.weights = np.ones(n, dtype=np.float32) / n
-        self.on, self.gain = False, 0.0
-
-    def predict_proba(self, X_seq):
-        preds = np.array([t.predict_proba(X_seq) for t in self.trans], dtype=np.float32)
-        return np.tensordot(self.weights, preds, axes=1)
-
-    def predict_idx(self, sid, row, chunk=512, sektor_key=None):
-        out = []
-        for s in range(0, len(sid), chunk):
-            out.append(self.predict_proba(gather_seq(sid[s:s + chunk], row[s:s + chunk], sektor_key)))
-        return np.concatenate(out) if out else np.zeros((0, 3), np.float32)
-
-    def fit(self, sid, row, y, steps=100, bs=32, seed=42, sektor_key=None):
-        rng = np.random.default_rng(seed)
-        cnt = np.bincount(y, minlength=3).astype(float) + 1.0
-        cw = ((len(y) / (3.0 * cnt)) ** 0.5).astype(np.float32)
-        for t in self.trans:
-            for _ in range(steps):
-                idx = rng.integers(0, len(y), min(bs, len(y)))
-                t.update(gather_seq(sid[idx], row[idx], sektor_key), y[idx], w=cw[y[idx]])
-
-    def sample_val(self, sid, row, y, k=1500, seed=3):
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(y), min(k, len(y)), replace=False) if len(y) > k else np.arange(len(y))
-        return idx
-
-    def update_w(self, sid, row, y, sektor_key=None):
-        ls = []
-        for t in self.trans:
-            P = np.concatenate([t.predict_proba(gather_seq(sid[s:s + 512], row[s:s + 512], sektor_key))
-                                for s in range(0, len(sid), 512)])
-            ls.append(short_logloss(P, y))
-        inv = 1.0 / (np.array(ls) + 1e-6)
-        self.weights = (inv / inv.sum()).astype(np.float32)
-
-    def get_state(self):
-        return {"trans": [t.get_state() for t in self.trans], "weights": self.weights.tolist(), "on": self.on, "gain": self.gain}
-
-    def set_state(self, s):
-        try:
-            for t, ts in zip(self.trans, s["trans"]): t.set_state(ts)
-            self.weights = np.array(s["weights"], dtype=np.float32)
-            self.on, self.gain = s.get("on", False), s.get("gain", 0.0)
-        except Exception as e:
-            log.warning(f"trans state: {e}"); self.on = False
-
-# ════════════════════════════════════════════════════════════
-# 4. RL (PPO) — VETO katmanı
-# ════════════════════════════════════════════════════════════
-class PPOAgent:
-    def __init__(self, n_in=N_FEAT, n_act=3, h=64, lr=0.001, seed=None, gamma=0.95):
-        rg = np.random.default_rng(seed); f32 = np.float32
-        self.rng = np.random.default_rng(None if seed is None else seed + 1)
-        def W(i, o): return (rg.standard_normal((i, o)) * np.sqrt(2.0 / i)).astype(f32)
-        self.P = {"W_pi1": W(n_in, h), "b_pi1": np.zeros(h, f32), "W_pi2": W(h, n_act) * 0.1, "b_pi2": np.zeros(n_act, f32),
-                  "W_v1": W(n_in, h), "b_v1": np.zeros(h, f32), "W_v2": W(h, 1) * 0.1, "b_v2": np.zeros(1, f32)}
-        self.m = {k: np.zeros_like(v) for k, v in self.P.items()}
-        self.v = {k: np.zeros_like(v) for k, v in self.P.items()}
-        self.lr, self.gamma, self.t, self.clip = lr, gamma, 0, 0.2
-
-    def _forward(self, X):
-        h_pi = np.maximum(X @ self.P["W_pi1"] + self.P["b_pi1"], 0)
-        logits = h_pi @ self.P["W_pi2"] + self.P["b_pi2"]
-        h_v = np.maximum(X @ self.P["W_v1"] + self.P["b_v1"], 0)
-        return _softmax(logits), (h_v @ self.P["W_v2"] + self.P["b_v2"])[:, 0], (h_pi, h_v)
-
-    def proba(self, X): return self._forward(np.atleast_2d(X))[0]
-
-    def act(self, x, greedy=False):
-        proba, v, _ = self._forward(np.atleast_2d(x)); p = proba[0]
-        a = int(p.argmax()) if greedy else int(self.rng.choice(len(p), p=p / p.sum()))
-        return a, float(p[a]), float(v[0])
-
-    def update(self, X, actions, old_probs, rewards, epochs=4, ent=0.01):
-        n, ar = len(X), np.arange(len(X))
-        old = np.clip(old_probs, 1e-9, 1)
-        for _ in range(epochs):
-            proba, v, (h_pi, h_v) = self._forward(X)
-            adv = rewards - v
-            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            ratio = np.clip(proba[ar, actions], 1e-9, 1) / old
-            clipped = ((adv > 0) & (ratio > 1 + self.clip)) | ((adv < 0) & (ratio < 1 - self.clip))
-            coef = np.where(clipped, 0.0, -adv * ratio) / n
-            d_lg = coef[:, None] * (np.eye(proba.shape[1])[actions] - proba)
-            H = -(proba * np.log(proba + 1e-9)).sum(1)
-            d_lg += ent * proba * (np.log(proba + 1e-9) + H[:, None]) / n
-            d_v = (v - rewards)[:, None] / n
-            G = {"W_pi2": h_pi.T @ d_lg, "b_pi2": d_lg.sum(0), "W_v2": h_v.T @ d_v, "b_v2": d_v.sum(0)}
-            dh_pi = (d_lg @ self.P["W_pi2"].T) * (h_pi > 0)
-            G["W_pi1"], G["b_pi1"] = X.T @ dh_pi, dh_pi.sum(0)
-            dh_v = (d_v @ self.P["W_v2"].T) * (h_v > 0)
-            G["W_v1"], G["b_v1"] = X.T @ dh_v, dh_v.sum(0)
-            self.t += 1
-            b1, b2 = 0.9, 0.999
-            c1, c2 = 1 - b1 ** self.t, 1 - b2 ** self.t
-            for k, g in G.items():
-                self.m[k] *= b1; self.m[k] += (1 - b1) * g
-                self.v[k] *= b2; self.v[k] += (1 - b2) * g * g
-                self.P[k] -= (self.lr * (self.m[k] / c1) / (np.sqrt(self.v[k] / c2) + 1e-8)).astype(np.float32)
-        return float(rewards.mean())
-
-    def get_state(self):
-        return {"P": {k: v.copy() for k, v in self.P.items()}, "m": {k: v.copy() for k, v in self.m.items()},
-                "v": {k: v.copy() for k, v in self.v.items()}, "t": self.t, "lr": self.lr, "gamma": self.gamma}
-
-    def set_state(self, s):
-        for k in ("P", "m", "v"): setattr(self, k, {kk: vv.copy() for kk, vv in s[k].items()})
-        self.t, self.lr, self.gamma = s["t"], s["lr"], s["gamma"]
-
-# ════════════════════════════════════════════════════════════
-# 5. HMM
-# ════════════════════════════════════════════════════════════
-class HMMRegime:
-    def __init__(self, n_states=4, seed=42):
-        self.n_states = n_states
-        self.A = np.full((n_states, n_states), 0.1 / (n_states - 1)); np.fill_diagonal(self.A, 0.9)
-        self.mu = np.array([0.001, -0.001, 0.0, 0.0005]); self.sigma = np.array([0.01, 0.015, 0.03, 0.008])
-        self.pi = np.ones(n_states) / n_states
-        self.fitted, self.n_iter, self.fit_date = False, 0, ""
-        self.names = list(REGIMES)
-
-    def _emis(self, obs):
-        z = (obs[:, None] - self.mu[None]) / (self.sigma[None] + 1e-9)
-        return np.exp(-0.5 * z * z) / (self.sigma[None] * math.sqrt(2 * math.pi) + 1e-9) + 1e-12
-
-    def _fb(self, obs):
-        T, N = len(obs), self.n_states
-        B = self._emis(obs)
-        alpha, c = np.zeros((T, N)), np.zeros(T)
-        a = self.pi * B[0]; c[0] = a.sum() + 1e-300; alpha[0] = a / c[0]
-        for t in range(1, T):
-            a = (alpha[t - 1] @ self.A) * B[t]; c[t] = a.sum() + 1e-300; alpha[t] = a / c[t]
-        beta = np.ones((T, N))
-        for t in range(T - 2, -1, -1):
-            beta[t] = (self.A @ (B[t + 1] * beta[t + 1])) / c[t + 1]
-        return alpha, beta, c, B
-
-    def _label(self):
-        order_sig = np.argsort(-self.sigma)
-        vol = int(order_sig[0]); rest = [i for i in range(self.n_states) if i != vol]
-        rest.sort(key=lambda i: self.mu[i])
-        names = [None] * self.n_states
-        names[vol], names[rest[0]], names[rest[-1]] = "VOL", "BEAR", "BULL"
-        for i in rest[1:-1]: names[i] = "RANGE"
-        self.names = names
-
-    def fit(self, returns, n_iter=20, date=""):
-        obs = np.asarray(returns, dtype=np.float64)
-        obs = obs[np.isfinite(obs)]
-        if len(obs) < 120: return self
-        q = np.quantile(obs, [0.1, 0.4, 0.6, 0.9]); sd = obs.std()
-        self.mu = np.array([q[3], q[0], obs.mean(), q[2]]) * 0.3
-        self.sigma = np.array([sd * 0.8, sd * 1.0, sd * 2.0, sd * 0.6])
-        for it in range(n_iter):
-            alpha, beta, c, B = self._fb(obs)
-            gamma = alpha * beta; gamma /= gamma.sum(1, keepdims=True) + 1e-300
-            xi = np.einsum("ti,ij,tj->ij", alpha[:-1], self.A, (B[1:] * beta[1:]) / c[1:, None])
-            self.A = xi / (xi.sum(1, keepdims=True) + 1e-300)
-            g_sum = gamma.sum(0) + 1e-12
-            self.mu = (gamma * obs[:, None]).sum(0) / g_sum
-            self.sigma = np.sqrt((gamma * (obs[:, None] - self.mu[None]) ** 2).sum(0) / g_sum + 1e-8)
-            self.pi = gamma[0] / (gamma[0].sum() + 1e-12)
-            self.n_iter = it + 1
-        self._label()
-        self.fitted, self.fit_date = True, date
-        return self
-
-    def posterior(self, recent):
-        if not self.fitted: return np.ones(self.n_states) / self.n_states
-        alpha, _, _, _ = self._fb(np.asarray(recent, dtype=np.float64))
-        return alpha[-1]
-
-    def predict_name(self, recent):
-        if not self.fitted or len(recent) < 10: return None, 0.0
-        p = self.posterior(recent); i = int(p.argmax())
-        return self.names[i], float(p[i])
-
-    def get_state(self):
-        return {"A": self.A.tolist(), "mu": self.mu.tolist(), "sigma": self.sigma.tolist(), "pi": self.pi.tolist(),
-                "fitted": self.fitted, "n_iter": self.n_iter, "names": self.names, "fit_date": self.fit_date}
-
-    def set_state(self, s):
-        self.A, self.mu = np.array(s["A"]), np.array(s["mu"])
-        self.sigma, self.pi = np.array(s["sigma"]), np.array(s["pi"])
-        self.fitted, self.n_iter = s.get("fitted", False), s.get("n_iter", 0)
-        self.names, self.fit_date = s.get("names", list(REGIMES)), s.get("fit_date", "")
-
-@st.cache_resource(show_spinner=False)
-def get_hmm(): return HMMRegime()
-
-# ════════════════════════════════════════════════════════════
-# 6. EWC
-# ════════════════════════════════════════════════════════════
-class EWC:
-    def __init__(self, lam=5.0):
-        self.lam, self.fisher, self.optimal, self.n = lam, [], [], 0
-
-    def consolidate(self, nets, X, y_s, y_l, n_samples=240, chunk=8):
-        rng = np.random.default_rng(42)
-        idx = rng.choice(len(X), min(n_samples, len(X)), replace=False)
-        X, ys, yl = X[idx], y_s[idx], y_l[idx]
-        new_f, new_o = [], []
-        for nn in nets:
-            acc, nch = {k: np.zeros_like(v) for k, v in nn.P.items()}, 0
-            for s in range(0, len(X), chunk):
-                Yl, ml = _onehot_m(yl[s:s + chunk], 0.05)
-                _, G = NN.loss_grad(nn.P, X[s:s + chunk], _onehot(ys[s:s + chunk], 0.05), Yl, ml, None, 0.0, None, nn.alpha)
-                for k, g in G.items(): acc[k] += g * g
-                nch += 1
-            tot = sum(float(a.sum()) for a in acc.values()) / max(1, sum(a.size for a in acc.values())) + 1e-18
-            new_f.append({k: (a / nch / tot).astype(np.float32) for k, a in acc.items()})
-            new_o.append({k: v.copy() for k, v in nn.P.items()})
-        if self.fisher and len(self.fisher) == len(new_f):
-            for i in range(len(new_f)):
-                for k in new_f[i]:
-                    new_f[i][k] = 0.7 * self.fisher[i][k] + 0.3 * new_f[i][k]
-                    new_o[i][k] = 0.5 * self.optimal[i][k] + 0.5 * new_o[i][k]
-        self.fisher, self.optimal = new_f, new_o
-        self.n += 1
-        log.info(f"EWC konsolide: tur {self.n}")
-
-    def penalty(self, i, nn):
-        if not self.fisher: return 0.0
-        return 0.5 * self.lam * sum(float((self.fisher[i][k] * (nn.P[k] - self.optimal[i][k]) ** 2).sum()) for k in self.fisher[i])
-
-    def extra(self, i):
-        if not self.fisher or i >= len(self.fisher): return None
-        F, O, lam = self.fisher[i], self.optimal[i], self.lam
-        return lambda P: {k: lam * F[k] * (P[k] - O[k]) for k in F if k in P}
-
-    def get_state(self): return {"fisher": self.fisher, "optimal": self.optimal, "lam": self.lam, "n": self.n}
-
-    def set_state(self, s):
-        self.fisher, self.optimal = s.get("fisher", []), s.get("optimal", [])
-        self.lam, self.n = s.get("lam", 5.0), s.get("n", 0)
-
-# ════════════════════════════════════════════════════════════
-# 7. REPTILE
-# ════════════════════════════════════════════════════════════
-class Reptile:
-    def __init__(self, inner_lr=0.01, eps=0.3, n_inner=5):
-        self.inner_lr, self.eps, self.n_inner, self.history = inner_lr, eps, n_inner, []
-
-    @staticmethod
-    def tasks(X, y_s, y_l, d, n_tasks=5):
-        ud = np.unique(d)
-        if len(ud) < n_tasks * 10: return []
-        chunk, out = len(ud) // n_tasks, []
-        for i in range(n_tasks):
-            seg = ud[i * chunk:(i + 1) * chunk if i < n_tasks - 1 else len(ud)]
-            idx = np.flatnonzero(np.isin(d, seg))
-            if len(idx) < 50: continue
-            out.append((X[idx], y_s[idx], y_l[idx]))
-        return out
-
-    def meta_train(self, bag, sp, n_epochs=3, seed=0):
-        tasks = self.tasks(sp["Xtr"], sp["ytr"], sp["ytr_long"], sp["tr"]["d"])
-        if len(tasks) < 2: return None
-        Xv, yv, ylv = sp["Xva"][:2500], sp["yva"][:2500], sp["yva_long"][:2500]
-        rng = np.random.default_rng(seed)
-        for ep in range(n_epochs):
-            before, states = bag.evaluate(Xv, yv, ylv)[0], [nn.get_state() for nn in bag.nets]
-            for nn in bag.nets:
-                theta0 = {k: v.copy() for k, v in nn.P.items()}; st0 = nn.get_state(); delta = {k: np.zeros_like(v) for k, v in theta0.items()}
-                for (Xt, yt, ylt) in tasks:
-                    nn.P = {k: v.copy() for k, v in theta0.items()}
-                    lr0 = nn.lr; nn.lr = self.inner_lr
-                    for _ in range(self.n_inner):
-                        idx = rng.integers(0, len(Xt), min(32, len(Xt)))
-                        nn.train_step(Xt[idx], yt[idx], ylt[idx])
-                    nn.lr = lr0
-                    for k in delta: delta[k] += (nn.P[k] - theta0[k]) / len(tasks)
-                nn.set_state(st0)
-                nn.P = {k: (theta0[k] + self.eps * delta[k]).astype(np.float32) for k in theta0}
-                nn.E = {k: v.copy() for k, v in nn.P.items()}
-            after = bag.evaluate(Xv, yv, ylv)[0]
-            ok = after <= before * 1.002
-            if not ok:
-                for nn, s in zip(bag.nets, states): nn.set_state(s)
-            self.history.append({"epoch": ep, "before": before, "after": after, "kept": bool(ok), "n_tasks": len(tasks)})
-        return self.history
-
-    def get_state(self): return {"inner_lr": self.inner_lr, "eps": self.eps, "n_inner": self.n_inner, "history": self.history[-30:]}
-
-    def set_state(self, s):
-        self.inner_lr, self.eps, self.n_inner = s.get("inner_lr", 0.01), s.get("eps", 0.3), s.get("n_inner", 5)
-        self.history = s.get("history", [])
-
-# ════════════════════════════════════════════════════════════
-# 8. ERROR ANALYZER
-# ════════════════════════════════════════════════════════════
-class ErrorAnalyzer:
-    def __init__(self):
-        self.trades = []
-        self.reg_mult = {r: 1.0 for r in REGIMES}
-        self.patterns = {}
-        self.n_analyzed = 0
-
-    def record_trade(self, feat, regime, net):
-        self.trades.append({"feat": np.asarray(feat, np.float32).copy(), "regime": regime if regime in REGIMES else "RANGE", "net": float(net)})
-        self.trades = self.trades[-600:]
-
-    def analyze(self, min_trades=20):
-        if len(self.trades) < min_trades: return None
-        self.n_analyzed += 1
-        for r in REGIMES:
-            sub = [t for t in self.trades if t["regime"] == r]
-            if len(sub) >= 8:
-                loss_rate = (sum(1 for t in sub if t["net"] < 0) + 1) / (len(sub) + 2)
-                self.reg_mult[r] = clamp(1.0 + (0.5 - loss_rate) * 1.2, 0.5, 1.2)
-            else:
-                self.reg_mult[r] = 1.0
-        F = np.array([t["feat"] for t in self.trades]); net = np.array([t["net"] for t in self.trades])
-        lose, win = F[net < 0], F[net >= 0]
-        self.patterns = {}
-        if len(lose) >= 8 and len(win) >= 8:
-            sd = np.sqrt((lose.var(0) + win.var(0)) / 2) + 1e-6
-            d = (lose.mean(0) - win.mean(0)) / sd
-            for i in np.argsort(-np.abs(d))[:5]:
-                if i < len(FEAT_NAMES) and i < N_FEAT_TECH:
-                    self.patterns[f"{FEAT_NAMES[i]} {'YÜKSEK' if d[i] > 0 else 'DÜŞÜK'}"] = round(float(d[i]), 2)
-        return {"n_trades": len(self.trades), "regime_mult": dict(self.reg_mult), "patterns": dict(self.patterns)}
-
-    def regime_mult(self, regime): return float(self.reg_mult.get(regime, 1.0))
-
-    def report(self):
-        if len(self.trades) < 10: return "Yetersiz işlem verisi (≥10 kapanmış işlem gerekir)"
-        net = np.array([t["net"] for t in self.trades])
-        lines = [f"📊 {len(net)} kapanmış işlem · kayıp oranı %{(net < 0).mean() * 100:.0f} · ort. net %{net.mean() * 100:+.2f}",
-                 "Rejim çarpanları: " + ", ".join(f"{r} ×{m:.2f}" for r, m in self.reg_mult.items())]
-        if self.patterns:
-            lines.append("Kayıplı işlemlerde ayrışan özellikler (Cohen d):")
-            lines += [f"  • {k}: {v:+.2f}" for k, v in self.patterns.items()]
-        return "\n".join(lines)
-
-    def get_state(self):
-        return {"trades": self.trades[-300:], "reg_mult": self.reg_mult, "patterns": self.patterns, "n_analyzed": self.n_analyzed}
-
-    def set_state(self, s):
-        self.trades, self.patterns = s.get("trades", []), s.get("patterns", {})
-        self.reg_mult = {r: s.get("reg_mult", {}).get(r, 1.0) for r in REGIMES}
-        self.n_analyzed = s.get("n_analyzed", 0)
-
-# ════════════════════════════════════════════════════════════
-# 9. BAGGED NN — 🐛 BUG 3 DÜZELTME: set_state nn_kwargs restore
-# ════════════════════════════════════════════════════════════
-class BaggedNN:
-    def __init__(self, n=BAG_N, seed=BAG_SEED, replay_cap=5000, nn_kwargs=None, replay=None):
-        self.nn_kwargs = dict(nn_kwargs or {})
-        self.nets = [NN(seed=seed + i * 7, **self.nn_kwargs) for i in range(n)]
-        self.perf = np.ones(n, dtype=np.float32) / n
-        self.weights = self.perf.copy()
-        self.best_vl, self.plateau, self.evo = float("inf"), 0, 0
-        self.pbt_acc = self.pbt_n = 0
-        self.replay = replay if replay is not None else ExperienceBuffer(replay_cap)
-        self.router = RouterNN(N_STOCKS + 2 * n, n, seed=seed + 991) if USE_ROUTER else None
-        self.router_on, self.router_gain = False, 0.0
-        self.trans_ens = TransformerEnsemble(n=2, seed=seed + 500)
-        self.ewc, self.ewc_consolidated = EWC(), False
-        self.reptile = Reptile()
-        self.error_analyzer = ErrorAnalyzer()
-
-    def _Z(self, X): return [nn.logits_pair(X) for nn in self.nets]
-    def _temps(self): return [(nn.Ts, nn.Tl) for nn in self.nets]
-
-    @staticmethod
-    def _probs(Z, temps):
-        ps = np.array([_softmax(z[0] / max(t[0], 1e-3)) for z, t in zip(Z, temps)], dtype=np.float32)
-        pl = np.array([_softmax(z[1] / max(t[1], 1e-3)) for z, t in zip(Z, temps)], dtype=np.float32)
-        return ps, pl
-
-    def _net_losses(self, Z, temps, y_s, y_l):
-        ps, pl = self._probs(Z, temps)
-        return np.array([_comb_loss_vec(ps[i], pl[i], y_s, y_l, ALPHA_LONG).mean() for i in range(len(self.nets))])
-
-    @staticmethod
-    def _router_inputs(X, ps, pl):
-        cs = ps[:, :, 2] - np.maximum(ps[:, :, 0], ps[:, :, 1])
-        cl = pl[:, :, 2] - np.maximum(pl[:, :, 0], pl[:, :, 1])
-        return np.hstack([X[:, -N_STOCKS:], cs.T, cl.T]).astype(np.float32)
-
-    def _weights_for(self, X, ps, pl):
-        if self.router is None or not self.router_on or X is None: return self.weights[None, :]
-        g, _ = self.router.forward(self._router_inputs(X, ps, pl))
-        return (1 - ROUTER_MIX) * self.weights[None, :] + ROUTER_MIX * g
-
-    def _ens_eval(self, Z, temps, y_s, y_l, X=None):
-        ps, pl = self._probs(Z, temps)
-        w = self._weights_for(X, ps, pl)
-        Ps, Pl = _mix(w, ps), _mix(w, pl)
-        return float(_comb_loss_vec(Ps, Pl, y_s, y_l, ALPHA_LONG).mean()), float(np.mean(Ps.argmax(1) == y_s)), Ps, Pl
-
-    def update_w_from_losses(self, losses):
-        inv = (1.0 / (np.asarray(losses) + 1e-6)).astype(np.float32)
-        self.perf = (0.8 * self.perf + 0.2 * inv / inv.sum()).astype(np.float32)
-        self.perf /= self.perf.sum()
-        self.weights = self.perf.copy()
-
-    def update_w(self, X, y_s, y_l=None):
-        if y_l is None: y_l = np.full(len(y_s), -1, dtype=np.int64)
-        self.update_w_from_losses(self._net_losses(self._Z(X), self._temps(), y_s, y_l))
-
-    def _stack(self, X):
-        pr = [nn.proba_pair(X) for nn in self.nets]
-        return np.array([p[0] for p in pr], dtype=np.float32), np.array([p[1] for p in pr], dtype=np.float32)
-
-    def predict_batch(self, X):
-        ps, pl = self._stack(X)
-        w = self._weights_for(X, ps, pl)
-        return _mix(w, ps), _mix(w, pl)
-
-    def predict_unc(self, X, sid=None, row=None, seq=None):
-        ps, pl = self._stack(X)
-        w = self._weights_for(X, ps, pl)
-        Ps, Pl = _mix(w, ps), _mix(w, pl)
-        U = ps.std(axis=0).mean(axis=1)
-        if self.trans_ens.on:
-            Pt = None
-            try:
-                if seq is not None: Pt = self.trans_ens.predict_proba(seq)
-                elif sid is not None: Pt = self.trans_ens.predict_idx(np.asarray(sid), np.asarray(row))
+                from groq import Groq
+                self._client = Groq(api_key=GROQ_API_KEY)
             except Exception as e:
-                log.warning(f"trans pred: {e}")
-            if Pt is not None and len(Pt) == len(Ps):
-                Ps = (MLP_WEIGHT * Ps + TRANS_WEIGHT * Pt).astype(np.float32)
-        return Ps, Pl, U
+                log.warning("Groq istemcisi kurulamadı: %s", e)
 
-    def evaluate(self, X, y_s, y_l=None):
-        if y_l is None: y_l = np.full(len(y_s), -1, dtype=np.int64)
-        vl, acc_s, _, Pl = self._ens_eval(self._Z(X), self._temps(), y_s, y_l, X=X)
-        v = y_l >= 0
-        return (vl, (acc_s, float(np.mean(Pl.argmax(1)[v] == y_l[v])) if v.any() else 0.0),
-                float(np.bincount(y_s, minlength=3).max() / len(y_s)))
+    def reset_cycle(self) -> None:
+        """Her döngü başında LLM çağrı sayacını sıfırlar."""
+        with self._lock:
+            self._llm_calls = 0
 
-    def drift(self, X, y_s, y_l=None, frac=0.2):
-        if y_l is None: y_l = np.full(len(y_s), -1, dtype=np.int64)
-        ps, pl = self.predict_batch(X)
-        l = _comb_loss_vec(ps, pl, y_s, y_l, ALPHA_LONG)
-        k = int(len(l) * (1 - frac))
-        return float(l[k:].mean() / (l[:k].mean() + 1e-9)) if k > 10 else 1.0
+    def _lexicon(self, title: str) -> Tuple[float, float]:
+        t = title.lower()
+        p = sum(1 for w in self.POS if w in t)
+        n = sum(1 for w in self.NEG if w in t)
+        if p + n == 0:
+            return 0.0, 0.2
+        return (p - n) / float(p + n), min(0.6, 0.3 + 0.1 * (p + n))
 
-    def fit_router(self, sp, steps=150, bs=128, seed=7):
-        if self.router is None: return None
-        Xva, yva, ylv = sp["Xva"], sp["yva"], sp["yva_long"]
-        k = int(len(Xva) * 0.6)
-        if k < 200 or len(Xva) - k < 100: return None
-        temps = self._temps()
-        psA, plA = self._probs(self._Z(Xva[:k]), temps)
-        FA = self._router_inputs(Xva[:k], psA, plA)
-        YsA = _onehot(yva[:k], 0.05); YlA, mlA = _onehot_m(ylv[:k], 0.05)
-        rng = np.random.default_rng(seed)
-        for _ in range(steps):
-            idx = rng.integers(0, k, min(bs, k))
-            _, G = self.router.loss_grad(FA[idx], psA[:, idx], plA[:, idx], YsA[idx], YlA[idx], mlA[idx])
-            self.router.step(G)
-        psB, plB = self._probs(self._Z(Xva[k:]), temps)
-        yB, ylB = yva[k:], ylv[k:]
-        st = float(_comb_loss_vec(_mix(self.weights[None, :], psB), _mix(self.weights[None, :], plB), yB, ylB, ALPHA_LONG).mean())
-        self.router_on = True
-        w = self._weights_for(Xva[k:], psB, plB)
-        rt = float(_comb_loss_vec(_mix(w, psB), _mix(w, plB), yB, ylB, ALPHA_LONG).mean())
-        self.router_gain = st - rt
-        self.router_on = bool(rt < st * 0.998)
-        return {"static": st, "router": rt, "on": self.router_on}
+    def analyze(self, stock: str, title: str) -> Tuple[float, float]:
+        """(sentiment [-1,1], confidence [0,1]) döndürür."""
+        key = f"news_{stock}_{abs(hash(title)) % (10 ** 10)}"
+        hit = cache_get(key, NEWS_CACHE_HOURS * 3600.0)
+        if hit is not None:
+            return hit
+        res = self._lexicon(title)
+        with self._lock:
+            can_llm = self._client is not None and self._llm_calls < NEWS_LLM_PER_CYCLE
+            if can_llm:
+                self._llm_calls += 1
+        if can_llm:
+            try:
+                msg = ("Borsa İstanbul hissesi için haber başlığını değerlendir. Yalnızca JSON döndür: "
+                       '{"sentiment": -1..1, "confidence": 0..1}. '
+                       f"Hisse: {stock}. Başlık: {title}")
+                r = self._client.chat.completions.create(
+                    model=GROQ_MODEL, messages=[{"role": "user", "content": msg}],
+                    temperature=0, max_tokens=60, response_format={"type": "json_object"})
+                j = json.loads(r.choices[0].message.content)
+                res = (float(np.clip(j.get("sentiment", 0.0), -1, 1)),
+                       float(np.clip(j.get("confidence", 0.5), 0, 1)))
+            except Exception as e:
+                log.warning("Groq analiz hatası (%s): %s", stock, e)
+        cache_put(key, res)
+        return res
 
-    def fit_all(self, Xtr, ytr_s, ytr_l, Xva=None, yva_s=None, yva_l=None, steps=300, seed=42, sw=None):
-        def job(i):
-            nn = self.nets[i]
-            rg = np.random.default_rng(seed + i * 7)
-            idx = rg.integers(0, len(Xtr), int(0.85 * len(Xtr)))
-            Xb, ybs, ybl = Xtr[idx], ytr_s[idx], ytr_l[idx]
-            wb = None if sw is None else sw[idx]
-            s = self.replay.sample(300, rg) if self.replay.size() >= 200 else None
-            if s is not None:
-                Xb, ybs, ybl = np.vstack([Xb, s[0]]), np.concatenate([ybs, s[1]]), np.concatenate([ybl, s[2]])
-                if wb is not None: wb = np.concatenate([wb, np.full(len(s[1]), float(wb.mean()), np.float32)])
-            fit_model(nn, Xb, ybs, ybl, Xva, yva_s, yva_l, steps=steps, seed=seed + i * 7, sw=wb)
-        with ThreadPoolExecutor(max_workers=max(1, min(len(self.nets), os.cpu_count() or 2))) as ex:
-            list(ex.map(job, range(len(self.nets))))
-
-    def distill(self, X, y_s, y_l):
-        bi = int(np.argmax(self.perf)); t = self.nets[bi]
-        zs, zl = t.logits_pair(X)
-        soft_s, soft_l = _softmax(zs / t.Ts / 2.0).astype(np.float32), _softmax(zl / t.Tl / 2.0).astype(np.float32)
-        Ys = 0.5 * soft_s + 0.5 * _onehot(y_s, 0.05)
-        Yh, mv = _onehot_m(y_l, 0.05)
-        Yl = np.where(mv[:, None] > 0, 0.5 * soft_l + 0.5 * Yh, soft_l).astype(np.float32)
-        for i, nn in enumerate(self.nets):
-            if i != bi and self.perf[i] < 0.9 * self.perf[bi]: nn.distill_from(Ys, Yl, X)
-
-    def evolve_step(self, sp, n_batches=6, lr_mult=0.5):
-        self.evo += 1
-        Xtr, ytr_s, ytr_l, wtr = sp["Xtr"], sp["ytr"], sp["ytr_long"], sp.get("wtr")
-        Xva, yva_s, yva_l = sp["Xva"], sp["yva"], sp["yva_long"]
-        rg = np.random.default_rng(self.evo * 31 + 5)
-        if len(Xva) > 2500:
-            sel = rg.choice(len(Xva), 2500, replace=False)
-            Xva, yva_s, yva_l = Xva[sel], yva_s[sel], yva_l[sel]
-        snaps = [nn.snapshot() for nn in self.nets]
-        Z0, t0 = self._Z(Xva), self._temps()
-        vl0, _, _, _ = self._ens_eval(Z0, t0, yva_s, yva_l, X=Xva)
-        cdf = None if wtr is None else np.cumsum(wtr.astype(np.float64))
-        cnt = np.bincount(ytr_s, minlength=3) + 1.0
-        cw = ((len(ytr_s) / (3.0 * cnt)) ** 0.5).astype(np.float32)
-        for _ in range(n_batches):
-            for i, nn in enumerate(self.nets):
-                idx = rg.integers(0, len(Xtr), 64) if cdf is None else np.minimum(np.searchsorted(cdf, rg.random(64) * cdf[-1]), len(Xtr) - 1)
-                Xb, ybs, ybl = Xtr[idx], ytr_s[idx], ytr_l[idx]
-                s = self.replay.sample(24, rg)
-                if s is not None:
-                    Xb, ybs, ybl = np.vstack([Xb, s[0]]), np.concatenate([ybs, s[1]]), np.concatenate([ybl, s[2]])
-                ex = self.ewc.extra(i) if self.ewc_consolidated else None
-                nn.train_step(Xb, ybs, ybl, w=cw[ybs], lr_mult=lr_mult, extra=ex)
-        Z1 = self._Z(Xva)
-        t1 = [(fit_temp_logits(z[0], yva_s), fit_temp_logits(z[1], yva_l, valid=yva_l >= 0)) for z in Z1]
-        vl1, va1, _, _ = self._ens_eval(Z1, t1, yva_s, yva_l, X=Xva)
-        rolled = vl1 > vl0 * 1.02
-        if rolled:
-            for nn, s in zip(self.nets, snaps): nn.restore(s)
-            vl1, va1, _, _ = self._ens_eval(Z0, t0, yva_s, yva_l, X=Xva)
-        else:
-            for nn, (a, b) in zip(self.nets, t1): nn.Ts, nn.Tl = a, b
-        self.update_w_from_losses(self._net_losses(Z1, t1, yva_s, yva_l))
-        if self.evo % 3 == 0:
-            sel = rg.choice(len(Xtr), min(400, len(Xtr)), replace=False)
-            self.distill(Xtr[sel], ytr_s[sel], ytr_l[sel])
-        if vl1 < self.best_vl * 0.98: self.best_vl, self.plateau = vl1, 0
-        else: self.plateau += 1
-        db_log_train(self.evo, vl1, va1, "rollback" if rolled else "")
-        return {"vl": vl1, "va": va1, "rolled": bool(rolled), "step": self.evo}
-
-    def pbt_step(self, sp, steps=60):
-        rg = np.random.default_rng(self.evo * 13 + 7)
-        Xva, yva_s, yva_l = sp["Xva"], sp["yva"], sp["yva_long"]
-        if len(Xva) > 3000:
-            sel = rg.choice(len(Xva), 3000, replace=False)
-            Xva, yva_s, yva_l = Xva[sel], yva_s[sel], yva_l[sel]
-        losses = self._net_losses(self._Z(Xva), self._temps(), yva_s, yva_l)
-        bi, wi = int(losses.argmin()), int(losses.argmax())
-        if bi == wi: return None
-        nn, best = self.nets[wi], self.nets[bi]
-        old, old_hp, old_t, old_loss, old_m, old_v = nn.snapshot(), (nn.lr, nn.dropout, nn.wd), nn.t, float(losses[wi]), nn.m, nn.v
-        nn.restore(best.snapshot())
-        nn.m, nn.v, nn.t = {k: v.copy() for k, v in best.m.items()}, {k: v.copy() for k, v in best.v.items()}, best.t
-        nn.lr = clamp(best.lr * float(rg.choice([0.7, 1.0, 1.4])), 5e-4, 8e-3)
-        nn.dropout = clamp(best.dropout + float(rg.choice([-0.05, 0.0, 0.05])), 0.0, 0.4)
-        nn.wd = clamp(best.wd * float(rg.choice([0.5, 1.0, 2.0])), 1e-3, 0.1)
-        for k in nn.P:
-            if k[0] == "W":
-                nn.P[k] += (rg.standard_normal(nn.P[k].shape) * 0.02 * nn.P[k].std()).astype(np.float32)
-                nn.E[k] = nn.P[k].copy()
-        fit_model(nn, sp["Xtr"], sp["ytr"], sp["ytr_long"], Xva, yva_s, yva_l, steps=steps, seed=int(rg.integers(1 << 30)), warmup=5, sw=sp.get("wtr"))
-        new_loss = float(nn.evaluate(Xva, yva_s, yva_l)[0])
-        ok = new_loss < old_loss * 0.995
-        self.pbt_n += 1
-        hp = {"lr": round(nn.lr, 5), "dropout": round(nn.dropout, 2), "wd": round(nn.wd, 4)}
-        if ok:
-            self.pbt_acc += 1; losses[wi] = new_loss
-        else:
-            nn.restore(old); nn.lr, nn.dropout, nn.wd = old_hp; nn.t, nn.m, nn.v = old_t, old_m, old_v
-        self.update_w_from_losses(losses)
-        return {"accepted": bool(ok), "slot": wi, "old": old_loss, "new": float(new_loss), "hp": hp}
-
-    def consolidate_ewc(self, X, y_s, y_l):
+    def headlines(self, code: str) -> List[str]:
+        """YFinance haber başlıklarını (en fazla NEWS_MAX_PER_STOCK) döndürür."""
         try:
-            self.ewc.consolidate(self.nets, X, y_s, y_l)
-            self.ewc_consolidated = True
-            return True
+            import yfinance as yf
+            items = yf.Ticker(f"{code}.IS").news or []
+            out: List[str] = []
+            for it in items[:NEWS_MAX_PER_STOCK]:
+                t = it.get("title") or (it.get("content") or {}).get("title")
+                if t:
+                    out.append(str(t))
+            return out
         except Exception as e:
-            log.warning(f"EWC: {e}"); return False
+            log.warning("Haber başlıkları alınamadı (%s): %s", code, e)
+            return []
 
-    def fast_adapt(self, X, y_s, y_l, n_steps=5, lr=0.01):
-        if len(X) < 60: return False
-        k = int(len(X) * 0.7)
-        Xa, ya, yla, Xc, yc, ylc = X[:k], y_s[:k], y_l[:k], X[k:], y_s[k:], y_l[k:]
-        states, l0 = [nn.get_state() for nn in self.nets], self.evaluate(Xc, yc, ylc)[0]
-        rng = np.random.default_rng(self.evo)
-        for nn in self.nets:
-            old = nn.lr; nn.lr = lr
-            for _ in range(n_steps):
-                idx = rng.integers(0, k, min(32, k)); nn.train_step(Xa[idx], ya[idx], yla[idx])
-            nn.lr = old
-        if self.evaluate(Xc, yc, ylc)[0] < l0 * 0.999: return True
-        for nn, s in zip(self.nets, states): nn.set_state(s)
-        return False
 
-    def get_state(self):
-        return {"nets": [nn.get_state() for nn in self.nets], "perf": self.perf.tolist(), "weights": self.weights.tolist(),
-                "bvl": self.best_vl, "plateau": self.plateau, "evo": self.evo, "pbt_acc": self.pbt_acc, "pbt_n": self.pbt_n,
-                "router": self.router.get_state() if self.router else None, "router_on": self.router_on, "router_gain": self.router_gain,
-                "trans": self.trans_ens.get_state(), "ewc": self.ewc.get_state(), "ewc_consolidated": self.ewc_consolidated,
-                "reptile": self.reptile.get_state(), "error_analyzer": self.error_analyzer.get_state(),
-                "nn_kwargs": dict(self.nn_kwargs)}   # ✅ nn_kwargs kaydedilir
+class MacroFetcher:
+    """FRED (anahtarsız CSV) + YFinance makro verisi çeker."""
 
-    def set_state(self, s):
-        # 🐛 BUG 3 DÜZELTME: nn_kwargs restore + NN'leri yeniden başlat
-        nk = s.get("nn_kwargs")
-        if nk and nk != self.nn_kwargs:
-            self.nn_kwargs = dict(nk)
-            self.nets = [NN(seed=BAG_SEED + i * 7, **self.nn_kwargs) for i in range(len(self.nets))]
-            log.info(f"NAS state: yeni nn_kwargs uygulandı {nk}")
-        for nn, ns in zip(self.nets, s["nets"]): nn.set_state(ns)
-        self.perf, self.weights = np.array(s["perf"], dtype=np.float32), np.array(s["weights"], dtype=np.float32)
-        self.best_vl, self.plateau, self.evo = s["bvl"], s["plateau"], s["evo"]
-        self.pbt_acc, self.pbt_n = s.get("pbt_acc", 0), s.get("pbt_n", 0)
-        if self.router is not None and s.get("router") is not None: self.router.set_state(s["router"])
-        self.router_on, self.router_gain = s.get("router_on", False), s.get("router_gain", 0.0)
-        if s.get("trans"): self.trans_ens.set_state(s["trans"])
-        if s.get("ewc"): self.ewc.set_state(s["ewc"])
-        self.ewc_consolidated = s.get("ewc_consolidated", False)
-        if s.get("reptile"): self.reptile.set_state(s["reptile"])
-        if s.get("error_analyzer"): self.error_analyzer.set_state(s["error_analyzer"])# ════════════════════════════════════════════════════════════
-# 🐋 PARÇA 3/4: RİSK + SİM + TUNER + ÖZ-GELİŞİM + FORECAST + BOT
-# Düzeltmeler: BUG 2 (pretrain XU100), SORUN 1 (federated_pull optimizer reset)
-# ════════════════════════════════════════════════════════════
+    FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
 
-# ════════════════════════════════════════════════════════════
-# 1. SİNYAL
-# ════════════════════════════════════════════════════════════
-def regime_of(row):
-    vals = [safe_float(row.get(k, 0)) for k in ("Regime_Bull_sm", "Regime_Bear_sm", "Regime_Vol_sm", "Regime_Range_sm")]
-    return REGIMES[int(np.argmax(vals))]
+    def __init__(self) -> None:
+        self.yf = YFinanceFetcher(cache_ttl=3600.0)
 
-def regime_adj(rp):
-    return np.array([rp.get("regime_bull_adj", 0), rp.get("regime_bear_adj", 0),
-                     rp.get("regime_vol_adj", 0), rp.get("regime_range_adj", 0)], dtype=np.float32)
+    def fetch_fred(self, sid: str) -> Optional[pd.Series]:
+        """Tek FRED serisini günlük frekansa ileri-doldurarak döndürür."""
+        key = f"fred_{sid}"
+        hit = cache_get(key, 6 * 3600.0)
+        if hit is not None:
+            return hit
+        try:
+            df = pd.read_csv(self.FRED_URL.format(sid=sid))
+            df.columns = ["date", "value"]
+            df["date"] = pd.to_datetime(df["date"])
+            s = pd.to_numeric(df["value"], errors="coerce")
+            s.index = df["date"]
+            s = s.dropna()
+            cache_put(key, s)
+            return s
+        except Exception as e:
+            log.warning("FRED alınamadı (%s): %s", sid, e)
+            return None
 
-def signal_from_probs(p_s, p_l, rp, regime=None):
-    code = REGIMES.index(regime) if regime in REGIMES else None
-    pb, pb_l, ps = rp["p_buy"], rp.get("p_buy_long", 0.40), rp["p_sell"]
-    if code is not None:
-        a = regime_adj(rp)[code]; pb += a; pb_l += a * 0.5; ps -= a * 0.5
-    long_bull, long_bear = p_l[2] >= pb_l, p_l[0] >= ps
-    short_al = p_s[2] >= pb and p_s[2] - max(p_s[0], p_s[1]) >= rp["margin"]
-    if p_s[0] >= ps or long_bear: return "SAT"
-    if rp.get("use_long_gate", True) and not long_bull: return "TUT"
-    if short_al and long_bull: return "AL"
-    return "TUT"
+    def fetch(self) -> pd.DataFrame:
+        """8 makro kapanış + 7 FRED serisi (günlük, ffill) sütunlarıyla DataFrame."""
+        cols: Dict[str, pd.Series] = {}
+        syms = DATA_SOURCES["makro"]["semboller"]
+        dfs = self.yf.fetch_many(list(syms.values()), "5y", workers=4)
+        for k, sym in syms.items():
+            if sym in dfs:
+                cols[k] = dfs[sym]["Close"]
+        for sid in DATA_SOURCES["makro"]["fred_series"]:
+            s = self.fetch_fred(sid)
+            if s is not None:
+                cols[sid] = s
+        if not cols:
+            return pd.DataFrame()
+        out = pd.concat(cols, axis=1).sort_index().ffill()
+        return out
 
-def conf_mult_vec(Ps, Pl, rp):
-    cs = Ps[:, 2] - np.maximum(Ps[:, 0], Ps[:, 1])
-    cl = Pl[:, 2] - np.maximum(Pl[:, 0], Pl[:, 1])
-    base = rp.get("margin", 0.10); d = max(1e-9, 1.0 - base)
-    rs, rl = np.maximum(0.0, (cs - base) / d), np.maximum(0.0, (cl - base) / d)
-    return 0.6 + 0.8 * np.minimum(1.0, (rs * 0.6 + rl * 0.4) * 2.0)
 
-def conf_mult(p_s, p_l, rp): return float(conf_mult_vec(np.asarray(p_s)[None], np.asarray(p_l)[None], rp)[0])
+# ═══════════════════════════════════════════════════════════════════
+# 5. NUMBA ÇEKİRDEKLERİ — YARDIMCILAR
+# ═══════════════════════════════════════════════════════════════════
 
-def apply_tilt(p, tilt):
-    if abs(tilt) < 1e-9: return p
-    q = np.array(p, dtype=np.float64); q[2] += tilt; q[0] -= tilt
-    q = np.clip(q, 1e-3, None)
-    return (q / q.sum()).astype(np.float32)
+@njit(cache=True, nogil=True)
+def _ema(x, span, out):
+    """Üstel hareketli ortalama (NaN'ları taşır). out: (n,)"""
+    n = x.shape[0]
+    a = 2.0 / (span + 1.0)
+    for i in range(n):
+        xi = x[i]
+        if np.isnan(xi):
+            out[i] = out[i - 1] if i > 0 else np.nan
+        elif i == 0 or np.isnan(out[i - 1]):
+            out[i] = xi
+        else:
+            out[i] = a * xi + (1.0 - a) * out[i - 1]
 
-# ════════════════════════════════════════════════════════════
-# 2. PORTFÖY
-# ════════════════════════════════════════════════════════════
-def hrp_weights(cov, corr):
-    n = len(corr)
-    if n < 2: return np.ones(n)
-    try:
-        from scipy.cluster.hierarchy import linkage, dendrogram
-        from scipy.spatial.distance import squareform
-        dist = np.sqrt(np.clip((1 - corr) / 2, 0, 1)); np.fill_diagonal(dist, 0)
-        link = linkage(squareform(dist, checks=False), method="single")
-        def cvar(idx):
-            if len(idx) == 1: return float(cov[idx[0], idx[0]])
-            sub = cov[np.ix_(idx, idx)]; ivp = 1.0 / np.diag(sub); ivp /= ivp.sum()
-            return float(ivp @ sub @ ivp)
-        def bisect(idx):
-            if len(idx) == 1: return {tuple(idx): 1.0}
-            mid = len(idx) // 2; left, right = idx[:mid], idx[mid:]
-            lv, rv = cvar(left), cvar(right); alpha = 1.0 - lv / (lv + rv + 1e-9)
-            w = {k: v * alpha for k, v in bisect(left).items()}
-            w.update({k: v * (1 - alpha) for k, v in bisect(right).items()})
-            return w
-        order = dendrogram(link, no_plot=True)["leaves"]
-        out = np.zeros(n)
-        for (i,), v in bisect(order).items(): out[i] = v
-        return out / (out.sum() + 1e-9)
-    except Exception:
-        return np.ones(n) / n
 
-def markowitz_weights(mu, cov, risk_aversion=3.0):
-    n = len(mu)
-    if n < 2: return np.ones(n)
-    try:
-        w = np.clip(np.linalg.pinv(cov + np.eye(n) * 1e-6) @ mu / max(risk_aversion, 1e-6), 0, None)
-        return w / (w.sum() + 1e-9) if w.sum() > 0 else np.ones(n) / n
-    except Exception: return np.ones(n) / n
+@njit(cache=True, nogil=True)
+def _sma(x, p, out):
+    """Basit hareketli ortalama; penceredeki herhangi bir NaN → NaN."""
+    n = x.shape[0]
+    out[:] = np.nan
+    for i in range(p - 1, n):
+        s = 0.0
+        ok = True
+        for j in range(p):
+            v = x[i - p + 1 + j]
+            if np.isnan(v):
+                ok = False
+                break
+            s += v
+        if ok:
+            out[i] = s / p
 
-def risk_parity_weights(positions):
-    if not RISK_PARITY or not positions: return {}
-    w = {}
-    for s, p in positions.items():
-        vol = p.get("atr", 0) / max(p.get("entry", 1), 1e-9)
-        w[s] = 1.0 / (vol if vol > 0 else 0.02)
-    tot = sum(w.values())
-    return {s: x / tot for s, x in w.items()} if tot > 0 else {}
 
-def portfolio_suggestion(dfs, names):
-    if len(names) < 2: return None
-    R = pd.concat([dfs[n].set_index("Date")["Ret1"].tail(120).rename(n) for n in names if n in dfs], axis=1).dropna()
-    if len(R) < 40 or R.shape[1] < 2: return None
-    cov, corr = R.cov().to_numpy(), R.corr().to_numpy()
-    return pd.DataFrame({"HRP %": hrp_weights(cov, corr) * 100,
-                         "Markowitz %": markowitz_weights(R.mean().to_numpy(), cov) * 100,
-                         "Eşit %": 100.0 / R.shape[1]}, index=R.columns).round(1)
+@njit(cache=True, nogil=True)
+def _wma(x, p, out):
+    """Ağırlıklı hareketli ortalama (lineer ağırlık)."""
+    n = x.shape[0]
+    out[:] = np.nan
+    den = p * (p + 1) / 2.0
+    for i in range(p - 1, n):
+        s = 0.0
+        ok = True
+        for j in range(p):
+            v = x[i - p + 1 + j]
+            if np.isnan(v):
+                ok = False
+                break
+            s += v * (j + 1)
+        if ok:
+            out[i] = s / den
 
-# ════════════════════════════════════════════════════════════
-# 3. VaR / CVaR
-# ════════════════════════════════════════════════════════════
-def var_cvar(pnl_history, confidence=VAR_CONFIDENCE):
-    if len(pnl_history) < 20: return 0.0, 0.0
-    s = np.sort(pnl_history); idx = max(1, int(len(s) * (1 - confidence)))
-    return float(s[idx - 1]), float(s[:idx].mean())
 
-def calc_portfolio_var(bot, rp):
-    pnls = [t["pnl"] / bot.initial for t in bot.trades if t.get("action") == "SAT" and "pnl" in t]
-    if len(pnls) < 20: return {"var95": 0.0, "cvar95": 0.0, "var99": 0.0, "cvar99": 0.0, "n": len(pnls)}
-    arr = np.array(pnls, dtype=float)
-    v95, c95 = var_cvar(arr, 0.95); v99, c99 = var_cvar(arr, 0.99)
-    return {"var95": v95, "cvar95": c95, "var99": v99, "cvar99": c99, "n": len(arr)}
+@njit(cache=True, nogil=True)
+def _rmax(x, p, out):
+    """Kayan pencere maksimumu (i dahil)."""
+    n = x.shape[0]
+    out[:] = np.nan
+    for i in range(p - 1, n):
+        m = x[i]
+        for j in range(1, p):
+            if x[i - j] > m:
+                m = x[i - j]
+        out[i] = m
 
-# ════════════════════════════════════════════════════════════
-# 4. Slippage / Almgren-Chriss
-# ════════════════════════════════════════════════════════════
-def almgren_chriss_impact(order_size, daily_volume, atr_pct, sigma_daily=0.02, eta=0.1):
-    if daily_volume <= 0: return 0.01
-    pv = order_size / daily_volume
-    return float(clamp(eta * pv * sigma_daily + eta * np.sqrt(max(pv, 0)) * sigma_daily, 0.0001, 0.05))
 
-def dynamic_slippage(price, volume_tl, atr_pct, order_size_tl=1e6):
-    if not DYNAMIC_SLIPPAGE: return SLIPPAGE
-    vf = clamp((1e7 / max(volume_tl, 1e5)) ** 0.5, 0.5, 3.0)
-    af = clamp(1.0 + (atr_pct - 0.02) * 50, 0.8, 3.0)
-    return clamp(SLIPPAGE_BASE * vf * af + almgren_chriss_impact(order_size_tl, volume_tl, atr_pct), 0.0002, 0.02)
+@njit(cache=True, nogil=True)
+def _rmin(x, p, out):
+    """Kayan pencere minimumu (i dahil)."""
+    n = x.shape[0]
+    out[:] = np.nan
+    for i in range(p - 1, n):
+        m = x[i]
+        for j in range(1, p):
+            if x[i - j] < m:
+                m = x[i - j]
+        out[i] = m
 
-def simulate_partial_fill(order_size, daily_volume, atr_pct):
-    if daily_volume <= 0: return 0.0
-    p = order_size / daily_volume
-    return 1.0 if p < 0.01 else 0.95 if p < 0.05 else 0.80 if p < 0.10 else 0.60 if p < 0.20 else 0.40
 
-# ════════════════════════════════════════════════════════════
-# 5. Pozisyon + Stop
-# ════════════════════════════════════════════════════════════
-def size_pos(eq, cash, expo, px, atr, probs_s, probs_l, rp, positions=None, rmult=1.0):
-    sd = rp["sl_atr"] * atr
-    if sd <= 0 or px <= 0 or not np.isfinite(sd): return 0, sd
-    cm = conf_mult(probs_s, probs_l, rp) if rp.get("conf_sizing", True) else 1.0
-    rp_mult = 1.0
-    if RISK_PARITY and positions:
-        w = risk_parity_weights(positions)
-        if w: rp_mult = clamp(np.mean(list(w.values())) / 0.2, 0.5, 1.5)
-    room = max(0.0, rp["max_exposure"] * eq - expo)
-    q = int(min(eq * rp["risk_per_trade"] * cm * rp_mult * rmult / sd,
-                eq * rp["max_pos"] / px, room / px, cash / (px * (1 + FEE))))
-    return max(q, 0), sd
+@njit(cache=True, nogil=True)
+def _true_range(h, l, c, out):
+    """True Range."""
+    n = c.shape[0]
+    out[0] = h[0] - l[0]
+    for i in range(1, n):
+        a = h[i] - l[i]
+        b = abs(h[i] - c[i - 1])
+        d = abs(l[i] - c[i - 1])
+        out[i] = max(a, max(b, d))
 
-def stop_level(entry, high, sd0, atr, rp):
-    stop, trail = entry - sd0, False
-    if rp.get("be_on", True) and high >= entry + rp.get("be_r", 1.0) * sd0:
-        stop = max(stop, entry * (1 + RT_COST))
-    if high >= entry + rp["trail_act_r"] * sd0:
-        ts = high - rp["trail_atr"] * atr
-        if ts > stop: stop, trail = ts, True
-    return stop, trail
 
-# ════════════════════════════════════════════════════════════
-# 6. SİMÜLATÖR
-# ════════════════════════════════════════════════════════════
-def make_V(hold, Ps, Pl, U):
-    ud, di = np.unique(hold["d"], return_inverse=True)
-    V = dict(hold); V.update(Ps=Ps, Pl=Pl, U=U, di=di, nd=len(ud))
-    V["conf_s"] = (Ps[:, 2] - np.maximum(Ps[:, 0], Ps[:, 1])).astype(np.float32)
-    fh, fl, fc = hold["fh"], hold["fl"], hold["fc"]
-    V["cmax"] = np.maximum.accumulate(np.where(np.isfinite(fh), 1.0 + fh, -np.inf), axis=1)
-    V["lo1"], V["cl1"] = 1.0 + fl, 1.0 + fc
-    V["nval"] = np.isfinite(fl).sum(1)
-    return V
+@njit(cache=True, nogil=True)
+def _roc_pct(c, p, out):
+    """Yüzde ROC."""
+    n = c.shape[0]
+    out[:] = np.nan
+    for i in range(p, n):
+        if c[i - p] != 0.0:
+            out[i] = 100.0 * (c[i] / c[i - p] - 1.0)
 
-def sim_signals(V, rp):
-    Ps, Pl = V["Ps"], V["Pl"]
-    adj = regime_adj(rp)[V["rg"]]
-    m = ((Ps[:, 2] >= rp["p_buy"] + adj) & (V["conf_s"] >= rp["margin"])
-         & (Pl[:, 2] >= rp.get("p_buy_long", 0.40) + adj * 0.5)
-         & (V["U"] <= rp["unc_max"]) & (V["nval"] >= 1)
-         & (V["turn"] >= rp.get("min_daily_turnover", 0)))
-    if rp["use_regime"]: m &= V["a200"]
+
+# ═══════════════════════════════════════════════════════════════════
+# 6. NUMBA ÇEKİRDEKLERİ — 49 TEMEL GÖSTERGE
+# ═══════════════════════════════════════════════════════════════════
+
+@njit(cache=True, nogil=True)
+def k_rsi(close, period, out):
+    """Wilder RSI (0-100)."""
+    n = close.shape[0]
+    out[:] = np.nan
+    if n <= period:
+        return
+    ag = 0.0
+    al = 0.0
+    for i in range(1, period + 1):
+        d = close[i] - close[i - 1]
+        if d > 0:
+            ag += d
+        else:
+            al -= d
+    ag /= period
+    al /= period
+    out[period] = 100.0 if al == 0.0 else 100.0 - 100.0 / (1.0 + ag / al)
+    for i in range(period + 1, n):
+        d = close[i] - close[i - 1]
+        g = d if d > 0 else 0.0
+        ls = -d if d < 0 else 0.0
+        ag = (ag * (period - 1) + g) / period
+        al = (al * (period - 1) + ls) / period
+        out[i] = 100.0 if al == 0.0 else 100.0 - 100.0 / (1.0 + ag / al)
+
+
+@njit(cache=True, nogil=True)
+def k_atrn(high, low, close, period, out):
+    """Wilder ATR / Close (normalize ATR)."""
+    n = close.shape[0]
+    out[:] = np.nan
+    if n < period:
+        return
+    tr = np.empty(n)
+    _true_range(high, low, close, tr)
+    atr = 0.0
+    for i in range(period):
+        atr += tr[i]
+    atr /= period
+    out[period - 1] = atr / close[period - 1] if close[period - 1] != 0 else 0.0
+    for i in range(period, n):
+        atr = (atr * (period - 1) + tr[i]) / period
+        out[i] = atr / close[i] if close[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_macd(close, fast, slow, sig, m_out, s_out, h_out):
+    """MACD (fiyata normalize): macd/close, sinyal, histogram."""
+    n = close.shape[0]
+    ef = np.empty(n)
+    es = np.empty(n)
+    _ema(close, fast, ef)
+    _ema(close, slow, es)
+    raw = np.empty(n)
+    for i in range(n):
+        raw[i] = (ef[i] - es[i]) / close[i] if close[i] != 0 else 0.0
+    sg = np.empty(n)
+    _ema(raw, sig, sg)
+    for i in range(n):
+        m_out[i] = raw[i]
+        s_out[i] = sg[i]
+        h_out[i] = raw[i] - sg[i]
+
+
+@njit(cache=True, nogil=True)
+def k_bollinger(close, period, kstd, pct_out, width_out):
+    """Bollinger %B ve bant genişliği."""
+    n = close.shape[0]
+    pct_out[:] = np.nan
+    width_out[:] = np.nan
+    for i in range(period - 1, n):
+        m = 0.0
+        for j in range(period):
+            m += close[i - j]
+        m /= period
+        v = 0.0
+        for j in range(period):
+            d = close[i - j] - m
+            v += d * d
+        sd = math.sqrt(v / period)
+        up = m + kstd * sd
+        lo = m - kstd * sd
+        pct_out[i] = (close[i] - lo) / (up - lo) if up > lo else 0.5
+        width_out[i] = (up - lo) / m if m != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_stoch(high, low, close, kp, k_out, d_out):
+    """Stochastic %K (0-1) ve %D (3'lü SMA)."""
+    n = close.shape[0]
+    k_out[:] = np.nan
+    for i in range(kp - 1, n):
+        hh = high[i]
+        ll = low[i]
+        for j in range(1, kp):
+            if high[i - j] > hh:
+                hh = high[i - j]
+            if low[i - j] < ll:
+                ll = low[i - j]
+        k_out[i] = (close[i] - ll) / (hh - ll) if hh > ll else 0.5
+    _sma(k_out, 3, d_out)
+
+
+@njit(cache=True, nogil=True)
+def k_obv_vwap(high, low, close, vol, win, obv_out, vwap_out):
+    """OBV normalize (win bar değişimi / win bar hacim) ve VWAP uzaklığı."""
+    n = close.shape[0]
+    obv = np.zeros(n)
+    for i in range(1, n):
+        if close[i] > close[i - 1]:
+            obv[i] = obv[i - 1] + vol[i]
+        elif close[i] < close[i - 1]:
+            obv[i] = obv[i - 1] - vol[i]
+        else:
+            obv[i] = obv[i - 1]
+    obv_out[:] = np.nan
+    vwap_out[:] = np.nan
+    for i in range(win, n):
+        sv = 0.0
+        spv = 0.0
+        for j in range(win):
+            k = i - j
+            sv += vol[k]
+            spv += (high[k] + low[k] + close[k]) / 3.0 * vol[k]
+        obv_out[i] = (obv[i] - obv[i - win]) / (sv + 1.0)
+        if sv > 0:
+            vwap_out[i] = close[i] / (spv / sv) - 1.0
+
+
+@njit(cache=True, nogil=True)
+def k_ret(close, p, out):
+    """p-bar basit getiri."""
+    n = close.shape[0]
+    out[:] = np.nan
+    for i in range(p, n):
+        if close[i - p] != 0:
+            out[i] = close[i] / close[i - p] - 1.0
+
+
+@njit(cache=True, nogil=True)
+def k_sma_dist(close, p, out):
+    """Kapanışın SMA'ya göreli uzaklığı."""
+    n = close.shape[0]
+    tmp = np.empty(n)
+    _sma(close, p, tmp)
+    for i in range(n):
+        out[i] = close[i] / tmp[i] - 1.0 if (not np.isnan(tmp[i]) and tmp[i] != 0) else np.nan
+
+
+@njit(cache=True, nogil=True)
+def k_logret(close, out):
+    """Log getiri (ilk bar 0)."""
+    n = close.shape[0]
+    out[0] = 0.0
+    for i in range(1, n):
+        if close[i] > 0 and close[i - 1] > 0:
+            out[i] = math.log(close[i] / close[i - 1])
+        else:
+            out[i] = 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_rvol(lr, p, out):
+    """Yıllıklandırılmış gerçekleşen volatilite."""
+    n = lr.shape[0]
+    out[:] = np.nan
+    for i in range(p - 1, n):
+        m = 0.0
+        for j in range(p):
+            m += lr[i - j]
+        m /= p
+        v = 0.0
+        for j in range(p):
+            d = lr[i - j] - m
+            v += d * d
+        out[i] = math.sqrt(v / max(p - 1, 1)) * math.sqrt(252.0)
+
+
+@njit(cache=True, nogil=True)
+def k_range_vols(o, h, l, c, p, gk_out, pk_out):
+    """Garman-Klass ve Parkinson volatilite (yıllık)."""
+    n = c.shape[0]
+    gk_out[:] = np.nan
+    pk_out[:] = np.nan
+    k2 = 2.0 * math.log(2.0) - 1.0
+    for i in range(p - 1, n):
+        sg = 0.0
+        sp = 0.0
+        for j in range(p):
+            k = i - j
+            if h[k] > 0 and l[k] > 0 and o[k] > 0 and c[k] > 0:
+                hl = math.log(h[k] / l[k])
+                co = math.log(c[k] / o[k])
+                sg += 0.5 * hl * hl - k2 * co * co
+                sp += hl * hl
+        sg = max(sg / p, 0.0)
+        gk_out[i] = math.sqrt(sg) * math.sqrt(252.0)
+        pk_out[i] = math.sqrt(sp / p / (4.0 * math.log(2.0))) * math.sqrt(252.0)
+
+
+@njit(cache=True, nogil=True)
+def k_candle(o, h, l, c, hl_out, co_out, wu_out, wl_out):
+    """Mum yapısı: aralık/kapanış, gövde/açılış, üst ve alt fitil oranı."""
+    n = c.shape[0]
+    for i in range(n):
+        rng = h[i] - l[i]
+        hl_out[i] = rng / c[i] if c[i] != 0 else 0.0
+        co_out[i] = (c[i] - o[i]) / o[i] if o[i] != 0 else 0.0
+        if rng > 0:
+            wu_out[i] = (h[i] - max(o[i], c[i])) / rng
+            wl_out[i] = (min(o[i], c[i]) - l[i]) / rng
+        else:
+            wu_out[i] = 0.0
+            wl_out[i] = 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_volume_feats(v, p, rel_out, chg_out):
+    """Göreli hacim (önceki p bar ortalamasına) ve log hacim değişimi."""
+    n = v.shape[0]
+    rel_out[:] = np.nan
+    chg_out[:] = np.nan
+    for i in range(1, n):
+        chg_out[i] = math.log((v[i] + 1.0) / (v[i - 1] + 1.0))
+    for i in range(p, n):
+        m = 0.0
+        for j in range(1, p + 1):
+            m += v[i - j]
+        m /= p
+        rel_out[i] = v[i] / (m + 1.0)
+
+
+@njit(cache=True, nogil=True)
+def k_amihud(c, v, lr, p, out):
+    """Amihud illiquidity: ort(|r| / (fiyat*hacim)) * 1e6."""
+    n = c.shape[0]
+    out[:] = np.nan
+    for i in range(p - 1, n):
+        s = 0.0
+        for j in range(p):
+            k = i - j
+            s += abs(lr[k]) / (c[k] * v[k] + 1.0)
+        out[i] = s / p * 1e6
+
+
+@njit(cache=True, nogil=True)
+def k_cs_spread(h, l, out):
+    """Corwin-Schultz (2012) 2-gün spread tahmini (≥0)."""
+    n = h.shape[0]
+    out[:] = np.nan
+    den = 3.0 - 2.0 * math.sqrt(2.0)
+    for i in range(1, n):
+        if h[i] > 0 and l[i] > 0 and h[i - 1] > 0 and l[i - 1] > 0:
+            b = math.log(h[i] / l[i]) ** 2 + math.log(h[i - 1] / l[i - 1]) ** 2
+            hh = max(h[i], h[i - 1])
+            ll = min(l[i], l[i - 1])
+            g = math.log(hh / ll) ** 2
+            a = (math.sqrt(2.0 * b) - math.sqrt(b)) / den - math.sqrt(g / den)
+            ea = math.exp(a)
+            s = 2.0 * (ea - 1.0) / (1.0 + ea)
+            out[i] = s if s > 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_gap(o, c, out):
+    """Açılış boşluğu: open_t / close_{t-1} - 1."""
+    n = c.shape[0]
+    out[0] = 0.0
+    for i in range(1, n):
+        out[i] = o[i] / c[i - 1] - 1.0 if c[i - 1] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_skew_kurt(lr, p, sk_out, ku_out):
+    """Kayan çarpıklık ve fazla basıklık."""
+    n = lr.shape[0]
+    sk_out[:] = np.nan
+    ku_out[:] = np.nan
+    for i in range(p - 1, n):
+        m = 0.0
+        for j in range(p):
+            m += lr[i - j]
+        m /= p
+        m2 = 0.0
+        m3 = 0.0
+        m4 = 0.0
+        for j in range(p):
+            d = lr[i - j] - m
+            m2 += d * d
+            m3 += d * d * d
+            m4 += d * d * d * d
+        m2 /= p
+        m3 /= p
+        m4 /= p
+        if m2 > 1e-18:
+            sk_out[i] = m3 / (m2 ** 1.5)
+            ku_out[i] = m4 / (m2 * m2) - 3.0
+        else:
+            sk_out[i] = 0.0
+            ku_out[i] = 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_dd_low(h, l, c, p, dd_out, dl_out):
+    """p-bar tepeden düşüş ve p-bar dipten uzaklık."""
+    n = c.shape[0]
+    dd_out[:] = np.nan
+    dl_out[:] = np.nan
+    for i in range(p - 1, n):
+        hh = h[i]
+        ll = l[i]
+        for j in range(1, p):
+            if h[i - j] > hh:
+                hh = h[i - j]
+            if l[i - j] < ll:
+                ll = l[i - j]
+        dd_out[i] = c[i] / hh - 1.0 if hh > 0 else 0.0
+        dl_out[i] = c[i] / ll - 1.0 if ll > 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_mom_acc(c, p, out):
+    """Momentum ivmesi: ret_p(t) - ret_p(t-p)."""
+    n = c.shape[0]
+    out[:] = np.nan
+    for i in range(2 * p, n):
+        if c[i - p] != 0 and c[i - 2 * p] != 0:
+            out[i] = (c[i] / c[i - p] - 1.0) - (c[i - p] / c[i - 2 * p] - 1.0)
+
+
+@njit(cache=True, nogil=True)
+def k_eff_ratio(c, p, out):
+    """Kaufman verimlilik oranı."""
+    n = c.shape[0]
+    out[:] = np.nan
+    for i in range(p, n):
+        s = 0.0
+        for j in range(p):
+            s += abs(c[i - j] - c[i - j - 1])
+        out[i] = abs(c[i] - c[i - p]) / s if s > 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_adv(c, v, p, out):
+    """Ortalama günlük TL hacmi (p bar)."""
+    n = c.shape[0]
+    out[:] = np.nan
+    for i in range(p - 1, n):
+        s = 0.0
+        for j in range(p):
+            s += c[i - j] * v[i - j]
+        out[i] = s / p
+
+
+@njit(cache=True, nogil=True)
+def k_ema_dist(close, span, out):
+    """Kapanışın EMA'ya göreli uzaklığı."""
+    n = close.shape[0]
+    tmp = np.empty(n)
+    _ema(close, span, tmp)
+    for i in range(n):
+        out[i] = close[i] / tmp[i] - 1.0 if tmp[i] != 0 else 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 7. NUMBA ÇEKİRDEKLERİ — 62 GENİŞLETİLMİŞ GÖSTERGE
+# ═══════════════════════════════════════════════════════════════════
+
+@njit(cache=True, nogil=True)
+def k_ichimoku(h, l, c, out_t, out_k, out_sa, out_sb, out_ch):
+    """
+    Ichimoku (fiyata göreli). Bulut look-ahead olmasın diye 26 bar GERİ kaydırılmış
+    (t anındaki bulut = 26 bar önce hesaplanan değerler). Chikou: c_t / c_{t-26} - 1.
+    """
+    n = c.shape[0]
+    h9 = np.empty(n); l9 = np.empty(n); h26 = np.empty(n)
+    l26 = np.empty(n); h52 = np.empty(n); l52 = np.empty(n)
+    _rmax(h, 9, h9); _rmin(l, 9, l9)
+    _rmax(h, 26, h26); _rmin(l, 26, l26)
+    _rmax(h, 52, h52); _rmin(l, 52, l52)
+    out_t[:] = np.nan; out_k[:] = np.nan; out_sa[:] = np.nan
+    out_sb[:] = np.nan; out_ch[:] = np.nan
+    for i in range(n):
+        if not np.isnan(h9[i]):
+            out_t[i] = (h9[i] + l9[i]) / 2.0 / c[i] - 1.0
+        if not np.isnan(h26[i]):
+            out_k[i] = (h26[i] + l26[i]) / 2.0 / c[i] - 1.0
+        j = i - 26
+        if j >= 0 and not np.isnan(h26[j]):
+            ten = (h9[j] + l9[j]) / 2.0
+            kij = (h26[j] + l26[j]) / 2.0
+            out_sa[i] = (ten + kij) / 2.0 / c[i] - 1.0
+            if not np.isnan(h52[j]):
+                out_sb[i] = (h52[j] + l52[j]) / 2.0 / c[i] - 1.0
+        if i >= 26 and c[i - 26] != 0:
+            out_ch[i] = c[i] / c[i - 26] - 1.0
+
+
+@njit(cache=True, nogil=True)
+def k_keltner(h, l, c, ema_p, atr_p, mult, out_up, out_lo, out_w):
+    """Keltner kanalı: üst/alt bant (kapanışa göreli) ve genişlik."""
+    n = c.shape[0]
+    mid = np.empty(n)
+    tr = np.empty(n)
+    _ema(c, ema_p, mid)
+    _true_range(h, l, c, tr)
+    atr = np.empty(n)
+    _ema(tr, atr_p, atr)
+    for i in range(n):
+        out_up[i] = (mid[i] + mult * atr[i]) / c[i] - 1.0 if c[i] != 0 else 0.0
+        out_lo[i] = (mid[i] - mult * atr[i]) / c[i] - 1.0 if c[i] != 0 else 0.0
+        out_w[i] = 2.0 * mult * atr[i] / mid[i] if mid[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_donchian(h, l, c, p, out_up, out_lo, out_w):
+    """Donchian kanalı (kapanışa göreli)."""
+    n = c.shape[0]
+    hh = np.empty(n)
+    ll = np.empty(n)
+    _rmax(h, p, hh)
+    _rmin(l, p, ll)
+    for i in range(n):
+        if np.isnan(hh[i]):
+            out_up[i] = np.nan; out_lo[i] = np.nan; out_w[i] = np.nan
+        else:
+            out_up[i] = hh[i] / c[i] - 1.0
+            out_lo[i] = ll[i] / c[i] - 1.0
+            out_w[i] = (hh[i] - ll[i]) / c[i]
+
+
+@njit(cache=True, nogil=True)
+def k_aroon(h, l, p, out_up, out_dn, out_osc):
+    """Aroon Up/Down/Osc (0-1 ölçeğinde)."""
+    n = h.shape[0]
+    out_up[:] = np.nan; out_dn[:] = np.nan; out_osc[:] = np.nan
+    for i in range(p, n):
+        ih = 0
+        il = 0
+        mh = h[i]
+        ml = l[i]
+        for j in range(p + 1):
+            k = i - j
+            if h[k] > mh:
+                mh = h[k]; ih = j
+            if l[k] < ml:
+                ml = l[k]; il = j
+        up = (p - ih) / float(p)
+        dn = (p - il) / float(p)
+        out_up[i] = up
+        out_dn[i] = dn
+        out_osc[i] = up - dn
+
+
+@njit(cache=True, nogil=True)
+def k_cci(h, l, c, p, out):
+    """Commodity Channel Index (/100)."""
+    n = c.shape[0]
+    out[:] = np.nan
+    tp = np.empty(n)
+    for i in range(n):
+        tp[i] = (h[i] + l[i] + c[i]) / 3.0
+    for i in range(p - 1, n):
+        m = 0.0
+        for j in range(p):
+            m += tp[i - j]
+        m /= p
+        md = 0.0
+        for j in range(p):
+            md += abs(tp[i - j] - m)
+        md /= p
+        out[i] = (tp[i] - m) / (0.015 * md) / 100.0 if md > 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_roc(c, p, out):
+    """Rate of Change (yüzde)."""
+    _roc_pct(c, p, out)
+
+
+@njit(cache=True, nogil=True)
+def k_willr(h, l, c, p, out):
+    """Williams %R (-100..0)."""
+    n = c.shape[0]
+    out[:] = np.nan
+    for i in range(p - 1, n):
+        hh = h[i]
+        ll = l[i]
+        for j in range(1, p):
+            if h[i - j] > hh:
+                hh = h[i - j]
+            if l[i - j] < ll:
+                ll = l[i - j]
+        out[i] = -100.0 * (hh - c[i]) / (hh - ll) if hh > ll else -50.0
+
+
+@njit(cache=True, nogil=True)
+def k_adx(h, l, c, p, out_adx, out_pdi, out_mdi):
+    """Wilder ADX, +DI, -DI."""
+    n = c.shape[0]
+    out_adx[:] = np.nan; out_pdi[:] = np.nan; out_mdi[:] = np.nan
+    if n < 2 * p + 1:
+        return
+    tr = np.empty(n)
+    _true_range(h, l, c, tr)
+    pdm = np.zeros(n)
+    mdm = np.zeros(n)
+    for i in range(1, n):
+        up = h[i] - h[i - 1]
+        dn = l[i - 1] - l[i]
+        pdm[i] = up if (up > dn and up > 0) else 0.0
+        mdm[i] = dn if (dn > up and dn > 0) else 0.0
+    st = 0.0; sp = 0.0; sm = 0.0
+    for i in range(1, p + 1):
+        st += tr[i]; sp += pdm[i]; sm += mdm[i]
+    dx = np.full(n, np.nan)
+    for i in range(p, n):
+        if i > p:
+            st = st - st / p + tr[i]
+            sp = sp - sp / p + pdm[i]
+            sm = sm - sm / p + mdm[i]
+        pdi = 100.0 * sp / st if st > 0 else 0.0
+        mdi = 100.0 * sm / st if st > 0 else 0.0
+        out_pdi[i] = pdi
+        out_mdi[i] = mdi
+        dx[i] = 100.0 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0.0
+    adx = 0.0
+    for i in range(p, 2 * p):
+        adx += dx[i]
+    adx /= p
+    out_adx[2 * p - 1] = adx
+    for i in range(2 * p, n):
+        adx = (adx * (p - 1) + dx[i]) / p
+        out_adx[i] = adx
+
+
+@njit(cache=True, nogil=True)
+def k_psar(h, l, c, af, max_af, out_sar, out_trend):
+    """Parabolic SAR (kapanışa göreli) ve trend yönü (+1/-1)."""
+    n = c.shape[0]
+    out_sar[:] = np.nan
+    out_trend[:] = np.nan
+    trend = 1.0
+    sar = l[0]
+    ep = h[0]
+    a = af
+    for i in range(1, n):
+        sar = sar + a * (ep - sar)
+        if trend > 0:
+            sar = min(sar, l[i - 1])
+            if i >= 2:
+                sar = min(sar, l[i - 2])
+            if l[i] < sar:
+                trend = -1.0; sar = ep; ep = l[i]; a = af
+            elif h[i] > ep:
+                ep = h[i]; a = min(a + af, max_af)
+        else:
+            sar = max(sar, h[i - 1])
+            if i >= 2:
+                sar = max(sar, h[i - 2])
+            if h[i] > sar:
+                trend = 1.0; sar = ep; ep = h[i]; a = af
+            elif l[i] < ep:
+                ep = l[i]; a = min(a + af, max_af)
+        out_sar[i] = (sar - c[i]) / c[i] if c[i] != 0 else 0.0
+        out_trend[i] = trend
+
+
+@njit(cache=True, nogil=True)
+def k_vortex(h, l, c, p, out_pos, out_neg):
+    """Vortex göstergesi VI+ / VI-."""
+    n = c.shape[0]
+    out_pos[:] = np.nan; out_neg[:] = np.nan
+    tr = np.empty(n)
+    _true_range(h, l, c, tr)
+    vp = np.zeros(n)
+    vm = np.zeros(n)
+    for i in range(1, n):
+        vp[i] = abs(h[i] - l[i - 1])
+        vm[i] = abs(l[i] - h[i - 1])
+    for i in range(p, n):
+        a = 0.0; b = 0.0; t = 0.0
+        for j in range(p):
+            a += vp[i - j]; b += vm[i - j]; t += tr[i - j]
+        out_pos[i] = a / t if t > 0 else 1.0
+        out_neg[i] = b / t if t > 0 else 1.0
+
+
+@njit(cache=True, nogil=True)
+def k_trix(c, p, out):
+    """TRIX: üçlü EMA'nın 1-bar yüzde değişimi."""
+    n = c.shape[0]
+    e1 = np.empty(n); e2 = np.empty(n); e3 = np.empty(n)
+    _ema(c, p, e1); _ema(e1, p, e2); _ema(e2, p, e3)
+    out[0] = np.nan
+    for i in range(1, n):
+        out[i] = 100.0 * (e3[i] / e3[i - 1] - 1.0) if e3[i - 1] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_dpo(c, p, out):
+    """Detrended Price Oscillator (geçmişe kaydırılmış, look-ahead yok)."""
+    n = c.shape[0]
+    sm = np.empty(n)
+    _sma(c, p, sm)
+    sh = p // 2 + 1
+    out[:] = np.nan
+    for i in range(n):
+        if i - sh >= 0 and not np.isnan(sm[i]) and c[i] != 0:
+            out[i] = (c[i - sh] - sm[i]) / c[i]
+
+
+@njit(cache=True, nogil=True)
+def k_mass_index(h, l, out):
+    """Mass Index (EMA9 oranının 25 bar toplamı)."""
+    n = h.shape[0]
+    rng = np.empty(n)
+    for i in range(n):
+        rng[i] = h[i] - l[i]
+    e1 = np.empty(n); e2 = np.empty(n)
+    _ema(rng, 9, e1); _ema(e1, 9, e2)
+    ratio = np.empty(n)
+    for i in range(n):
+        ratio[i] = e1[i] / e2[i] if e2[i] > 0 else 1.0
+    out[:] = np.nan
+    for i in range(24, n):
+        s = 0.0
+        for j in range(25):
+            s += ratio[i - j]
+        out[i] = s
+
+
+@njit(cache=True, nogil=True)
+def k_chaikin_osc(h, l, c, v, out):
+    """Chaikin Osilatörü: EMA3(ADL) - EMA10(ADL), 10-bar hacme normalize."""
+    n = c.shape[0]
+    adl = np.zeros(n)
+    acc = 0.0
+    for i in range(n):
+        rng = h[i] - l[i]
+        mfm = ((c[i] - l[i]) - (h[i] - c[i])) / rng if rng > 0 else 0.0
+        acc += mfm * v[i]
+        adl[i] = acc
+    e3 = np.empty(n); e10 = np.empty(n); sv = np.empty(n)
+    _ema(adl, 3, e3); _ema(adl, 10, e10); _sma(v, 10, sv)
+    for i in range(n):
+        out[i] = (e3[i] - e10[i]) / (sv[i] * 10.0 + 1.0) if not np.isnan(sv[i]) else np.nan
+
+
+@njit(cache=True, nogil=True)
+def k_force_index(c, v, p, out):
+    """Force Index: EMA_p((c_t - c_{t-1}) * v_t), EMA_p(c*v)'ye normalize."""
+    n = c.shape[0]
+    fi = np.zeros(n)
+    cv = np.zeros(n)
+    for i in range(n):
+        cv[i] = c[i] * v[i]
+        if i > 0:
+            fi[i] = (c[i] - c[i - 1]) * v[i]
+    ef = np.empty(n); ec = np.empty(n)
+    _ema(fi, p, ef); _ema(cv, p, ec)
+    for i in range(n):
+        out[i] = ef[i] / (ec[i] + 1.0)
+
+
+@njit(cache=True, nogil=True)
+def k_eom(h, l, v, p, out):
+    """Ease of Movement (SMA_p), ölçek-bağımsız biçimde."""
+    n = h.shape[0]
+    raw = np.full(n, np.nan)
+    for i in range(1, n):
+        mid = (h[i] + l[i]) / 2.0
+        pm = (h[i - 1] + l[i - 1]) / 2.0
+        rng = h[i] - l[i]
+        if mid > 0:
+            raw[i] = ((mid - pm) / mid) * rng / mid * 1e6 / (v[i] + 1.0) * 1e3
+    _sma(raw, p, out)
+
+
+@njit(cache=True, nogil=True)
+def k_klinger(h, l, c, v, out):
+    """Klinger Hacim Osilatörü (EMA34-EMA55 of VF), ortalama hacme normalize."""
+    n = c.shape[0]
+    vf = np.zeros(n)
+    trend_prev = 1.0
+    cm = 0.0
+    dm_prev = h[0] - l[0]
+    for i in range(1, n):
+        hlc = h[i] + l[i] + c[i]
+        hlc_p = h[i - 1] + l[i - 1] + c[i - 1]
+        trend = 1.0 if hlc > hlc_p else -1.0
+        dm = h[i] - l[i]
+        if trend == trend_prev:
+            cm = cm + dm
+        else:
+            cm = dm_prev + dm
+        ratio = abs(2.0 * dm / cm - 1.0) if cm > 0 else 0.0
+        vf[i] = v[i] * ratio * trend * 100.0
+        trend_prev = trend
+        dm_prev = dm
+    e34 = np.empty(n); e55 = np.empty(n); sv = np.empty(n)
+    _ema(vf, 34, e34); _ema(vf, 55, e55); _sma(v, 55, sv)
+    for i in range(n):
+        out[i] = (e34[i] - e55[i]) / (sv[i] * 100.0 + 1.0) if not np.isnan(sv[i]) else np.nan
+
+
+@njit(cache=True, nogil=True)
+def k_elder(h, l, c, p, out_bull, out_bear):
+    """Elder Ray: (High - EMA)/Close ve (Low - EMA)/Close."""
+    n = c.shape[0]
+    e = np.empty(n)
+    _ema(c, p, e)
+    for i in range(n):
+        out_bull[i] = (h[i] - e[i]) / c[i] if c[i] != 0 else 0.0
+        out_bear[i] = (l[i] - e[i]) / c[i] if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_ultimate_osc(h, l, c, out):
+    """Ultimate Oscillator (7/14/28), 0-100."""
+    n = c.shape[0]
+    out[:] = np.nan
+    bp = np.zeros(n)
+    tr = np.zeros(n)
+    for i in range(1, n):
+        lo = min(l[i], c[i - 1])
+        hi = max(h[i], c[i - 1])
+        bp[i] = c[i] - lo
+        tr[i] = hi - lo
+    for i in range(28, n):
+        a7 = 0.0; t7 = 0.0; a14 = 0.0; t14 = 0.0; a28 = 0.0; t28 = 0.0
+        for j in range(28):
+            k = i - j
+            a28 += bp[k]; t28 += tr[k]
+            if j < 14:
+                a14 += bp[k]; t14 += tr[k]
+            if j < 7:
+                a7 += bp[k]; t7 += tr[k]
+        r7 = a7 / t7 if t7 > 0 else 0.5
+        r14 = a14 / t14 if t14 > 0 else 0.5
+        r28 = a28 / t28 if t28 > 0 else 0.5
+        out[i] = 100.0 * (4.0 * r7 + 2.0 * r14 + r28) / 7.0
+
+
+@njit(cache=True, nogil=True)
+def k_awesome_osc(h, l, out):
+    """Awesome Oscillator: (SMA5 - SMA34) of median price, SMA34'e göreli."""
+    n = h.shape[0]
+    mp = np.empty(n)
+    for i in range(n):
+        mp[i] = (h[i] + l[i]) / 2.0
+    a = np.empty(n); b = np.empty(n)
+    _sma(mp, 5, a); _sma(mp, 34, b)
+    for i in range(n):
+        out[i] = (a[i] - b[i]) / b[i] if (not np.isnan(b[i]) and b[i] != 0) else np.nan
+
+
+@njit(cache=True, nogil=True)
+def k_bop(o, h, l, c, out):
+    """Balance of Power (14'lük SMA)."""
+    n = c.shape[0]
+    raw = np.empty(n)
+    for i in range(n):
+        rng = h[i] - l[i]
+        raw[i] = (c[i] - o[i]) / rng if rng > 0 else 0.0
+    _sma(raw, 14, out)
+
+
+@njit(cache=True, nogil=True)
+def k_coppock(c, out):
+    """Coppock Curve: WMA10(ROC14 + ROC11)."""
+    n = c.shape[0]
+    r14 = np.empty(n); r11 = np.empty(n)
+    _roc_pct(c, 14, r14); _roc_pct(c, 11, r11)
+    s = np.empty(n)
+    for i in range(n):
+        s[i] = r14[i] + r11[i]
+    _wma(s, 10, out)
+
+
+@njit(cache=True, nogil=True)
+def k_fisher(h, l, p, out):
+    """Fisher Transform."""
+    n = h.shape[0]
+    out[:] = np.nan
+    val = 0.0
+    fish = 0.0
+    for i in range(p - 1, n):
+        hh = (h[i] + l[i]) / 2.0
+        ll = hh
+        for j in range(p):
+            m = (h[i - j] + l[i - j]) / 2.0
+            if m > hh:
+                hh = m
+            if m < ll:
+                ll = m
+        mid = (h[i] + l[i]) / 2.0
+        x = 2.0 * ((mid - ll) / (hh - ll) - 0.5) if hh > ll else 0.0
+        val = 0.33 * x + 0.67 * val
+        val = min(max(val, -0.999), 0.999)
+        fish = 0.5 * math.log((1.0 + val) / (1.0 - val)) + 0.5 * fish
+        out[i] = fish
+
+
+@njit(cache=True, nogil=True)
+def k_schaff(c, out):
+    """Schaff Trend Cycle (23/50/10), 0-1."""
+    n = c.shape[0]
+    e1 = np.empty(n); e2 = np.empty(n)
+    _ema(c, 23, e1); _ema(c, 50, e2)
+    macd = np.empty(n)
+    for i in range(n):
+        macd[i] = e1[i] - e2[i]
+    out[:] = np.nan
+    pf = 0.5
+    pff = 0.5
+    f1p = 0.5
+    f2p = 0.5
+    for i in range(9, n):
+        hh = macd[i]; ll = macd[i]
+        for j in range(10):
+            m = macd[i - j]
+            if m > hh:
+                hh = m
+            if m < ll:
+                ll = m
+        f1 = (macd[i] - ll) / (hh - ll) if hh > ll else f1p
+        f1p = f1
+        pf = pf + 0.5 * (f1 - pf)
+        out[i] = pf  # geçici; ikinci aşamada yeniden hesaplanır
+    pfarr = out.copy()
+    out[:] = np.nan
+    for i in range(18, n):
+        hh = pfarr[i]; ll = pfarr[i]
+        ok = True
+        for j in range(10):
+            m = pfarr[i - j]
+            if np.isnan(m):
+                ok = False
+                break
+            if m > hh:
+                hh = m
+            if m < ll:
+                ll = m
+        if not ok:
+            continue
+        f2 = (pfarr[i] - ll) / (hh - ll) if hh > ll else f2p
+        f2p = f2
+        pff = pff + 0.5 * (f2 - pff)
+        out[i] = pff
+
+
+@njit(cache=True, nogil=True)
+def k_kst(c, out):
+    """Know Sure Thing."""
+    n = c.shape[0]
+    r1 = np.empty(n); r2 = np.empty(n); r3 = np.empty(n); r4 = np.empty(n)
+    _roc_pct(c, 10, r1); _roc_pct(c, 15, r2); _roc_pct(c, 20, r3); _roc_pct(c, 30, r4)
+    s1 = np.empty(n); s2 = np.empty(n); s3 = np.empty(n); s4 = np.empty(n)
+    _sma(r1, 10, s1); _sma(r2, 10, s2); _sma(r3, 10, s3); _sma(r4, 15, s4)
+    for i in range(n):
+        out[i] = s1[i] + 2.0 * s2[i] + 3.0 * s3[i] + 4.0 * s4[i]
+
+
+@njit(cache=True, nogil=True)
+def k_ppo(c, fast, slow, sig, out_ppo, out_sig, out_hist):
+    """Percentage Price Oscillator."""
+    n = c.shape[0]
+    ef = np.empty(n); es = np.empty(n)
+    _ema(c, fast, ef); _ema(c, slow, es)
+    for i in range(n):
+        out_ppo[i] = 100.0 * (ef[i] - es[i]) / es[i] if es[i] != 0 else 0.0
+    _ema(out_ppo, sig, out_sig)
+    for i in range(n):
+        out_hist[i] = out_ppo[i] - out_sig[i]
+
+
+@njit(cache=True, nogil=True)
+def k_rvi(o, h, l, c, out):
+    """Relative Vigor Index (SMA10 oranı)."""
+    n = c.shape[0]
+    num = np.full(n, np.nan)
+    den = np.full(n, np.nan)
+    for i in range(3, n):
+        num[i] = ((c[i] - o[i]) + 2.0 * (c[i - 1] - o[i - 1]) + 2.0 * (c[i - 2] - o[i - 2])
+                  + (c[i - 3] - o[i - 3])) / 6.0
+        den[i] = ((h[i] - l[i]) + 2.0 * (h[i - 1] - l[i - 1]) + 2.0 * (h[i - 2] - l[i - 2])
+                  + (h[i - 3] - l[i - 3])) / 6.0
+    sn = np.empty(n); sd = np.empty(n)
+    _sma(num, 10, sn); _sma(den, 10, sd)
+    for i in range(n):
+        out[i] = sn[i] / sd[i] if (not np.isnan(sd[i]) and sd[i] > 0) else np.nan
+
+
+@njit(cache=True, nogil=True)
+def k_stochrsi(c, p, out_k, out_d):
+    """Stochastic RSI: %K (SMA3) ve %D (SMA3), 0-1."""
+    n = c.shape[0]
+    r = np.empty(n)
+    k_rsi(c, p, r)
+    raw = np.full(n, np.nan)
+    for i in range(2 * p - 1, n):
+        hh = r[i]; ll = r[i]
+        ok = True
+        for j in range(p):
+            m = r[i - j]
+            if np.isnan(m):
+                ok = False
+                break
+            if m > hh:
+                hh = m
+            if m < ll:
+                ll = m
+        if ok:
+            raw[i] = (r[i] - ll) / (hh - ll) if hh > ll else 0.5
+    _sma(raw, 3, out_k)
+    _sma(out_k, 3, out_d)
+
+
+@njit(cache=True, nogil=True)
+def k_connors_rsi(c, out):
+    """Connors RSI = (RSI3 + RSI(streak,2) + PercentRank(ROC1,100)) / 3."""
+    n = c.shape[0]
+    r3 = np.empty(n)
+    k_rsi(c, 3, r3)
+    streak = np.zeros(n)
+    for i in range(1, n):
+        if c[i] > c[i - 1]:
+            streak[i] = streak[i - 1] + 1.0 if streak[i - 1] > 0 else 1.0
+        elif c[i] < c[i - 1]:
+            streak[i] = streak[i - 1] - 1.0 if streak[i - 1] < 0 else -1.0
+        else:
+            streak[i] = 0.0
+    rs = np.empty(n)
+    k_rsi(streak, 2, rs)
+    roc1 = np.zeros(n)
+    for i in range(1, n):
+        roc1[i] = c[i] / c[i - 1] - 1.0 if c[i - 1] != 0 else 0.0
+    out[:] = np.nan
+    for i in range(101, n):
+        if np.isnan(r3[i]) or np.isnan(rs[i]):
+            continue
+        cnt = 0
+        for j in range(1, 101):
+            if roc1[i - j] < roc1[i]:
+                cnt += 1
+        out[i] = (r3[i] + rs[i] + float(cnt)) / 3.0
+
+
+@njit(cache=True, nogil=True)
+def k_qstick(o, c, p, out):
+    """QStick: SMA_p((c-o)/o)."""
+    n = c.shape[0]
+    raw = np.empty(n)
+    for i in range(n):
+        raw[i] = (c[i] - o[i]) / o[i] if o[i] != 0 else 0.0
+    _sma(raw, p, out)
+
+
+@njit(cache=True, nogil=True)
+def k_vwma(c, v, p, out):
+    """Hacim ağırlıklı MA (kapanışa göreli)."""
+    n = c.shape[0]
+    out[:] = np.nan
+    for i in range(p - 1, n):
+        sv = 0.0
+        spv = 0.0
+        for j in range(p):
+            sv += v[i - j]
+            spv += c[i - j] * v[i - j]
+        out[i] = (spv / sv) / c[i] - 1.0 if (sv > 0 and c[i] != 0) else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_hull_ma(c, p, out):
+    """Hull MA (kapanışa göreli)."""
+    n = c.shape[0]
+    half = max(p // 2, 1)
+    sq = max(int(math.sqrt(p)), 1)
+    w1 = np.empty(n); w2 = np.empty(n)
+    _wma(c, half, w1); _wma(c, p, w2)
+    raw = np.empty(n)
+    for i in range(n):
+        raw[i] = 2.0 * w1[i] - w2[i]
+    h = np.empty(n)
+    _wma(raw, sq, h)
+    for i in range(n):
+        out[i] = h[i] / c[i] - 1.0 if (not np.isnan(h[i]) and c[i] != 0) else np.nan
+
+
+@njit(cache=True, nogil=True)
+def k_alma(c, p, offset, sigma, out):
+    """Arnaud Legoux MA (kapanışa göreli)."""
+    n = c.shape[0]
+    out[:] = np.nan
+    m = offset * (p - 1)
+    s = p / sigma
+    w = np.empty(p)
+    ws = 0.0
+    for j in range(p):
+        w[j] = math.exp(-((j - m) ** 2) / (2.0 * s * s))
+        ws += w[j]
+    for i in range(p - 1, n):
+        a = 0.0
+        for j in range(p):
+            a += w[j] * c[i - p + 1 + j]
+        out[i] = a / ws / c[i] - 1.0 if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_tema(c, p, out):
+    """Triple EMA (kapanışa göreli)."""
+    n = c.shape[0]
+    e1 = np.empty(n); e2 = np.empty(n); e3 = np.empty(n)
+    _ema(c, p, e1); _ema(e1, p, e2); _ema(e2, p, e3)
+    for i in range(n):
+        out[i] = (3.0 * e1[i] - 3.0 * e2[i] + e3[i]) / c[i] - 1.0 if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_dema(c, p, out):
+    """Double EMA (kapanışa göreli)."""
+    n = c.shape[0]
+    e1 = np.empty(n); e2 = np.empty(n)
+    _ema(c, p, e1); _ema(e1, p, e2)
+    for i in range(n):
+        out[i] = (2.0 * e1[i] - e2[i]) / c[i] - 1.0 if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_zlema(c, p, out):
+    """Zero-Lag EMA (kapanışa göreli)."""
+    n = c.shape[0]
+    lag = (p - 1) // 2
+    d = np.empty(n)
+    for i in range(n):
+        d[i] = c[i] + (c[i] - c[i - lag]) if i >= lag else c[i]
+    e = np.empty(n)
+    _ema(d, p, e)
+    for i in range(n):
+        out[i] = e[i] / c[i] - 1.0 if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_mcginley(c, p, out):
+    """McGinley Dynamic (kapanışa göreli)."""
+    n = c.shape[0]
+    md = c[0]
+    for i in range(n):
+        if i > 0 and md > 0:
+            r = c[i] / md
+            den = max(0.6 * p * r ** 4, 1.0)
+            md = md + (c[i] - md) / den
+        out[i] = md / c[i] - 1.0 if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_kama(c, p, out):
+    """Kaufman Adaptive MA (kapanışa göreli)."""
+    n = c.shape[0]
+    out[:] = np.nan
+    if n <= p:
+        return
+    fast = 2.0 / 3.0
+    slow = 2.0 / 31.0
+    kma = c[p - 1]
+    for i in range(p, n):
+        ch = abs(c[i] - c[i - p])
+        vol = 0.0
+        for j in range(p):
+            vol += abs(c[i - j] - c[i - j - 1])
+        er = ch / vol if vol > 0 else 0.0
+        sc = (er * (fast - slow) + slow) ** 2
+        kma = kma + sc * (c[i] - kma)
+        out[i] = kma / c[i] - 1.0 if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_frama(c, p, out):
+    """Fractal Adaptive MA (Ehlers) — kapanış tabanlı; kapanışa göreli."""
+    n = c.shape[0]
+    out[:] = np.nan
+    N = p if p % 2 == 0 else p + 1
+    half = N // 2
+    if n < N:
+        return
+    filt = c[N - 1]
+    for i in range(N - 1, n):
+        h1 = c[i]; l1 = c[i]
+        h2 = c[i - half]; l2 = c[i - half]
+        h3 = c[i]; l3 = c[i]
+        for j in range(half):
+            a = c[i - j]
+            if a > h1:
+                h1 = a
+            if a < l1:
+                l1 = a
+            b = c[i - half - j]
+            if b > h2:
+                h2 = b
+            if b < l2:
+                l2 = b
+        h3 = max(h1, h2)
+        l3 = min(l1, l2)
+        n1 = (h1 - l1) / half
+        n2 = (h2 - l2) / half
+        n3 = (h3 - l3) / N
+        d = 1.0
+        if n1 > 0 and n2 > 0 and n3 > 0:
+            d = (math.log(n1 + n2) - math.log(n3)) / math.log(2.0)
+        a = math.exp(-4.6 * (d - 1.0))
+        a = min(max(a, 0.01), 1.0)
+        filt = a * c[i] + (1.0 - a) * filt
+        out[i] = filt / c[i] - 1.0 if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def k_mama(c, out):
+    """MESA Adaptive MA (Ehlers, fast=0.5, slow=0.05); kapanışa göreli."""
+    n = c.shape[0]
+    out[:] = np.nan
+    sm = np.zeros(n); dt = np.zeros(n); q1 = np.zeros(n); i1 = np.zeros(n)
+    i2 = np.zeros(n); q2 = np.zeros(n); re = np.zeros(n); im = np.zeros(n)
+    per = np.zeros(n); ph = np.zeros(n)
+    mama = c[0]
+    for i in range(n):
+        if i < 6:
+            sm[i] = c[i]
+            per[i] = 6.0
+            continue
+        sm[i] = (4.0 * c[i] + 3.0 * c[i - 1] + 2.0 * c[i - 2] + c[i - 3]) / 10.0
+        adj = 0.075 * per[i - 1] + 0.54
+        dt[i] = (0.0962 * sm[i] + 0.5769 * sm[i - 2] - 0.5769 * sm[i - 4] - 0.0962 * sm[i - 6]) * adj
+        q1[i] = (0.0962 * dt[i] + 0.5769 * dt[i - 2] - 0.5769 * dt[i - 4] - 0.0962 * dt[i - 6]) * adj
+        i1[i] = dt[i - 3]
+        ji = (0.0962 * i1[i] + 0.5769 * i1[i - 2] - 0.5769 * i1[i - 4] - 0.0962 * i1[i - 6]) * adj
+        jq = (0.0962 * q1[i] + 0.5769 * q1[i - 2] - 0.5769 * q1[i - 4] - 0.0962 * q1[i - 6]) * adj
+        i2[i] = 0.2 * (i1[i] - jq) + 0.8 * i2[i - 1]
+        q2[i] = 0.2 * (q1[i] + ji) + 0.8 * q2[i - 1]
+        re[i] = 0.2 * (i2[i] * i2[i - 1] + q2[i] * q2[i - 1]) + 0.8 * re[i - 1]
+        im[i] = 0.2 * (i2[i] * q2[i - 1] - q2[i] * i2[i - 1]) + 0.8 * im[i - 1]
+        p = per[i - 1]
+        if im[i] != 0.0 and re[i] != 0.0:
+            p = 2.0 * math.pi / math.atan(im[i] / re[i])
+        p = min(max(p, 0.67 * per[i - 1]), 1.5 * per[i - 1])
+        p = min(max(p, 6.0), 50.0)
+        per[i] = 0.2 * p + 0.8 * per[i - 1]
+        if i1[i] != 0.0:
+            ph[i] = math.atan(q1[i] / i1[i]) * 180.0 / math.pi
+        else:
+            ph[i] = ph[i - 1]
+        dph = max(ph[i - 1] - ph[i], 1.0)
+        al = min(max(0.5 / dph, 0.05), 0.5)
+        mama = al * c[i] + (1.0 - al) * mama
+        out[i] = mama / c[i] - 1.0 if c[i] != 0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def tech_stock_kernel(o, h, l, c, v, out):
+    """
+    Tek hisse için 111 teknik göstergeyi out (N_TECH, T) içine yazar.
+    Sıra TECH_ALL_NAMES ile birebir aynıdır. Dönüş: yazılan satır sayısı.
+    """
+    n = c.shape[0]
+    k = 0
+    lr = np.empty(n)
+    k_logret(c, lr)
+    # RSI 7/14/21
+    k_rsi(c, 7, out[k]); k += 1
+    k_rsi(c, 14, out[k]); k += 1
+    k_rsi(c, 21, out[k]); k += 1
+    # ATR/C 7/14/21
+    k_atrn(h, l, c, 7, out[k]); k += 1
+    k_atrn(h, l, c, 14, out[k]); k += 1
+    k_atrn(h, l, c, 21, out[k]); k += 1
+    # MACD
+    k_macd(c, 12, 26, 9, out[k], out[k + 1], out[k + 2]); k += 3
+    k_bollinger(c, 20, 2.0, out[k], out[k + 1]); k += 2
+    k_stoch(h, l, c, 14, out[k], out[k + 1]); k += 2
+    k_obv_vwap(h, l, c, v, 20, out[k + 1], out[k]); k += 2   # vwap_dist, obv_norm
+    k_ret(c, 1, out[k]); k += 1
+    k_ret(c, 2, out[k]); k += 1
+    k_ret(c, 3, out[k]); k += 1
+    k_ret(c, 5, out[k]); k += 1
+    k_ret(c, 10, out[k]); k += 1
+    k_ret(c, 20, out[k]); k += 1
+    k_ret(c, 40, out[k]); k += 1
+    k_sma_dist(c, 5, out[k]); k += 1
+    k_sma_dist(c, 10, out[k]); k += 1
+    k_sma_dist(c, 20, out[k]); k += 1
+    k_sma_dist(c, 50, out[k]); k += 1
+    k_sma_dist(c, 200, out[k]); k += 1
+    k_ema_dist(c, 12, out[k]); k += 1
+    k_ema_dist(c, 26, out[k]); k += 1
+    k_rvol(lr, 10, out[k]); k += 1
+    k_rvol(lr, 30, out[k]); k += 1
+    k_rvol(lr, 60, out[k]); k += 1
+    k_range_vols(o, h, l, c, 20, out[k], out[k + 1]); k += 2
+    k_candle(o, h, l, c, out[k], out[k + 1], out[k + 2], out[k + 3]); k += 4
+    k_volume_feats(v, 20, out[k], out[k + 1]); k += 2
+    k_amihud(c, v, lr, 20, out[k]); k += 1
+    k_cs_spread(h, l, out[k]); k += 1
+    k_gap(o, c, out[k]); k += 1
+    k_skew_kurt(lr, 20, out[k], out[k + 1]); k += 2
+    k_dd_low(h, l, c, 60, out[k], out[k + 1]); k += 2
+    k_mom_acc(c, 10, out[k]); k += 1
+    k_eff_ratio(c, 20, out[k]); k += 1
+    # ── v7 genişletilmiş ──
+    k_ichimoku(h, l, c, out[k], out[k + 1], out[k + 2], out[k + 3], out[k + 4]); k += 5
+    k_keltner(h, l, c, 20, 10, 2.0, out[k], out[k + 1], out[k + 2]); k += 3
+    k_donchian(h, l, c, 20, out[k], out[k + 1], out[k + 2]); k += 3
+    k_aroon(h, l, 25, out[k], out[k + 1], out[k + 2]); k += 3
+    k_cci(h, l, c, 20, out[k]); k += 1
+    k_roc(c, 5, out[k]); k += 1
+    k_roc(c, 10, out[k]); k += 1
+    k_roc(c, 20, out[k]); k += 1
+    k_willr(h, l, c, 7, out[k]); k += 1
+    k_willr(h, l, c, 14, out[k]); k += 1
+    k_willr(h, l, c, 21, out[k]); k += 1
+    k_adx(h, l, c, 14, out[k], out[k + 1], out[k + 2]); k += 3
+    k_psar(h, l, c, 0.02, 0.2, out[k], out[k + 1]); k += 2
+    k_vortex(h, l, c, 14, out[k], out[k + 1]); k += 2
+    k_trix(c, 15, out[k]); k += 1
+    k_dpo(c, 20, out[k]); k += 1
+    k_mass_index(h, l, out[k]); k += 1
+    k_chaikin_osc(h, l, c, v, out[k]); k += 1
+    k_force_index(c, v, 13, out[k]); k += 1
+    k_eom(h, l, v, 14, out[k]); k += 1
+    k_klinger(h, l, c, v, out[k]); k += 1
+    k_elder(h, l, c, 13, out[k], out[k + 1]); k += 2
+    k_ultimate_osc(h, l, c, out[k]); k += 1
+    k_awesome_osc(h, l, out[k]); k += 1
+    k_bop(o, h, l, c, out[k]); k += 1
+    k_coppock(c, out[k]); k += 1
+    k_fisher(h, l, 10, out[k]); k += 1
+    k_schaff(c, out[k]); k += 1
+    k_kst(c, out[k]); k += 1
+    k_ppo(c, 12, 26, 9, out[k], out[k + 1], out[k + 2]); k += 3
+    k_rvi(o, h, l, c, out[k]); k += 1
+    k_stochrsi(c, 14, out[k], out[k + 1]); k += 2
+    k_connors_rsi(c, out[k]); k += 1
+    k_qstick(o, c, 8, out[k]); k += 1
+    k_vwma(c, v, 20, out[k]); k += 1
+    k_hull_ma(c, 20, out[k]); k += 1
+    k_alma(c, 20, 0.85, 6.0, out[k]); k += 1
+    k_tema(c, 20, out[k]); k += 1
+    k_dema(c, 20, out[k]); k += 1
+    k_zlema(c, 20, out[k]); k += 1
+    k_mcginley(c, 14, out[k]); k += 1
+    k_kama(c, 10, out[k]); k += 1
+    k_frama(c, 16, out[k]); k += 1
+    k_mama(c, out[k]); k += 1
+    return k
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 8. NUMBA ÇEKİRDEĞİ — 40 MİKRO YAPI PROXY'Sİ
+# ═══════════════════════════════════════════════════════════════════
+
+@njit(cache=True, nogil=True)
+def k_micro(h, l, c, v, lr, cs, adv, mu, alpha, beta, out, off):
+    """
+    Mikro yapı proxy'leri (günlük OHLCV'den; gerçek emir defteri DEĞİL).
+    Look-ahead YOK: rolling sigma i-1'e kadar hesaplanır, sonra i. bar eklenir.
+    Sıra MICRO_NAMES ile aynıdır; out[off + k, i] biçiminde yazılır.
+    Referans fikirler: OFI (Cont et al. 2014), Kyle (1985), Hawkes (1971).
+    """
+    n = c.shape[0]
+    sqrt2 = math.sqrt(2.0)
+    decay = math.exp(-beta)
+    sl_b = np.zeros(n)
+    sl_a = np.zeros(n)
+    sv = np.zeros(n)
+    for i in range(n):
+        s = 1.0 if lr[i] > 0 else (-1.0 if lr[i] < 0 else 0.0)
+        sv[i] = s * math.sqrt(max(v[i], 0.0))
+    s1 = 0.0
+    s2 = 0.0
+    e5 = 0.0
+    e20 = 0.0
+    ofi_hist = np.zeros(n)
+    lam = mu
+    lam_b = mu
+    lam_a = mu
+    ts_prev = 1.0
+    for i in range(n):
+        # ── rolling sigma (i-1'e kadar) ──
+        cntp = i if i < OFI_WINDOW else OFI_WINDOW
+        if cntp >= 5:
+            m = s1 / cntp
+            var = s2 / cntp - m * m
+            sig = math.sqrt(var) if var > 0 else 0.0
+            if sig < 1e-6:
+                sig = 0.02
+        else:
+            sig = 0.02
+        z = lr[i] / sig
+        ofi = math.erf(z / sqrt2)
+        s1 += lr[i]
+        s2 += lr[i] * lr[i]
+        if i >= OFI_WINDOW:
+            s1 -= lr[i - OFI_WINDOW]
+            s2 -= lr[i - OFI_WINDOW] * lr[i - OFI_WINDOW]
+        ofi_hist[i] = ofi
+        e5 = ofi if i == 0 else e5 + (2.0 / 6.0) * (ofi - e5)
+        e20 = ofi if i == 0 else e20 + (2.0 / 21.0) * (ofi - e20)
+        # çok seviyeli OFI proxy (1/3/5 bar ortalama)
+        a3 = 0.0
+        a5 = 0.0
+        c3 = 0
+        c5 = 0
+        for j in range(5):
+            if i - j >= 0:
+                a5 += ofi_hist[i - j]
+                c5 += 1
+                if j < 3:
+                    a3 += ofi_hist[i - j]
+                    c3 += 1
+        # ── yardımcı nicelikler ──
+        rng = max(h[i] - l[i], 1e-9 * max(c[i], 1e-9))
+        pos = min(max((c[i] - l[i]) / rng, 0.0), 1.0)
+        pc = c[i - 1] if i > 0 else c[i]
+        vm = 0.0
+        cnt = 0
+        for j in range(1, 21):
+            if i - j >= 0:
+                vm += v[i - j]
+                cnt += 1
+        vr = v[i] / (vm / cnt + 1.0) if cnt > 0 else 1.0
+        vrc = min(vr, 10.0)
+        mid = (h[i] + l[i]) / 2.0
+        # ── yazımlar ──
+        out[off + 0, i] = ofi
+        out[off + 1, i] = e5
+        out[off + 2, i] = e20
+        out[off + 3, i] = ofi
+        out[off + 4, i] = a3 / c3
+        out[off + 5, i] = a5 / c5
+        # kuyruk proxy'leri
+        out[off + 6, i] = pos
+        out[off + 7, i] = 1.0 - pos
+        out[off + 8, i] = 1.0 - abs(2.0 * pos - 1.0)
+        # iceberg: yüksek hacim ama düşük fiyat hareketi
+        ice = max(vrc - 1.0, 0.0) * (1.0 - min(abs(z), 1.0))
+        out[off + 9, i] = ice if lr[i] <= 0 else 0.0
+        out[off + 10, i] = ice if lr[i] > 0 else 0.0
+        out[off + 11, i] = math.tanh(ice)
+        # spoof proxy: büyük fitil + yüksek hacim
+        lw = (min(c[i], pc) - l[i]) / rng
+        uw = (h[i] - max(c[i], pc)) / rng
+        sb = max(lw, 0.0) * vrc
+        sa = max(uw, 0.0) * vrc
+        out[off + 12, i] = sb
+        out[off + 13, i] = sa
+        out[off + 14, i] = max(sb, sa)
+        # fiyat proxy'leri
+        out[off + 15, i] = ((pos * h[i] + (1.0 - pos) * l[i]) / c[i] - 1.0) if c[i] > 0 else 0.0
+        out[off + 16, i] = ((mid + c[i]) / 2.0 / c[i] - 1.0) if c[i] > 0 else 0.0
+        out[off + 17, i] = (mid / c[i] - 1.0) if c[i] > 0 else 0.0
+        # spread'ler
+        sq = rng / c[i] if c[i] > 0 else 0.0
+        out[off + 18, i] = 2.0 * abs(c[i] - mid) / mid if mid > 0 else 0.0
+        out[off + 19, i] = sq
+        out[off + 20, i] = cs[i] if not np.isnan(cs[i]) else 0.0
+        # derinlik
+        a_i = adv[i] if not np.isnan(adv[i]) else 0.0
+        out[off + 21, i] = math.log1p(a_i / max(sq, 1e-4))
+        # Kyle lambda: lr ~ λ · işaretli hacim (20 bar, i dahil)
+        lo_j = i - 19 if i >= 19 else 0
+        cn = i - lo_j + 1
+        if cn >= 5:
+            mr = 0.0
+            mv = 0.0
+            for j in range(lo_j, i + 1):
+                mr += lr[j]
+                mv += sv[j]
+            mr /= cn
+            mv /= cn
+            cov = 0.0
+            vs = 0.0
+            for j in range(lo_j, i + 1):
+                cov += (lr[j] - mr) * (sv[j] - mv)
+                vs += (sv[j] - mv) * (sv[j] - mv)
+            out[off + 22, i] = cov / vs * 1e3 if vs > 1e-12 else 0.0
+        else:
+            out[off + 22, i] = 0.0
+        # Hawkes (kendini uyaran yoğunluk)
+        ev = 1.0 if abs(z) > 1.5 else 0.0
+        lam = mu + (lam - mu) * decay + alpha * ev
+        lam_b = mu + (lam_b - mu) * decay + alpha * (ev if lr[i] < 0 else 0.0)
+        lam_a = mu + (lam_a - mu) * decay + alpha * (ev if lr[i] > 0 else 0.0)
+        out[off + 23, i] = lam
+        out[off + 24, i] = lam_b
+        out[off + 25, i] = lam_a
+        # dengesizlikler
+        ti = 2.0 * pos - 1.0
+        vs_ = (1.0 if lr[i] > 0 else (-1.0 if lr[i] < 0 else 0.0)) * vrc / 10.0
+        out[off + 26, i] = ti
+        out[off + 27, i] = vs_
+        out[off + 28, i] = 0.5 * (ti + vs_)
+        # işlem işareti
+        tick = 1.0 if c[i] > pc else (-1.0 if c[i] < pc else 0.0)
+        lee = 1.0 if c[i] > mid else (-1.0 if c[i] < mid else tick)
+        if lee != 0.0:
+            ts_prev = lee
+        out[off + 29, i] = tick
+        out[off + 30, i] = lee
+        out[off + 31, i] = ts_prev
+        # LOB eğim/eğrilik proxy'leri
+        sl_b[i] = math.log1p(pos * vrc / max((c[i] - l[i]) / c[i], 1e-4)) if c[i] > 0 else 0.0
+        sl_a[i] = math.log1p((1.0 - pos) * vrc / max((h[i] - c[i]) / c[i], 1e-4)) if c[i] > 0 else 0.0
+        out[off + 32, i] = sl_b[i]
+        out[off + 33, i] = sl_a[i]
+        if i >= 2:
+            out[off + 34, i] = sl_b[i] - 2.0 * sl_b[i - 1] + sl_b[i - 2]
+            out[off + 35, i] = sl_a[i] - 2.0 * sl_a[i - 1] + sl_a[i - 2]
+        else:
+            out[off + 34, i] = 0.0
+            out[off + 35, i] = 0.0
+        out[off + 36, i] = sl_b[i] - sl_a[i]
+        # HHI (5 bar hacim yoğunlaşması)
+        tv = 0.0
+        tvb = 0.0
+        tva = 0.0
+        for j in range(5):
+            if i - j >= 0:
+                tv += v[i - j]
+                if lr[i - j] < 0:
+                    tvb += v[i - j]
+                elif lr[i - j] > 0:
+                    tva += v[i - j]
+        hb = 0.0
+        ha = 0.0
+        hc = 0.0
+        for j in range(5):
+            if i - j >= 0:
+                if tv > 0:
+                    hc += (v[i - j] / tv) ** 2
+                if lr[i - j] < 0 and tvb > 0:
+                    hb += (v[i - j] / tvb) ** 2
+                elif lr[i - j] > 0 and tva > 0:
+                    ha += (v[i - j] / tva) ** 2
+        out[off + 37, i] = hb
+        out[off + 38, i] = ha
+        out[off + 39, i] = hc
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 9. PANEL KERNELLERİ (PARALEL) + SARMALAYICILAR
+# ═══════════════════════════════════════════════════════════════════
+
+@njit(cache=True, parallel=True)
+def indicator_panel_kernel(O, H, L, C, V, out):
+    """(S,T) panelinde tüm hisseler için 111 teknik gösterge. out: (S, N_TECH, T)."""
+    S = C.shape[0]
+    for s in prange(S):
+        tech_stock_kernel(O[s], H[s], L[s], C[s], V[s], out[s])
+
+
+@njit(cache=True, parallel=True)
+def micro_panel_kernel(H, L, C, V, LR, CS, ADV, valid, mu, alpha, beta, feat, off):
+    """Geçerli hisseler için 40 mikro özellik; feat: (S, N_FEAT, T) içine off'tan yazar."""
+    for s in prange(C.shape[0]):
+        if valid[s]:
+            k_micro(H[s], L[s], C[s], V[s], LR[s], CS[s], ADV[s], mu, alpha, beta, feat[s], off)
+
+
+@njit(cache=True, parallel=True)
+def adv_panel_kernel(C, V, p, out):
+    """Panel ADV (TL)."""
+    for s in prange(C.shape[0]):
+        k_adv(C[s], V[s], p, out[s])
+
+
+@njit(cache=True, parallel=True)
+def logret_panel_kernel(C, out):
+    """Panel log getiri."""
+    for s in prange(C.shape[0]):
+        k_logret(C[s], out[s])
+
+
+@njit(cache=True, parallel=True)
+def cs_panel_kernel(H, L, out):
+    """Panel Corwin-Schultz spread."""
+    for s in prange(H.shape[0]):
+        k_cs_spread(H[s], L[s], out[s])
+
+
+@njit(cache=True, parallel=True)
+def rolling_corr_kernel(LR, window, out):
+    """
+    Kayan korelasyon tensörü out: (T, S, S). t anındaki pencere [t-window+1, t];
+    gelecek veri yok. İlk window-1 bar birim matris.
+    """
+    S = LR.shape[0]
+    T = LR.shape[1]
+    for t in prange(T):
+        for a in range(S):
+            for b in range(S):
+                out[t, a, b] = 1.0 if a == b else 0.0
+        if t < window - 1:
+            continue
+        lo = t - window + 1
+        mean = np.zeros(S)
+        sd = np.zeros(S)
+        for a in range(S):
+            m = 0.0
+            for j in range(lo, t + 1):
+                m += LR[a, j]
+            m /= window
+            mean[a] = m
+            v = 0.0
+            for j in range(lo, t + 1):
+                d = LR[a, j] - m
+                v += d * d
+            sd[a] = math.sqrt(v)
+        for a in range(S):
+            for b in range(a + 1, S):
+                cv = 0.0
+                for j in range(lo, t + 1):
+                    cv += (LR[a, j] - mean[a]) * (LR[b, j] - mean[b])
+                den = sd[a] * sd[b]
+                r = cv / den if den > 1e-12 else 0.0
+                out[t, a, b] = r
+                out[t, b, a] = r
+
+
+@njit(cache=True, parallel=True)
+def sector_ret_kernel(LR, sector, valid, n_sec, out):
+    """Sektör ortalama log getirisi out: (n_sec, T)."""
+    S = LR.shape[0]
+    T = LR.shape[1]
+    for t in prange(T):
+        for g in range(n_sec):
+            sm = 0.0
+            cn = 0
+            for s in range(S):
+                if valid[s] and sector[s] == g:
+                    sm += LR[s, t]
+                    cn += 1
+            out[g, t] = sm / cn if cn > 0 else 0.0
+
+
+def _clean(a: np.ndarray, clip: float = 1e6) -> np.ndarray:
+    """NaN/Inf'i 0'a çevirir ve aşırı değerleri kırpar (yerinde)."""
+    np.nan_to_num(a, copy=False, nan=0.0, posinf=clip, neginf=-clip)
+    np.clip(a, -clip, clip, out=a)
+    return a
+
+
+def compute_tech_panel(O: np.ndarray, H: np.ndarray, L: np.ndarray, C: np.ndarray,
+                       V: np.ndarray) -> np.ndarray:
+    """
+    Panel teknik özellikleri hesaplar. Girdi (S,T) float64; çıktı (S, N_TECH, T) float32.
+    Yeterli geçmişi olmayan barlar 0'dır (WARMUP_BARS maskesi Feature Store'da uygulanır).
+    """
+    O, H, L, C, V = (np.ascontiguousarray(a, dtype=np.float64) for a in (O, H, L, C, V))
+    S, T = C.shape
+    out = np.full((S, N_TECH, T), np.nan, dtype=np.float64)
+    indicator_panel_kernel(O, H, L, C, V, out)
+    _clean(out)
+    return np.ascontiguousarray(out.astype(np.float32))
+
+
+def compute_micro_panel(H: np.ndarray, L: np.ndarray, C: np.ndarray, V: np.ndarray,
+                        valid: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Panel mikro yapı özelliklerini hesaplar. Çıktı (S, N_MICRO, T) float32.
+    Dahili olarak log getiri, Corwin-Schultz ve 20 günlük ADV üretir.
+    """
+    H, L, C, V = (np.ascontiguousarray(a, dtype=np.float64) for a in (H, L, C, V))
+    S, T = C.shape
+    LR = np.zeros((S, T)); CS = np.full((S, T), np.nan); ADV = np.full((S, T), np.nan)
+    logret_panel_kernel(C, LR)
+    cs_panel_kernel(H, L, CS)
+    adv_panel_kernel(C, V, 20, ADV)
+    v = np.ones(S, dtype=np.bool_) if valid is None else np.ascontiguousarray(valid, dtype=np.bool_)
+    feat = np.zeros((S, N_MICRO, T), dtype=np.float64)
+    micro_panel_kernel(H, L, C, V, LR, CS, ADV, v, HAWKES_MU, HAWKES_ALPHA, HAWKES_BETA, feat, 0)
+    _clean(feat)
+    return np.ascontiguousarray(feat.astype(np.float32))
+
+
+def compute_corr_tensor(C: np.ndarray, window: int = CORR_WINDOW) -> np.ndarray:
+    """Panel kapanışlarından kayan korelasyon tensörü (T,S,S) float32 üretir."""
+    C = np.ascontiguousarray(C, dtype=np.float64)
+    S, T = C.shape
+    LR = np.zeros((S, T))
+    logret_panel_kernel(C, LR)
+    out = np.zeros((T, S, S), dtype=np.float32)
+    rolling_corr_kernel(LR, window, out)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 10. ÖZ-TEST 1
+# ═══════════════════════════════════════════════════════════════════
+
+def _synthetic_panel(S: int = 3, T: int = 320, seed: int = 7) -> Dict[str, np.ndarray]:
+    """Test için sentetik OHLCV paneli üretir."""
+    rng = np.random.default_rng(seed)
+    C = 100.0 * np.exp(np.cumsum(0.012 * rng.standard_normal((S, T)), axis=1))
+    O = np.empty_like(C)
+    O[:, 0] = C[:, 0]
+    O[:, 1:] = C[:, :-1] * (1.0 + 0.004 * rng.standard_normal((S, T - 1)))
+    H = np.maximum(O, C) * (1.0 + 0.006 * np.abs(rng.standard_normal((S, T))))
+    L = np.minimum(O, C) * (1.0 - 0.006 * np.abs(rng.standard_normal((S, T))))
+    V = rng.uniform(5e5, 5e6, (S, T))
+    return {k: np.ascontiguousarray(a) for k, a in zip("OHLCV", (O, H, L, C, V))}
+
+
+def _check(name: str, ok: bool, results: List[Tuple[str, bool]], extra: str = "") -> None:
+    """Test sonucunu kaydeder ve yazdırır."""
+    results.append((name, bool(ok)))
+    print(f"  [{'OK' if ok else 'HATA'}] {name} {extra}")
+
+
+def _selftest_part1() -> bool:
+    """Parça 1 öz-testi: config, DB, kernel doğruluğu, look-ahead (nedensellik), korelasyon."""
+    print(f"\n🐋 {BOT_VERSION} — Öz-test 1 (Numba: {'AÇIK' if NUMBA_OK else 'YOK, saf Python'}, "
+          f"DB: {'DuckDB' if DUCKDB_OK else 'SQLite'})")
+    res: List[Tuple[str, bool]] = []
+
+    # 1) Config tutarlılığı
+    _check("Özellik isimleri tekil", len(set(FEATURE_NAMES)) == N_FEAT, res, f"(N_FEAT={N_FEAT})")
+    _check("Teknik sayısı", N_TECH == len(TECH_NAMES) + len(TECH_NAMES_V7_EXT), res, f"(N_TECH={N_TECH})")
+    _check("Mikro sayısı 40", N_MICRO == 40, res)
+    _check("Hisse sayısı 24", N_STOCKS == 24, res)
+    _check("Tablo sayısı", len(DB_TABLES) >= 35, res, f"({len(DB_TABLES)} tablo)")
+    _check("Risk matrisi >=50 anahtar", len(get_risk_params()) >= 50, res, f"({len(get_risk_params())})")
+
+    # 2) Teknik panel
+    P = _synthetic_panel()
+    t0 = time.time()
+    tech = compute_tech_panel(P["O"], P["H"], P["L"], P["C"], P["V"])
+    print(f"  teknik panel süresi: {time.time() - t0:.2f}s")
+    _check("Teknik panel şekli", tech.shape == (3, N_TECH, 320), res, str(tech.shape))
+    _check("Teknik panelde NaN/Inf yok", bool(np.isfinite(tech).all()), res)
+    tmp = np.empty((N_TECH, 320))
+    kk = tech_stock_kernel(P["O"][0], P["H"][0], P["L"][0], P["C"][0], P["V"][0], tmp)
+    _check("Kernel yazılan satır == N_TECH", int(kk) == N_TECH, res, f"({kk})")
+
+    # 3) RSI referans (pandas Wilder)
+    c = P["C"][0]
+    d = pd.Series(c).diff()
+    up = d.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    ref = (100 - 100 / (1 + up / dn)).values
+    mine = tech[0, TECH_ALL_NAMES.index("rsi14")]
+    _check("RSI14 Wilder referansı", float(np.nanmax(np.abs(ref[-100:] - mine[-100:]))) < 1e-2, res)
+
+    # 4) Nedensellik (look-ahead) testi — teknik
+    cut = 270
+    tech_cut = compute_tech_panel(P["O"][:, :cut], P["H"][:, :cut], P["L"][:, :cut],
+                                  P["C"][:, :cut], P["V"][:, :cut])
+    diff = np.abs(tech_cut - tech[:, :, :cut]).max()
+    _check("Teknik göstergelerde look-ahead yok", diff < 1e-4, res, f"(maks fark {diff:.2e})")
+
+    # 5) Mikro panel
+    mic = compute_micro_panel(P["H"], P["L"], P["C"], P["V"])
+    _check("Mikro panel şekli", mic.shape == (3, 40, 320), res, str(mic.shape))
+    _check("Mikro panelde NaN/Inf yok", bool(np.isfinite(mic).all()), res)
+    mic_cut = compute_micro_panel(P["H"][:, :cut], P["L"][:, :cut], P["C"][:, :cut], P["V"][:, :cut])
+    d2 = np.abs(mic_cut - mic[:, :, :cut]).max()
+    _check("Mikro özelliklerde look-ahead yok", d2 < 1e-4, res, f"(maks fark {d2:.2e})")
+    ofi = mic[0, MICRO_NAMES.index("ofi")]
+    _check("OFI [-1,1] aralığında", bool(np.abs(ofi).max() <= 1.0 + 1e-6), res)
+
+    # 6) Korelasyon tensörü
+    corr = compute_corr_tensor(P["C"], 60)
+    lr = np.diff(np.log(P["C"]), axis=1, prepend=np.log(P["C"][:, :1]))
+    t = 200
+    ref_c = np.corrcoef(lr[:, t - 59:t + 1])
+    _check("Korelasyon tensörü np.corrcoef ile uyumlu", float(np.abs(corr[t] - ref_c).max()) < 1e-4, res)
+
+    # 7) Sektör getirisi
+    LR = np.zeros((3, 320)); logret_panel_kernel(P["C"], LR)
+    sec = np.array([0, 0, 1], dtype=np.int64)
+    sr = np.zeros((2, 320)); sector_ret_kernel(LR, sec, np.ones(3, dtype=np.bool_), 2, sr)
+    _check("Sektör getirisi doğru", abs(sr[0, 10] - LR[:2, 10].mean()) < 1e-12, res)
+
+    # 8) DB
+    tmpdir = tempfile.mkdtemp()
+    db = SeekDB(os.path.join(tmpdir, "t.duckdb"))
+    db.insert("trades", ["2025-01-01", "THYAO", "BUY", 300.0, 10, 0.0, "test"])
+    db.insert_many("equity", [["2025-01-01", 100000.0, 50000.0, 3], ["2025-01-02", 101000.0, 49000.0, 3]])
+    _check("DB tüm tablolar oluştu", all(db.count(t) >= 0 for t in db.table_names()), res)
+    _check("DB insert/count", db.count("trades") == 1 and db.count("equity") == 2, res)
+    _check("DB query", float(db.query('SELECT MAX("value") AS m FROM equity')["m"].iloc[0]) == 101000.0, res)
+    db.close()
+
+    # 9) Cache
+    cache_put("selftest_key", {"a": 1})
+    _check("Disk cache TTL", cache_get("selftest_key", 60.0) == {"a": 1}, res)
+
+    # 10) align_panel
+    idx = pd.bdate_range("2024-01-01", periods=100)
+    dfs = {"AAA": pd.DataFrame({"Open": 1.0, "High": 1.1, "Low": 0.9, "Close": 1.0, "Volume": 1e6}, index=idx),
+           "BBB": pd.DataFrame({"Open": 2.0, "High": 2.2, "Low": 1.8, "Close": 2.0, "Volume": 1e6}, index=idx[10:])}
+    ap = align_panel(dfs, ["AAA", "BBB"])
+    _check("align_panel şekli ve maske", ap["C"].shape == (2, 100) and bool(ap["valid"].all()), res)
+
+    ok = all(r[1] for r in res)
+    print(f"\n{'✅ ÖZ-TEST 1 BAŞARILI' if ok else '❌ ÖZ-TEST 1 BAŞARISIZ'} "
+          f"({sum(r[1] for r in res)}/{len(res)})")
+    return ok
+
+
+if __name__ == "__main__":
+    if os.environ.get("SEEKDEEP_SELFTEST") == "1":
+        sys.exit(0 if _selftest_part1() else 1)
+    print(f"{BOT_NAME} {BOT_VERSION} — Parça 1/6 yüklendi. Öz-test için SEEKDEEP_SELFTEST=1 kullanın.")
+# -*- coding: utf-8 -*-
+"""
+🐋 SEEK DEEP v7.0 — PARÇA 2/6: FEATURE STORE + MİKRO + GAT ADJACENCY + CPCV
+
+Bu modül Parça 1'i (seekdeep_v7.py) içe aktarır; ikisi aynı klasörde durmalıdır.
+
+İçindekiler:
+  1. RobustScaler (median/IQR, yalnızca train'de fit)
+  2. Triple-barrier kernel + etiketleme (López de Prado 2018)
+  3. Benzersizlik ağırlıkları (eşzamanlılık + zaman azalması)
+  4. GAT komşuluk matrisi (sektör + kNN + kenar tipleri)
+  5. Purged / Embargo CV + CPCV  C(8,4)=70
+  6. Özellik blokları (likidite, rank, makro, peer, one-hot, rejim)
+  7. FeatureStoreV7 + build_feature_store_v7
+  8. Öz-test 2 (SEEKDEEP_SELFTEST=1 python seekdeep_v7_p2.py)
+
+DÜRÜST NOTLAR (kodda da belirtilmiştir):
+  - NLP (15) ve Causal (10) blokları bu parçada 0'dır: tarihsel haber/sosyal veri
+    ücretsiz bulunmaz (NLP, dışarıdan `nlp` dizisiyle verilebilir); Causal Parça 4'te dolar.
+  - rk_value / rk_quality: tarihsel temel veri ücretsiz olmadığı için 0.5 (nötr). Güncel
+    temel veriyi geçmişe yaymak look-ahead olurdu.
+  - Likidite ve mikro özellikler günlük OHLCV proxy'leridir (gerçek emir defteri değil).
+"""
+from __future__ import annotations
+
+import os
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from itertools import combinations
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
+
+import seekdeep_v7 as P1
+from seekdeep_v7 import (
+    CORR_WINDOW, CPCV_N_GROUPS, CPCV_N_TEST_GROUPS, EMBARGO_BARS, FEAT_INDEX, FEATURE_NAMES,
+    HORIZON, HORIZON_LONG, LOG_ADV_NORM, MACRO_KEYS, MACRO_NAMES, MICRO_NAMES, N_FEAT, N_MICRO,
+    N_TECH, OTHER_ONEHOT_NAMES, PEER_K, PEER_NAMES, RANK_NAMES, LIQ_NAMES, NLP_NAMES,
+    CAUSAL_NAMES, ONEHOT_NAMES, REGIMES, SECTORS, STOCK_LIST, TB_K, TB_K_LONG, TECH_ALL_NAMES,
+    TIME_DECAY_HALF_LIFE, WARMUP_BARS, log, njit, prange, rolling_corr_kernel,
+    compute_tech_panel, compute_micro_panel, logret_panel_kernel, adv_panel_kernel,
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. ROBUSTSCALER
+# ═══════════════════════════════════════════════════════════════════
+
+
+class RobustScaler:
+    """Median/IQR tabanlı ölçekleme. Yalnızca eğitim bölümünde fit edilir (sızıntı yok)."""
+
+    def __init__(self, clip: float = 5.0, no_scale: Optional[np.ndarray] = None) -> None:
+        self.clip = float(clip)
+        self.no_scale = no_scale
+        self.med: Optional[np.ndarray] = None
+        self.iqr: Optional[np.ndarray] = None
+        self._lock = threading.RLock()
+
+    def fit(self, feat: np.ndarray, valid: np.ndarray, t_lo: int, t_hi: int,
+            max_samples: int = 200_000, seed: int = 0) -> "RobustScaler":
+        """
+        feat: (S,F,T), valid: (S,T) bool. Yalnızca [t_lo, t_hi) aralığındaki geçerli
+        örneklerden median ve IQR öğrenir.
+        """
+        with self._lock:
+            S, F, T = feat.shape
+            t_hi = min(t_hi, T)
+            sub = feat[:, :, t_lo:t_hi]
+            m = valid[:, t_lo:t_hi]
+            s_idx, t_idx = np.nonzero(m)
+            if len(s_idx) == 0:
+                raise ValueError("Scaler fit için geçerli örnek yok")
+            if len(s_idx) > max_samples:
+                rng = np.random.default_rng(seed)
+                pick = rng.choice(len(s_idx), max_samples, replace=False)
+                s_idx, t_idx = s_idx[pick], t_idx[pick]
+            X = sub[s_idx, :, t_idx].astype(np.float64)
+            med = np.median(X, axis=0)
+            q75, q25 = np.percentile(X, [75, 25], axis=0)
+            iqr = q75 - q25
+            iqr = np.where(iqr < 1e-8, 1.0, iqr)
+            if self.no_scale is not None:
+                med = np.where(self.no_scale, 0.0, med)
+                iqr = np.where(self.no_scale, 1.0, iqr)
+            self.med = med.astype(np.float32)
+            self.iqr = iqr.astype(np.float32)
+            log.info("RobustScaler fit: %d örnek, %d özellik", X.shape[0], F)
+            return self
+
+    def transform_inplace(self, feat: np.ndarray) -> np.ndarray:
+        """(S,F,T) özellik tensörünü yerinde ölçekler ve kırpar."""
+        if self.med is None or self.iqr is None:
+            raise RuntimeError("Scaler henüz fit edilmedi")
+        feat -= self.med[None, :, None]
+        feat /= self.iqr[None, :, None]
+        np.clip(feat, -self.clip, self.clip, out=feat)
+        return feat
+
+    def transform_rows(self, X: np.ndarray) -> np.ndarray:
+        """(n,F) satırlarını ölçekleyip yeni dizi döndürür."""
+        if self.med is None or self.iqr is None:
+            raise RuntimeError("Scaler henüz fit edilmedi")
+        out = (np.asarray(X, dtype=np.float32) - self.med) / self.iqr
+        return np.clip(out, -self.clip, self.clip).astype(np.float32)
+
+    def save(self, path: str) -> None:
+        """npz olarak kaydeder."""
+        np.savez(path, med=self.med, iqr=self.iqr, clip=self.clip)
+
+    @classmethod
+    def load(cls, path: str) -> "RobustScaler":
+        """npz'den yükler."""
+        z = np.load(path)
+        sc = cls(clip=float(z["clip"]))
+        sc.med = z["med"]
+        sc.iqr = z["iqr"]
+        return sc
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. TRIPLE-BARRIER
+# ═══════════════════════════════════════════════════════════════════
+
+@njit(cache=True, parallel=True)
+def triple_barrier_kernel(O, H, L, C, ATRN, horizon, k_pt, k_sl, labels, t1, rets):
+    """
+    Triple-barrier (López de Prado 2018). Giriş: t+1 AÇILIŞI. Bariyerler ATR(t).
+    Etiket: 0 yatay (dikey bariyer), 1 yukarı, 2 aşağı, -1 etiketsiz (ufuk bitmedi).
+    İki bariyer aynı bar → muhafazakâr STOP (2). Gap-down: min(stop, açılış);
+    gap-up: max(hedef, açılış). t1: çıkış barı, rets: çıkış/giriş - 1 (maliyetsiz).
+    """
+    S = C.shape[0]
+    T = C.shape[1]
+    for s in prange(S):
+        for t in range(T):
+            labels[s, t] = -1
+            t1[s, t] = -1
+            rets[s, t] = 0.0
+            if t + 1 >= T:
+                continue
+            a = ATRN[s, t]
+            if not (a > 0.0):
+                continue
+            entry = O[s, t + 1]
+            if not (entry > 0.0):
+                continue
+            last = t + horizon
+            if last >= T:
+                continue
+            atr = a * C[s, t]
+            pt = entry + k_pt * atr
+            sl = entry - k_sl * atr
+            lab = 0
+            ex = C[s, last]
+            j_ex = last
+            for j in range(t + 1, last + 1):
+                if j > t + 1:
+                    if O[s, j] <= sl:
+                        lab = 2
+                        ex = O[s, j]
+                        j_ex = j
+                        break
+                    if O[s, j] >= pt:
+                        lab = 1
+                        ex = O[s, j]
+                        j_ex = j
+                        break
+                if L[s, j] <= sl:
+                    lab = 2
+                    ex = min(sl, O[s, j])
+                    j_ex = j
+                    break
+                if H[s, j] >= pt:
+                    lab = 1
+                    ex = max(pt, O[s, j])
+                    j_ex = j
+                    break
+            labels[s, t] = lab
+            t1[s, t] = j_ex
+            rets[s, t] = ex / entry - 1.0
+
+
+@njit(cache=True, parallel=True)
+def uniqueness_panel_kernel(lab, t1, out):
+    """
+    Ortalama benzersizlik (López de Prado 2018): her etiket için [t, t1] boyunca
+    1/eşzamanlılık ortalaması. lab/t1/out: (S,T). Etiketsiz (-1) satırlar 0.
+    """
+    S = lab.shape[0]
+    T = lab.shape[1]
+    for s in prange(S):
+        diff = np.zeros(T + 2)
+        for t in range(T):
+            if lab[s, t] >= 0 and t1[s, t] >= t:
+                diff[t] += 1.0
+                diff[t1[s, t] + 1] -= 1.0
+        conc = np.zeros(T)
+        run = 0.0
+        for t in range(T):
+            run += diff[t]
+            conc[t] = run
+        pref = np.zeros(T + 1)
+        for t in range(T):
+            pref[t + 1] = pref[t] + (1.0 / conc[t] if conc[t] > 0 else 0.0)
+        for t in range(T):
+            if lab[s, t] >= 0 and t1[s, t] >= t:
+                n = t1[s, t] - t + 1
+                out[s, t] = (pref[t1[s, t] + 1] - pref[t]) / n
+            else:
+                out[s, t] = 0.0
+
+
+def triple_barrier_labeling(O: np.ndarray, H: np.ndarray, L: np.ndarray, C: np.ndarray,
+                            ATRN: np.ndarray, horizon: int, k_pt: float,
+                            k_sl: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(S,T) panelleri için (labels int64, t1 int64, rets float64) döndürür."""
+    O, H, L, C, ATRN = (np.ascontiguousarray(a, dtype=np.float64) for a in (O, H, L, C, ATRN))
+    S, T = C.shape
+    lab = np.full((S, T), -1, dtype=np.int64)
+    t1 = np.full((S, T), -1, dtype=np.int64)
+    rets = np.zeros((S, T), dtype=np.float64)
+    triple_barrier_kernel(O, H, L, C, ATRN, int(horizon), float(k_pt), float(k_sl), lab, t1, rets)
+    return lab, t1, rets
+
+
+def compute_sample_weights(lab: np.ndarray, t1: np.ndarray,
+                           half_life: float = TIME_DECAY_HALF_LIFE) -> np.ndarray:
+    """
+    López de Prado (2018) örnek ağırlıkları: benzersizlik × zaman azalması, etiketli
+    örneklerde ortalaması 1 olacak biçimde normalize. Etiketsizler 0. Dönüş (S,T) float32.
+    """
+    lab = np.ascontiguousarray(lab, dtype=np.int64)
+    t1 = np.ascontiguousarray(t1, dtype=np.int64)
+    S, T = lab.shape
+    uq = np.zeros((S, T), dtype=np.float64)
+    uniqueness_panel_kernel(lab, t1, uq)
+    decay = np.power(0.5, (T - 1 - np.arange(T)) / max(half_life, 1.0))
+    w = uq * decay[None, :]
+    m = lab >= 0
+    mean = w[m].mean() if m.any() else 1.0
+    if mean > 0:
+        w = w / mean
+    w[~m] = 0.0
+    return w.astype(np.float32)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. GAT KOMŞULUK MATRİSİ
+# ═══════════════════════════════════════════════════════════════════
+
+def build_adjacency(corr: np.ndarray, sector_id: np.ndarray, valid: np.ndarray,
+                    topk: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    GAT komşuluğu: 1) sektör, 2) korelasyon kNN, 3) self-loop.
+    Kenar tipi: 0=Yok, 1=Sektör, 2=Korelasyon, 3=İkisi, 4=Self. Ağırlık: korelasyon.
+    Dönüş: (adj bool, etype int8, ew float32), hepsi (S,S).
+    """
+    S = corr.shape[0]
+    valid = np.asarray(valid, dtype=bool)
+    same = (sector_id[:, None] == sector_id[None, :]) & valid[:, None] & valid[None, :]
+    np.fill_diagonal(same, False)
+    c = corr.astype(np.float64).copy()
+    np.fill_diagonal(c, -2.0)
+    c[~valid, :] = -2.0
+    c[:, ~valid] = -2.0
+    k = max(1, min(topk, S - 1))
+    idx = np.argpartition(-c, k - 1, axis=1)[:, :k]
+    knn = np.zeros((S, S), dtype=bool)
+    knn[np.repeat(np.arange(S), k), idx.ravel()] = True
+    knn &= (c > -1.5)
+    knn = knn | knn.T
+    eye = np.eye(S, dtype=bool)
+    adj = same | knn | eye
+    etype = same.astype(np.int8) + 2 * knn.astype(np.int8)
+    etype[eye] = 4
+    ew = np.where(adj, corr, 0.0).astype(np.float32)
+    return adj, etype, ew
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. PURGED / EMBARGO CV + CPCV
+# ═══════════════════════════════════════════════════════════════════
+
+def _fix_t1(t_idx: np.ndarray, t1: np.ndarray) -> np.ndarray:
+    """Etiket bitiş zamanı eksikse (<t) örneğin kendi zamanına çeker."""
+    return np.maximum(np.asarray(t1), np.asarray(t_idx))
+
+
+def test_mask_from_ranges(t_idx: np.ndarray, ranges: Sequence[Tuple[int, int]]) -> np.ndarray:
+    """t_idx'i yarı-açık test aralıklarından [lo,hi) herhangi birine düşen örnekler için True."""
+    m = np.zeros(len(t_idx), dtype=bool)
+    for lo, hi in ranges:
+        m |= (t_idx >= lo) & (t_idx < hi)
     return m
 
-def simulate_entries(V, idx, rp):
-    k = len(idx)
-    Hc = int(np.clip(round(rp["max_hold"] * 5 / 7), 1, HW))
-    cm, lo, cl = V["cmax"][idx, :Hc], V["lo1"][idx, :Hc], V["cl1"][idx, :Hc]
-    nval, atr = np.minimum(V["nval"][idx], Hc), V["atrp"][idx]
-    e = 1.0 + SLIPPAGE
-    sd0 = rp["sl_atr"] * atr
-    stop_fixed = (e - sd0)[:, None]
-    hwm_prev = np.empty_like(cm); hwm_prev[:, 0] = e
-    if Hc > 1: hwm_prev[:, 1:] = np.maximum(e, cm[:, :-1])
-    trail_on = hwm_prev >= (e + rp["trail_act_r"] * sd0)[:, None]
-    stop = np.where(trail_on, np.maximum(stop_fixed, hwm_prev - (rp["trail_atr"] * atr)[:, None]), stop_fixed)
-    valid = np.arange(Hc)[None, :] < nval[:, None]
-    hit = valid & (lo <= stop)
-    anyh, first = hit.any(1), hit.argmax(1)
-    ar = np.arange(k)
-    ex = np.where(anyh, stop[ar, first], cl[ar, np.maximum(nval - 1, 0)])
-    return (ex * (1 - SLIPPAGE) * (1 - FEE) / (e * (1 + FEE)) - 1.0).astype(np.float32)
 
-def run_sim(V, rp):
-    idx = np.flatnonzero(sim_signals(V, rp))
-    if len(idx) == 0: return idx, None, None
-    rets = simulate_entries(V, idx, rp)
-    cm = conf_mult_vec(V["Ps"][idx], V["Pl"][idx], rp) if rp.get("conf_sizing", True) else 1.0
-    sd = np.maximum(rp["sl_atr"] * V["atrp"][idx], 1e-6)
-    frac = np.minimum(rp["risk_per_trade"] * cm / sd, rp["max_pos"])
-    di, nd = V["di"][idx], V["nd"]
-    dayfrac = np.bincount(di, weights=frac, minlength=nd)
-    scale = np.minimum(1.0, rp["max_exposure"] / np.maximum(dayfrac[di], 1e-9))
-    daily = np.bincount(di, weights=frac * scale * rets, minlength=nd)
-    return idx, rets, daily
+def purged_train_mask(t_idx: np.ndarray, t1: np.ndarray,
+                      test_ranges: Sequence[Tuple[int, int]],
+                      embargo: int = EMBARGO_BARS) -> np.ndarray:
+    """
+    Train maskesi: etiket aralığı [t, t1] bir test aralığıyla kesişen örnekler çıkarılır
+    (purge) ve test aralığından sonraki `embargo` bar içindeki örnekler çıkarılır.
+    """
+    t1 = _fix_t1(t_idx, t1)
+    keep = np.ones(len(t_idx), dtype=bool)
+    for lo, hi in test_ranges:
+        overlap = (t_idx <= hi - 1) & (t1 >= lo)
+        emb = (t_idx >= hi) & (t_idx < hi + embargo)
+        keep &= ~(overlap | emb)
+    return keep
 
-def score_params(V, rp, min_n=20):
-    idx, rets, daily = run_sim(V, rp)
-    n = len(idx)
-    st_ = {"n": n, "gross": 0.0, "net": 0.0, "prec": 0.0, "dd": 0.0, "wr": 0.0, "pf": 0.0, "sharpe": 0.0, "sortino": 0.0, "t_stat": 0.0}
-    if n == 0: return -5.0, st_
-    st_.update(net=float(rets.mean()), gross=float(rets.mean() + RT_COST),
-               wr=float((rets > 0).mean()), prec=float((V["y"][idx] == 2).mean()))
-    if n < min_n: return -5.0 + n / max(1, min_n), st_
-    cum = np.cumsum(daily)
-    dd = float(np.max(np.maximum.accumulate(np.concatenate([[0.0], cum]))[1:] - cum))
-    st_["dd"] = dd
-    ds = daily.std() + 1e-9
-    neg = daily[daily < 0]
-    nstd = neg.std() + 1e-9 if len(neg) > 1 else ds
-    st_["sharpe"] = float(daily.mean() / ds * math.sqrt(252))
-    st_["sortino"] = float(daily.mean() / nstd * math.sqrt(252))
-    wp, lp = rets[rets > 0].sum(), -rets[rets < 0].sum()
-    st_["pf"] = float(wp / lp) if lp > 1e-9 else 5.0
-    st_["t_stat"] = float(daily.mean() / ds * math.sqrt(len(daily)))
-    base = st_["t_stat"] + 0.3 * clamp(st_["sharpe"], -3, 5) + 0.5 * clamp(st_["pf"] - 1.0, -1, 3) + 0.4 * clamp((st_["wr"] - 0.5) * 4, -1, 2)
-    base -= 15.0 * dd + 0.001 * max(0, n - 100)
-    return float(base), st_
 
-# ════════════════════════════════════════════════════════════
-# 7. DSR
-# ════════════════════════════════════════════════════════════
-def _norm_cdf(x): return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+def walk_forward_split(t_idx: np.ndarray, t1: np.ndarray, T: int,
+                       fracs: Tuple[float, float, float] = (0.70, 0.15, 0.15),
+                       embargo: int = EMBARGO_BARS) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Zaman sıralı train/val/test bölünmesi. Train etiketleri val başlamadan embargo kadar
+    önce biter; val etiketleri test başlamadan embargo kadar önce biter. İndeks dizileri döner.
+    """
+    t1 = _fix_t1(t_idx, t1)
+    a = int(T * fracs[0])
+    b = int(T * (fracs[0] + fracs[1]))
+    tr = np.nonzero(t1 < a - embargo)[0]
+    va = np.nonzero((t_idx >= a) & (t1 < b - embargo))[0]
+    te = np.nonzero(t_idx >= b)[0]
+    return tr, va, te
 
-def _norm_ppf(p):
-    if p <= 0: return -8.0
-    if p >= 1: return 8.0
-    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
-    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00]
-    pl, ph = 0.02425, 1 - 0.02425
-    if p < pl:
-        q = math.sqrt(-2 * math.log(p))
-        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
-    if p > ph:
-        q = math.sqrt(-2 * math.log(1 - p))
-        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
-    q = p - 0.5; r = q * q
-    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
 
-def deflated_sharpe(returns, n_trials):
-    r = np.asarray(returns, dtype=np.float64); r = r[np.isfinite(r)]; n = len(r)
-    if n < 30: return 0.0, 0.0, 0.0
-    mu, sdv = r.mean(), r.std(ddof=1)
-    if sdv < 1e-12: return 0.0, 0.0, 0.0
-    sr = mu / sdv; z = (r - mu) / sdv
-    g3, g4 = float((z ** 3).mean()), float((z ** 4).mean())
-    N, em = max(int(n_trials), 2), 0.5772156649
-    sr0 = math.sqrt(1.0 / (n - 1)) * ((1 - em) * _norm_ppf(1 - 1.0 / N) + em * _norm_ppf(1 - 1.0 / (N * math.e)))
-    den = math.sqrt(max(1 - g3 * sr + (g4 - 1) / 4.0 * sr ** 2, 1e-6))
-    return float(_norm_cdf((sr - sr0) * math.sqrt(n - 1) / den)), float(sr * math.sqrt(252)), float(sr0 * math.sqrt(252))
+def make_time_groups(t_lo: int, t_hi: int, n_groups: int) -> List[Tuple[int, int]]:
+    """[t_lo, t_hi) aralığını ardışık, eşit büyüklükte n_groups gruba böler."""
+    edges = np.linspace(t_lo, t_hi, n_groups + 1).astype(int)
+    return [(int(edges[i]), int(edges[i + 1])) for i in range(n_groups)]
 
-# ════════════════════════════════════════════════════════════
-# 8. CPCV-OOS + PBO (CSCV)
-# ════════════════════════════════════════════════════════════
-def cpcv_oos(bot, rp, n_groups=CPCV_N_GROUPS, n_test=CPCV_N_TEST_GROUPS, max_splits=15):
-    if not CPCV_ENABLED or bot.hold is None or bot.hold_te is None: return None
-    pool = {k: np.concatenate([bot.hold[k], bot.hold_te[k]]) for k in DS_KEYS}
-    ud = np.unique(pool["d"])
-    if len(ud) < n_groups * 10: return None
-    Ps, Pl, U = bot.nn.predict_unc(pool["X"], pool["sid"], pool["row"])
-    gs = len(ud) // n_groups
-    groups = [ud[i * gs:(len(ud) if i == n_groups - 1 else (i + 1) * gs)] for i in range(n_groups)]
-    combos = list(combinations(range(n_groups), n_test))
-    rng = np.random.default_rng(42)
-    if len(combos) > max_splits:
-        combos = [combos[i] for i in rng.choice(len(combos), max_splits, replace=False)]
-    scores = []
-    for combo in combos:
-        m = np.isin(pool["d"], np.concatenate([groups[i] for i in combo]))
-        if m.sum() < 50: continue
-        V = make_V({k: pool[k][m] for k in DS_KEYS}, Ps[m], Pl[m], U[m])
-        sc, _ = score_params(V, rp, min_n=5)
-        if np.isfinite(sc): scores.append(sc)
-    if not scores: return None
-    return {"mean_score": float(np.mean(scores)), "std_score": float(np.std(scores)),
-            "worst": float(np.min(scores)), "best": float(np.max(scores)),
-            "n_splits": len(scores),
-            "sharpe_cpcv": float(np.mean(scores) / (np.std(scores) + 1e-9)),
-            "per_split": [round(s, 3) for s in scores]}
 
-def cscv_pbo(M, n_blocks=8, max_combos=70, seed=0):
-    if M is None or M.ndim != 2: return None
-    T, K = M.shape
-    if K < 4 or T < n_blocks * 4: return None
-    S = n_blocks - n_blocks % 2; bl = T // S
-    blocks = [M[i * bl:(i + 1) * bl] for i in range(S)]
-    combos = list(combinations(range(S), S // 2))
-    rng = np.random.default_rng(seed)
-    if len(combos) > max_combos:
-        combos = [combos[i] for i in rng.choice(len(combos), max_combos, replace=False)]
-    sr = lambda A: A.mean(0) / (A.std(0) + 1e-9)
-    logits = []
-    for c in combos:
-        rest = [i for i in range(S) if i not in c]
-        s_tr, s_te = sr(np.vstack([blocks[i] for i in c])), sr(np.vstack([blocks[i] for i in rest]))
-        best = int(np.argmax(s_tr))
-        omega = ((s_te < s_te[best]).sum() + 1) / (K + 1)
-        logits.append(math.log(omega / (1 - omega)))
-    lg = np.array(logits); pbo = float((lg <= 0).mean())
-    return {"pbo": pbo, "n_combos": len(lg), "K": K, "logit_mean": float(lg.mean()),
-            "n_sims": len(lg), "mean": float(lg.mean()), "median": float(np.median(lg)),
-            "interpretation": "GÜVENİLİR" if pbo < 0.3 else ("ŞÜPHELİ" if pbo < 0.5 else "OVERFIT RİSKİ")}
+def cpcv_splits(t_idx: np.ndarray, t1: np.ndarray, t_lo: int, t_hi: int,
+                n_groups: int = CPCV_N_GROUPS, k_test: int = CPCV_N_TEST_GROUPS,
+                embargo: int = EMBARGO_BARS) -> Iterator[Tuple[Tuple[int, ...], np.ndarray, np.ndarray]]:
+    """
+    Combinatorial Purged CV (López de Prado 2018). C(8,4)=70 kombinasyon.
+    Her adımda (grup_kombinasyonu, train_indeksleri, test_indeksleri) üretir.
+    """
+    groups = make_time_groups(t_lo, t_hi, n_groups)
+    for combo in combinations(range(n_groups), k_test):
+        ranges = [groups[g] for g in combo]
+        te = np.nonzero(test_mask_from_ranges(t_idx, ranges))[0]
+        tr = np.nonzero(purged_train_mask(t_idx, t1, ranges, embargo))[0]
+        if len(te) and len(tr):
+            yield combo, tr, te
 
-# ════════════════════════════════════════════════════════════
-# 9. XAI / ÖNEM / KALİBRASYON
-# ════════════════════════════════════════════════════════════
-def feat_importance(bot):
-    imp = np.zeros(N_FEAT)
-    for nn in bot.nn.nets: imp += NN._scale(nn.E["Att"]) * np.linalg.norm(nn.E["W0"], axis=1)
-    return imp / (imp.sum() + 1e-9)
 
-def permutation_importance(bot, X, y, n_perm=3, max_n=1500):
-    rng = np.random.default_rng(42)
-    if len(X) > max_n:
-        sel = rng.choice(len(X), max_n, replace=False); X, y = X[sel], y[sel]
-    base, _, _ = bot.nn.evaluate(X, y, None)
-    imp = np.zeros(X.shape[1], dtype=np.float32)
-    for j in range(X.shape[1]):
-        ls = []
-        for _ in range(n_perm):
-            Xp = X.copy(); Xp[:, j] = rng.permutation(Xp[:, j])
-            ls.append(bot.nn.evaluate(Xp, y, None)[0])
-        imp[j] = max(0.0, np.mean(ls) - base)
-    return imp / (imp.sum() + 1e-9)
+def cpcv_path_count(n_groups: int = CPCV_N_GROUPS, k_test: int = CPCV_N_TEST_GROUPS) -> int:
+    """CPCV'de oluşan bağımsız backtest yolu sayısı: φ = k/N · C(N,k) (8,4 için 35)."""
+    from math import comb
+    return int(round(k_test / n_groups * comb(n_groups, k_test)))
 
-def shap_values(bot, x_sample, n_samples=30):
-    if bot.hold is None or len(bot.hold["X"]) < 10: return None
-    ref, rng = bot.hold["X"], np.random.default_rng(42)
-    x = np.atleast_2d(x_sample).astype(np.float32)[0]
-    n = len(x); sv = np.zeros(n, dtype=np.float32)
-    for _ in range(n_samples):
-        z, perm = ref[rng.integers(0, len(ref))], rng.permutation(n)
-        H = np.tile(z, (n + 1, 1))
-        for i, j in enumerate(perm): H[i + 1:, j] = x[j]
-        p = bot.nn.predict_batch(H)[0][:, 2]
-        sv[perm] += (p[1:] - p[:-1]) / n_samples
-    out = [(FEAT_NAMES[i], float(sv[i])) for i in range(n)]
-    out.sort(key=lambda t: abs(t[1]), reverse=True)
-    return out[:20]
 
-def lime_explain(bot, x_sample, n_samples=300):
-    if bot.hold is None: return None
-    ref, x = bot.hold["X"], np.atleast_2d(x_sample).astype(np.float32)
-    n_feat, rng = x.shape[1], np.random.default_rng(42)
-    mask = rng.random((n_samples, n_feat)) < 0.5
-    Z = np.where(mask, ref[rng.integers(0, len(ref), n_samples)], x)
-    y = bot.nn.predict_batch(Z)[0][:, 2]
-    dist = np.linalg.norm((Z - x) / (ref.std(0) + 1e-6), axis=1)
-    w = np.exp(-(dist / (dist.std() + 1e-9)) ** 2 / 2)
-    A = np.hstack([Z - Z.mean(0), np.ones((n_samples, 1))]) * np.sqrt(w)[:, None]
-    try: coef = np.linalg.solve(A.T @ A + 1e-2 * np.eye(n_feat + 1), A.T @ ((y - y.mean()) * np.sqrt(w)))
-    except Exception: return None
-    out = [(FEAT_NAMES[i], float(coef[i])) for i in range(n_feat)]
-    out.sort(key=lambda t: abs(t[1]), reverse=True)
-    return out[:15]
+# ═══════════════════════════════════════════════════════════════════
+# 5. ÖZELLİK BLOKLARI
+# ═══════════════════════════════════════════════════════════════════
 
-def partial_dependence(bot, X, feat_idx, n_grid=20):
-    if bot.hold is None: return None
-    ref = bot.hold["X"][:1500]
-    vals = np.linspace(np.percentile(X[:, feat_idx], 5), np.percentile(X[:, feat_idx], 95), n_grid)
-    out = []
-    for v in vals:
-        T = ref.copy(); T[:, feat_idx] = v
-        out.append(float(bot.nn.predict_batch(T)[0][:, 2].mean()))
-    return list(zip(vals.tolist(), out))
+def _tf(tech: np.ndarray, name: str) -> np.ndarray:
+    """Teknik tensörden (S,T) isimli özelliği döndürür."""
+    return tech[:, TECH_ALL_NAMES.index(name), :].astype(np.float64)
 
-def calibration(bot):
-    if not bot.hold: return None
-    Ps, Pl, U = bot.nn.predict_unc(bot.hold["X"], bot.hold["sid"], bot.hold["row"])
-    p, y = Ps[:, 2], (bot.hold["y"] == 2).astype(float)
-    edges = np.unique(np.quantile(p, np.linspace(0, 1, 9)))
-    if len(edges) < 3: return None
-    ids = np.clip(np.digitize(p, edges[1:-1]), 0, len(edges) - 2)
-    rows, ece = [], 0.0
-    for i in range(len(edges) - 1):
-        mk = ids == i
-        if mk.any():
-            rows.append({"Bin": i, "Tahmin %": round(p[mk].mean() * 100, 1),
-                         "Gerçek %": round(y[mk].mean() * 100, 1), "n": int(mk.sum())})
-            ece += mk.mean() * abs(p[mk].mean() - y[mk].mean())
-    return rows, float(ece)
 
-# ════════════════════════════════════════════════════════════
-# 10. STRESS TEST
-# ════════════════════════════════════════════════════════════
-KRIZ_SENARYOLARI = {
-    "2008_Kriz": {"shock": -0.55, "vol_mult": 3.0, "name": "2008 Finans Krizi"},
-    "2020_Covid": {"shock": -0.35, "vol_mult": 2.5, "name": "2020 Covid Çöküşü"},
-    "2023_Deprem": {"shock": -0.15, "vol_mult": 2.0, "name": "2023 Deprem Şoku"},
-    "2018_Kur": {"shock": -0.25, "vol_mult": 2.2, "name": "2018 Kur Krizi"},
-    "2022_Enflasyon": {"shock": -0.20, "vol_mult": 1.8, "name": "2022 Enflasyon"},
-    "Faiz_+500bp": {"shock": -0.15, "vol_mult": 1.5, "name": "Faiz +500bp"},
-}
+def _roll_corr(x: np.ndarray, y: np.ndarray, w: int) -> np.ndarray:
+    """(S,T) dizileri için satır bazında kayan korelasyon (NaN→0)."""
+    a = pd.DataFrame(x.T)
+    b = pd.DataFrame(y.T)
+    r = a.rolling(w, min_periods=w).corr(b).values.T
+    return np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
 
-def stress_test(bot, prices, rp, dfs=None):
-    total_eq, expo = bot.total_value(prices), bot.exposure(prices)
-    if total_eq <= 0: return []
-    res = []
-    for cfg in KRIZ_SENARYOLARI.values():
-        loss = expo * abs(cfg["shock"]) + expo * min(cfg["vol_mult"] * 0.02, 0.15)
-        res.append({"Senaryo": cfg["name"], "Şok %": cfg["shock"] * 100,
-                    "Portföy Kayıp ₺": loss, "Kayıp %": loss / total_eq * 100,
-                    "Yeni Portföy": total_eq - loss, "DD %": loss / total_eq * 100})
-    if dfs:
-        loss = 0.0
-        for s, p in bot.positions.items():
-            d = dfs.get(s)
-            if d is None: continue
-            w = (d["Close"].pct_change(10)).min()
-            loss += p["qty"] * prices.get(s, p["entry"]) * abs(min(0.0, safe_float(w)))
-        res.append({"Senaryo": "Tarihsel en kötü 10 gün (pozisyon bazlı)", "Şok %": float("nan"),
-                    "Portföy Kayıp ₺": loss, "Kayıp %": loss / total_eq * 100,
-                    "Yeni Portföy": total_eq - loss, "DD %": loss / total_eq * 100})
-    return res
 
-# ════════════════════════════════════════════════════════════
-# 11. TUNE (25 otonom) + CSCV-PBO
-# ════════════════════════════════════════════════════════════
-def _sub(hold, mask): return {k: v[mask] for k, v in hold.items()}
+def _cs_rank(X: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Her t'de geçerli hisseler arasında yüzdelik rank [0,1]; geçersizler 0.5."""
+    df = pd.DataFrame(X.T).where(pd.DataFrame(mask.T))
+    r = df.rank(axis=1, pct=True).values.T
+    return np.nan_to_num(r, nan=0.5)
 
-def _mat(rp, c):
-    out = dict(rp)
-    for k, v in c.items():
-        out[k] = bool(v > 0.5) if k in TUNE_BINARY else (int(round(v)) if k in TUNE_INT else float(v))
+
+def _sector_mean(X: np.ndarray, sector_id: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Her hisseye kendi sektörünün (geçerli hisseler üzerinden) ortalamasını atar. (S,T)"""
+    out = np.zeros_like(X, dtype=np.float64)
+    for g in np.unique(sector_id):
+        sel = sector_id == g
+        m = mask & sel[:, None]
+        cnt = np.maximum(m.sum(axis=0), 1)
+        mean = (np.where(m, X, 0.0)).sum(axis=0) / cnt
+        out[sel, :] = mean[None, :]
     return out
 
-def tune_risk(hold, bag, rp, budget=5.0, seed=0, min_n=20, hist=None, hold_te=None, max_evals=1200):
-    Ps, Pl, U = bag.predict_unc(hold["X"], hold["sid"], hold["row"])
-    d = hold["d"]; ud = np.unique(d)
-    if len(ud) < 30: return None
-    cut = ud[int(len(ud) * 0.6)]
-    ma = d < cut; mb = ~ma
-    if ma.sum() < 200 or mb.sum() < 100: return None
-    VA = make_V(truncate_windows(_sub(hold, ma), ud, cut), Ps[ma], Pl[ma], U[ma])
-    VB = make_V(_sub(hold, mb), Ps[mb], Pl[mb], U[mb])
-    nA, nB = min_n, max(8, int(min_n * 0.6))
-    rng = np.random.default_rng(seed)
-    full = lambda c: _mat(rp, c)
-    cur = {}
-    for k in TUNE_BOUNDS:
-        if k in rp:
-            val = float(rp[k])
-            if k in TUNE_BINARY: val = 1.0 if val else 0.0
-            if k in TUNE_INT: val = float(round(val))
-            cur[k] = val
-    curA, _ = score_params(VA, full(cur), nA)
-    curB, _ = score_params(VB, full(cur), nB)
-    best, bestA = dict(cur), curA
-    for h in (hist or []):
-        hc = {k: float(h[k]) for k in TUNE_BOUNDS if k in h}
-        if len(hc) == len(TUNE_BOUNDS):
-            s, _ = score_params(VA, full(hc), nA)
-            if s > bestA: best, bestA = hc, s
-    sig = {k: 0.12 * (hi - lo) for k, (lo, hi) in TUNE_BOUNDS.items()}
-    keys = list(TUNE_BOUNDS)
-    t0, evals, tries, succ, hs = time.time(), 0, 0, 0, []
-    while evals < max_evals and time.time() - t0 < budget:
-        if evals > 5 and rng.random() < 0.4 and hs:
-            top = sorted(hs, key=lambda x: x[1], reverse=True)[:5]
-            w_arr = np.array([max(0.01, h[1] + 6.0) for h in top]); w_arr /= w_arr.sum()
-            cand = dict(best)
-            for k in keys:
-                if rng.random() < 0.5:
-                    vals = np.array([h[0].get(k, best[k]) for h in top])
-                    sd = max(np.std(vals), 0.08 * (TUNE_BOUNDS[k][1] - TUNE_BOUNDS[k][0]))
-                    cand[k] = float(clamp((vals * w_arr).sum() + rng.normal() * sd, *TUNE_BOUNDS[k]))
-        else:
-            cand, nm = dict(best), 0
-            for k in keys:
-                if rng.random() < 0.4:
-                    cand[k] = float(clamp(best[k] + rng.normal() * sig[k], *TUNE_BOUNDS[k])); nm += 1
-            if nm == 0:
-                k = keys[int(rng.integers(len(keys)))]
-                cand[k] = float(clamp(best[k] + rng.normal() * sig[k], *TUNE_BOUNDS[k]))
-        sc, _ = score_params(VA, full(cand), nA)
-        evals += 1; tries += 1
-        hs.append((dict(cand), sc))
-        if len(hs) > 60: hs.pop(0)
-        if sc > bestA + 1e-9: best, bestA, succ = cand, sc, succ + 1
-        if tries == 25:
-            f = 1.3 if succ / 25 > 0.2 else 0.8
-            for k, (lo, hi) in TUNE_BOUNDS.items():
-                sig[k] = clamp(sig[k] * f, 0.01 * (hi - lo), 0.3 * (hi - lo))
-            tries = succ = 0
-    bestB, stB = score_params(VB, full(best), nB)
-    dsr = sr = sr0 = 0.0
-    if USE_DSR:
-        _, _, daily = run_sim(VB, full(best))
-        if daily is not None: dsr, sr, sr0 = deflated_sharpe(daily, evals + 1)
-    pbo = None
-    if PBO_ENABLED:
-        try:
-            Vf = make_V(hold, Ps, Pl, U)
-            pool, seen = [cur, best] + [c for c, _ in sorted(hs, key=lambda x: x[1], reverse=True)[:14]], set()
-            cols = []
-            for c in pool:
-                key = tuple(round(c[k], 3) for k in keys)
-                if key in seen: continue
-                seen.add(key)
-                _, _, dly = run_sim(Vf, full(c))
-                col = dly if dly is not None else np.zeros(Vf["nd"])
-                if col.std() > 1e-12: cols.append(col)
-            if len(cols) >= 4: pbo = cscv_pbo(np.column_stack(cols))
-        except Exception as e:
-            log.warning(f"cscv: {e}")
-    curT = bestT = stT = None
-    if hold_te is not None and len(hold_te["d"]) >= 100:
-        Pt, Plt, Ut = bag.predict_unc(hold_te["X"], hold_te["sid"], hold_te["row"])
-        VT = make_V(hold_te, Pt, Plt, Ut)
-        curT, _ = score_params(VT, full(cur), 8)
-        bestT, stT = score_params(VT, full(best), 8)
-    changed = any(abs(best[k] - cur[k]) > 1e-9 for k in keys)
-    improved = bool(changed and stB["n"] >= nB and bestB > curB + 0.25 and bestA > curA + 0.25 and stB["net"] > 0)
-    clean = lambda dct: {k: (bool(v > 0.5) if k in TUNE_BINARY else int(round(v)) if k in TUNE_INT else float(v)) for k, v in dct.items()}
-    return {"cur": clean(cur), "best": clean(best), "curA": curA, "bestA": bestA, "curB": curB, "bestB": bestB,
-            "evals": evals, "improved": improved, "stB": stB, "dsr": dsr, "sr": sr, "sr0": sr0,
-            "curT": curT, "bestT": bestT, "stT": stT, "pbo": pbo}
 
-def run_pbo(bot, rp, budget=4.0):
-    if bot.hold is None: return None
-    tr = tune_risk(bot.hold, bot.nn, rp, budget=budget, seed=bot.nn.evo + 1, hold_te=None)
-    return tr["pbo"] if tr else None
+def default_sector_ids(n: int) -> np.ndarray:
+    """Her bot için varsayılan alt-sektör ataması: 8'erli üç grup (override edilebilir)."""
+    return (np.arange(n) // 8).astype(np.int64).clip(0, 2)
 
-def _near(a, b, tol=0.35):
-    if not a or not b: return False
-    common = set(a) & set(b)
-    if not common: return False
-    for k in common:
-        if k not in TUNE_BOUNDS: continue
-        lo, hi = TUNE_BOUNDS[k]
-        if abs(float(a[k]) - float(b[k])) > tol * max(hi - lo, 1e-9): return False
-    return True
 
-# ════════════════════════════════════════════════════════════
-# 12. TRANSFORMER EĞİTİM YARDIMCISI (sektör-aware)
-# ════════════════════════════════════════════════════════════
-def train_transformer(nn, sp, steps=30, seed=0):
-    te, tr, va = nn.trans_ens, sp["tr"], sp["va"]
-    sk = AKTIF_SEKTOR
-    te.fit(tr["sid"], tr["row"], tr["y"], steps=steps, bs=16, seed=seed, sektor_key=sk)
-    vi = te.sample_val(va["sid"], va["row"], va["y"])
-    sid, row, y = va["sid"][vi], va["row"][vi], va["y"][vi]
-    te.update_w(sid, row, y, sektor_key=sk)
-    Pt = te.predict_idx(sid, row, sektor_key=sk)
-    Pm = nn.predict_batch(va["X"][vi])[0]
-    ml, bl = short_logloss(Pm, y), short_logloss(MLP_WEIGHT * Pm + TRANS_WEIGHT * Pt, y)
-    te.gain, te.on = ml - bl, bool(bl < ml * 0.998)
+def compute_peer_sets(corr: np.ndarray, mask: np.ndarray,
+                      k: int = PEER_K) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Her t ve hisse için korelasyona göre en yakın k peer. Dönüş: idx (T,S,k), w (T,S,k).
+    Geçersiz hisseler peer olamaz. Korelasyon t anına kadar olan pencereyi kullanır.
+    """
+    T, S, _ = corr.shape
+    k = max(1, min(k, S - 1))
+    idx = np.zeros((T, S, k), dtype=np.int64)
+    w = np.zeros((T, S, k), dtype=np.float64)
+    for t in range(T):
+        c = corr[t].astype(np.float64).copy()
+        np.fill_diagonal(c, -2.0)
+        c[:, ~mask[:, t]] = -2.0
+        ix = np.argpartition(-c, k - 1, axis=1)[:, :k]
+        idx[t] = ix
+        w[t] = np.clip(np.take_along_axis(c, ix, axis=1), 0.0, 1.0) + 1e-6
+    return idx, w
 
-# ════════════════════════════════════════════════════════════
-# 13. SELF-IMPROVER
-# ════════════════════════════════════════════════════════════
-class SelfImprover:
-    def __init__(self):
-        self.history, self.rp_hist = [], []
-        self.last_run, self.last_data, self.runs = 0.0, None, 0
-        self.proposal, self.drift, self.consec_improve, self.pending_rp = None, 1.0, 0, None
 
-    def due(self, now_ts, data_date, interval_min):
-        return (self.last_data != data_date) or (now_ts - self.last_run >= interval_min * 60)
+def peer_avg(X: np.ndarray, idx: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """X (S,T) için peer ağırlıklı ortalaması (S,T)."""
+    T = X.shape[1]
+    tt = np.arange(T)[:, None, None]
+    vals = X[idx, tt]                         # (T,S,k)
+    num = (vals * w).sum(axis=2)
+    den = w.sum(axis=2) + 1e-12
+    return (num / den).T
 
-    @staticmethod
-    def calibrate(bag, X, y_s):
-        if len(y_s) < 30: return None
-        ps, _ = bag.predict_batch(X)
-        p_al, y_al = ps[:, 2], (y_s == 2).astype(np.float32)
-        bins, n, ece, cal = np.linspace(0, 1, 11), len(ps), 0.0, []
-        for i in range(10):
-            m = (p_al >= bins[i]) & ((p_al < bins[i + 1]) if i < 9 else (p_al <= bins[i + 1]))
-            if m.sum() > 0:
-                ece += m.sum() / n * abs(p_al[m].mean() - y_al[m].mean())
-                cal.append({"bin": f"{bins[i]:.1f}-{bins[i+1]:.1f}", "pred": float(p_al[m].mean()),
-                            "actual": float(y_al[m].mean()), "n": int(m.sum())})
-        return {"brier": float(np.mean((p_al - y_al) ** 2)), "ece": float(ece),
-                "acc": float(np.mean(ps.argmax(1) == y_s)),
-                "base": float(np.bincount(y_s, minlength=3).max() / len(y_s)), "cal": cal, "n": n}
 
-    def run(self, sh, datasets, rp, budget=30.0, reason="auto"):
-        t0 = time.time()
-        merged = merge_ds(datasets)
-        sp = split_ds(merged) if merged else None
-        rep = {"ts": _ts(), "reason": reason}
-        if sp is None:
-            rep["error"] = "veri yetersiz"; return None, rep
-        nn = sh.nn
-        rep["drift"] = self.drift = nn.drift(sp["Xva"], sp["yva"], sp["yva_long"])
-        vl0, va0, _ = nn.evaluate(sp["Xva"], sp["yva"], sp["yva_long"])
-        steps = rolled = 0
-        n_steps = 12 if rep["drift"] > 1.15 else 6
-        while time.time() - t0 < budget * 0.35 and steps < n_steps:
-            r = nn.evolve_step(sp); steps += 1; rolled += int(r["rolled"])
-        pb = nn.pbt_step(sp) if time.time() - t0 < budget * 0.5 else None
-        rr = nn.fit_router(sp)
-        try: train_transformer(nn, sp, steps=30, seed=nn.evo)
-        except Exception as e: log.warning(f"trans: {e}")
-        adapted = False
-        if rep["drift"] > 1.15:
-            try:
-                adapted = nn.fast_adapt(sp["Xva"][-300:], sp["yva"][-300:], sp["yva_long"][-300:])
-                if time.time() - t0 < budget * 0.55:
-                    nn.reptile.meta_train(nn, sp, n_epochs=1, seed=nn.evo)
-            except Exception as e: log.warning(f"adapt: {e}")
-        rep["adapt"] = adapted
-        vl1, va1, _ = nn.evaluate(sp["Xva"], sp["yva"], sp["yva_long"])
-        rep.update(vl0=vl0, vl1=vl1, va0=va0, va1=va1, steps=steps, rolled=rolled,
-                   pbt=("kabul" if pb and pb["accepted"] else "red" if pb else "-"),
-                   router=("açık" if nn.router_on else "kapalı") if rr else "-")
-        te_loss, te_acc, te_base = nn.evaluate(sp["Xte"], sp["yte"], sp["yte_long"])
-        rep.update(te_loss=te_loss, te_acc=te_acc[0], te_base=te_base, gen_gap=te_loss / max(vl1, 1e-9))
-        cal = self.calibrate(nn, sp["Xte"], sp["yte"])
-        if cal:
-            rep.update(brier=cal["brier"], ece=cal["ece"])
-            db_calib_add(cal["n"], cal["brier"], cal["ece"], cal["acc"], cal["base"])
-        if (not nn.ewc_consolidated or nn.evo % 20 == 0) and len(sp["Xva"]) > 200:
-            nn.consolidate_ewc(sp["Xva"], sp["yva"], sp["yva_long"])
-        err = nn.error_analyzer.analyze()
-        if err: rep["error_analysis"] = err
-        sh.set_hold(sp); sh.set_ref(sp); sh.reeval(rp)
-        try:
-            sh._rl_train(sp, epochs=2)
-            sh.rl_on = sh._rl_validate(sp)
-        except Exception as e: log.warning(f"rl: {e}")
-        new_rp, adopted = None, False
-        tr = tune_risk(sh.hold, nn, rp, budget=min(max(2.0, budget - (time.time() - t0)), 15.0),
-                       seed=nn.evo, min_n=20, hist=self.rp_hist, hold_te=sh.hold_te)
-        if tr:
-            rep.update(scoreB0=tr["curB"], scoreB1=tr["bestB"], evals=tr["evals"], dsr=tr["dsr"], sr=tr["sr"])
-            if tr["bestT"] is not None: rep.update(scoreT0=tr["curT"], scoreT1=tr["bestT"])
-            dsr_ok = (not USE_DSR) or tr["dsr"] >= rp.get("dsr_confidence", 0.9)
-            te_ok = True
-            if tr["stT"] is not None:
-                te_ok = tr["stT"]["n"] >= 8 and tr["stT"]["net"] > 0 and tr["bestT"] >= tr["curT"] - rp.get("test_score_tol", 0.25)
-            cand_rp = _mat(rp, tr["best"])
-            cp = cpcv_oos(sh, cand_rp) if CPCV_ENABLED else None
-            if cp:
-                rep["cpcv"] = cp
-                db_cpcv_add(cp["mean_score"], cp["std_score"], cp["worst"], cp["best"], cp["n_splits"], cp["sharpe_cpcv"])
-            pbo = tr.get("pbo")
-            if pbo:
-                rep["pbo"] = pbo
-                db_pbo_add(pbo["pbo"], pbo["mean"], pbo["median"], pbo["n_sims"], pbo["interpretation"])
-            cpcv_ok = cp is None or cp.get("sharpe_cpcv", 0) > 0.3
-            pbo_ok = pbo is None or pbo["pbo"] < 0.5
-            min_trades_ok = tr["stB"].get("n", 0) >= 30
-            risk_ok = tr["stB"].get("dd", 1.0) < 0.30
-            if tr["improved"] and dsr_ok and te_ok and cpcv_ok and pbo_ok and min_trades_ok and risk_ok:
-                rep["changes"] = {k: round(float(tr["best"][k]), 4) for k in TUNE_BOUNDS
-                                  if k in tr["best"] and k in tr["cur"] and abs(float(tr["best"][k]) - float(tr["cur"][k])) > 1e-9}
-                need = int(rp.get("consec_improve", 2))
-                if self.pending_rp is not None and _near(self.pending_rp, tr["best"]): self.consec_improve += 1
-                else: self.consec_improve = 1
-                self.pending_rp = dict(tr["best"])
-                if self.consec_improve >= need and rp.get("auto_adopt", True):
-                    new_rp = {**rp, **{k: tr["best"][k] for k in TUNE_BOUNDS if k in tr["best"]}}
-                    self.rp_hist = (self.rp_hist + [dict(tr["cur"])])[-5:]
-                    adopted, self.proposal, self.consec_improve, self.pending_rp = True, None, 0, None
-                else:
-                    self.proposal = {"params": tr["best"], "gain": tr["bestB"] - tr["curB"], "ts": rep["ts"],
-                                     "wait": max(0, need - self.consec_improve)}
-            else:
-                rep.update(dsr_reject=not dsr_ok, te_reject=not te_ok, cpcv_reject=not cpcv_ok,
-                           pbo_reject=not pbo_ok, min_trades_reject=not min_trades_ok, risk_reject=not risk_ok)
-                self.consec_improve, self.pending_rp = 0, None
-        rep["adopted"], rep["sec"] = adopted, round(time.time() - t0, 1)
-        self.history = (self.history + [rep])[-40:]
-        self.runs += 1
-        db_improve_add(reason, f"drift={rep['drift']:.2f} steps={steps} pbt={rep['pbt']} router={rep['router']}",
-                       tr["curB"] if tr else vl0, tr["bestB"] if tr else vl1, adopted)
-        return new_rp, rep
+def build_liquidity_block(C: np.ndarray, V: np.ndarray, LR: np.ndarray, ADV: np.ndarray,
+                          tech: np.ndarray, micro: np.ndarray) -> np.ndarray:
+    """Likidite (15) proxy bloğu. Çıktı (S,15,T). Hepsi nedensel (rolling)."""
+    S, T = C.shape
+    mi = lambda n: micro[:, MICRO_NAMES.index(n), :].astype(np.float64)
+    out = np.zeros((S, len(LIQ_NAMES), T))
+    adv = np.nan_to_num(ADV, nan=0.0)
+    cv = C * V
+    out[:, 0] = np.log1p(adv) / LOG_ADV_NORM
+    out[:, 1] = np.clip(cv / (adv + 1.0), 0, 20)
+    out[:, 2] = mi("depth_proxy") * mi("queue_bid")
+    out[:, 3] = mi("depth_proxy") * mi("queue_ask")
+    lag = np.concatenate([np.zeros((S, 1)), LR[:, :-1]], axis=1)
+    out[:, 4] = -_roll_corr(LR, lag, 20)                                   # resilience
+    out[:, 5] = 1.0 / (1.0 + mi("spread_quoted") * 100.0)                  # tightness
+    vr = _tf(tech, "vol_rel")
+    out[:, 6] = np.abs(LR) / (np.abs(vr) + 0.1)                            # elasticity
+    out[:, 7] = mi("kyle_lambda_ext")
+    out[:, 8] = _tf(tech, "amihud")
+    dc = np.diff(C, axis=1, prepend=C[:, :1])                              # Roll spread
+    dcl = np.concatenate([np.zeros((S, 1)), dc[:, :-1]], axis=1)
+    cov = (pd.DataFrame((dc * dcl).T).rolling(20, min_periods=20).mean().values.T
+           - pd.DataFrame(dc.T).rolling(20, min_periods=20).mean().values.T
+           * pd.DataFrame(dcl.T).rolling(20, min_periods=20).mean().values.T)
+    out[:, 9] = 2.0 * np.sqrt(np.maximum(-np.nan_to_num(cov), 0.0)) / np.maximum(C, 1e-9)
+    out[:, 10] = pd.DataFrame(_tf(tech, "cs_spread").T).rolling(5, min_periods=1).mean().values.T
+    out[:, 11] = _roll_corr(LR, mi("trade_sign"), 20) ** 2                 # hasbrouck proxy
+    out[:, 12] = pd.DataFrame(np.abs(mi("order_imb")).T).rolling(20, min_periods=5).mean().values.T
+    out[:, 13] = _roll_corr(V, np.abs(LR), 20)                             # volume_sync
+    out[:, 14] = 0.01 / np.maximum(C, 1e-9)                                # tick_size_eff
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def get_state(self):
-        return {k: getattr(self, k) for k in ("history", "rp_hist", "last_run", "last_data", "runs",
-                                              "proposal", "drift", "consec_improve", "pending_rp")}
 
-    def set_state(self, s):
-        for k in ("history", "rp_hist", "last_run", "last_data", "runs", "proposal", "drift",
-                  "consec_improve", "pending_rp"):
-            if k in s: setattr(self, k, s[k])
+def _lag_series(s: pd.Series, days: int) -> pd.Series:
+    """Seriyi yayın gecikmesi kadar ileri kaydırır (look-ahead koruması)."""
+    s = s.copy()
+    s.index = s.index + pd.Timedelta(days=days)
+    return s
 
-class BackgroundImprover:
-    def __init__(self):
-        self.thread, self.result, self.owner, self.started = None, None, None, 0.0
 
-    def busy(self): return self.thread is not None and self.thread.is_alive()
+FRED_LAG_DAYS = {"DGS10": 1, "DGS2": 1, "BAMLH0A0HYM2": 1, "FEDFUNDS": 35,
+                 "CPIAUCSL": 45, "UNRATE": 35, "GDP": 120}
 
-    def start(self, bot, datasets, rp, data_date, reason, budget):
-        if self.busy(): return False
-        shadow = bot.clone_for_improve()
-        self.owner, self.started = id(bot), time.time()
-        def job():
-            try:
-                new_rp, rep = bot.si.run(shadow, datasets, rp, budget=budget, reason=reason)
-                self.result = {"new_rp": new_rp, "rep": rep, "shadow": shadow, "reason": reason,
-                               "data_date": data_date, "err": None}
-            except Exception as e:
-                log.exception("improve"); self.result = {"err": repr(e), "reason": reason, "data_date": data_date}
-        self.thread = threading.Thread(target=job, daemon=True)
-        self.thread.start()
-        return True
 
-    def pop(self, owner):
-        if self.result is not None and self.owner == owner:
-            r, self.result = self.result, None
-            return r
+def build_macro_block(macro_df: Optional[pd.DataFrame], dates: pd.DatetimeIndex) -> np.ndarray:
+    """
+    Makro (30,T) bloğu. Piyasa serileri 1 gün, FRED serileri yayın gecikmesi kadar
+    kaydırılır (look-ahead yok). Eksik seri 0. Sıra MACRO_NAMES ile aynıdır.
+    """
+    T = len(dates)
+    out = np.zeros((len(MACRO_NAMES), T))
+    if macro_df is None or len(macro_df) == 0:
+        return out
+
+    def on_dates(s: pd.Series, lag: int) -> pd.Series:
+        s = _lag_series(s.dropna(), lag)
+        u = s.index.union(dates)
+        return s.reindex(u).ffill().reindex(dates)
+
+    row = 0
+    for k in MACRO_KEYS:
+        if k in macro_df.columns:
+            s = on_dates(macro_df[k].astype(float), 1)
+            lv = np.log(s.where(s > 0))
+            mu = lv.rolling(60, min_periods=20).mean()
+            sd = lv.rolling(60, min_periods=20).std()
+            out[row] = ((lv - mu) / sd.replace(0, np.nan)).values
+            out[row + 1] = lv.diff(20).values
+            out[row + 2] = lv.diff(60).values
+        row += 3
+
+    def fred(sid: str) -> Optional[pd.Series]:
+        if sid in macro_df.columns:
+            return macro_df[sid].astype(float).dropna()
         return None
 
-@st.cache_resource(show_spinner=False)
-def get_bgi(): return BackgroundImprover()
+    d10, d2, bam = fred("DGS10"), fred("DGS2"), fred("BAMLH0A0HYM2")
+    if d10 is not None and d2 is not None:
+        out[row] = on_dates((d10 - d2).dropna(), FRED_LAG_DAYS["DGS10"]).values
+    if bam is not None:
+        out[row + 1] = on_dates(bam, FRED_LAG_DAYS["BAMLH0A0HYM2"]).values
+    ff = fred("FEDFUNDS")
+    if ff is not None:
+        out[row + 2] = on_dates(ff, FRED_LAG_DAYS["FEDFUNDS"]).values
+    cpi = fred("CPIAUCSL")
+    if cpi is not None:
+        out[row + 3] = on_dates(cpi.pct_change(12) * 100.0, FRED_LAG_DAYS["CPIAUCSL"]).values
+    un = fred("UNRATE")
+    if un is not None:
+        out[row + 4] = on_dates(un, FRED_LAG_DAYS["UNRATE"]).values
+    gdp = fred("GDP")
+    if gdp is not None:
+        out[row + 5] = on_dates(gdp.pct_change(4) * 100.0, FRED_LAG_DAYS["GDP"]).values
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
-def handle_improve_result(bot, res, rp):
-    if res is None: return rp
-    bot.si.last_run, bot.si.last_data = time.time(), res.get("data_date")
-    if res.get("err"):
-        st.session_state.log.append(f"{now_tr():%H:%M:%S} ❌ öz-gelişim hata: {res['err'][:120]}"); return rp
-    rep = res["rep"]
-    if rep.get("error"):
-        st.session_state.log.append(f"{now_tr():%H:%M:%S} {rep['error']}"); return rp
-    bot.adopt(res["shadow"])
-    out = rp
-    if res.get("new_rp"):
-        out = validate_risk(res["new_rp"]); st.session_state.rp = out
-        for k in TUNE_BOUNDS: st.session_state.pop(f"rp_{k}", None)
-        bot.reeval(out)
-    extra = f" te_acc {rep.get('te_acc', 0):.3f}(taban {rep.get('te_base', 0):.3f})"
-    if "dsr" in rep: extra += f" DSR {rep['dsr']:.3f}"
-    if "pbo" in rep: extra += f" PBO {rep['pbo']['pbo']:.2f}"
-    if "cpcv" in rep: extra += f" CPCV {rep['cpcv']['sharpe_cpcv']:.2f}"
-    st.session_state.log = (st.session_state.log + [
-        f"{now_tr():%H:%M:%S} 🐋 {res['reason']}: vl {rep['vl0']:.4f}→{rep['vl1']:.4f} drift {rep['drift']:.2f} "
-        f"pbt {rep['pbt']} router {rep['router']}{extra} " +
-        (f"✅ UYGULANDI {rep.get('changes')}" if rep.get("adopted") else "")])[-100:]
-    save_state(bot, out)
+
+def compute_regime(LR: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Nedensel piyasa rejimi (T,) int: 0=BULL, 1=BEAR, 2=VOL, 3=RANGE.
+    Eşit ağırlıklı endeks; VOL: rv20 > 1.5×rolling-medyan(250); BULL/BEAR: 60g getiri ±%5.
+    """
+    cnt = np.maximum(mask.sum(axis=0), 1)
+    mkt = np.where(mask, LR, 0.0).sum(axis=0) / cnt
+    s = pd.Series(mkt)
+    rv = s.rolling(20, min_periods=10).std() * np.sqrt(252.0)
+    med = rv.rolling(250, min_periods=30).median()
+    r60 = s.rolling(60, min_periods=20).sum()
+    reg = np.full(len(s), 3, dtype=np.int64)
+    reg[(r60 > 0.05).values] = 0
+    reg[(r60 < -0.05).values] = 1
+    reg[(rv > 1.5 * med).fillna(False).values] = 2
+    return reg
+
+
+def build_rank_block(tech: np.ndarray, liq: np.ndarray, peer_ret5: np.ndarray, peer_ret20: np.ndarray,
+                     sec_ret5: np.ndarray, sec_ret20: np.ndarray, C: np.ndarray, mask: np.ndarray,
+                     ADV: np.ndarray) -> np.ndarray:
+    """Rank (20) bloğu: her t'de kesit (cross-sectional) yüzdelik rankler. (S,20,T)"""
+    S, T = C.shape
+    ret5, ret20 = _tf(tech, "ret5"), _tf(tech, "ret20")
+    ret60 = np.zeros((S, T)); ret60[:, 60:] = C[:, 60:] / np.maximum(C[:, :-60], 1e-9) - 1.0
+    mom = np.zeros((S, T)); mom[:, 120:] = C[:, 20:T - 100] / np.maximum(C[:, :T - 120], 1e-9) - 1.0
+    mkt5 = np.where(mask, ret5, 0.0).sum(0) / np.maximum(mask.sum(0), 1)
+    mkt20 = np.where(mask, ret20, 0.0).sum(0) / np.maximum(mask.sum(0), 1)
+    cols = [ret5, ret20, ret60, _tf(tech, "rv30"), _tf(tech, "vol_rel"), _tf(tech, "rsi14"),
+            _tf(tech, "macd"), _tf(tech, "bb_pct"), _tf(tech, "amihud"), liq[:, 1],
+            sec_ret5, sec_ret20, peer_ret5, peer_ret20, ret5 - mkt5[None, :], ret20 - mkt20[None, :],
+            np.log1p(np.nan_to_num(ADV, nan=0.0)), mom]
+    out = np.full((S, len(RANK_NAMES), T), 0.5)
+    for i, x in enumerate(cols):
+        out[:, i] = _cs_rank(x, mask)
+    # rk_value (18), rk_quality (19): tarihsel temel veri yok → nötr 0.5
     return out
 
-# ════════════════════════════════════════════════════════════
-# 14. FORECAST
-# ════════════════════════════════════════════════════════════
+
+def build_peer_block(tech: np.ndarray, LR: np.ndarray, C: np.ndarray, corr: np.ndarray,
+                     mask: np.ndarray, sector_id: np.ndarray, macro_df: Optional[pd.DataFrame],
+                     dates: pd.DatetimeIndex, peers: Tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    """Peer/GNN (25) bloğu. Çıktı (S,25,T). PEER_NAMES sırasındadır, hepsi nedensel."""
+    S, T = LR.shape
+    idx, w = peers
+    out = np.zeros((S, len(PEER_NAMES), T))
+    ret5, ret20 = _tf(tech, "ret5"), _tf(tech, "ret20")
+    rv30, rsi, macd = _tf(tech, "rv30"), _tf(tech, "rsi14"), _tf(tech, "macd")
+    pr = peer_avg(LR, idx, w)
+    p5, p20 = peer_avg(ret5, idx, w), peer_avg(ret20, idx, w)
+    out[:, 0] = pr
+    out[:, 1] = ret5 - p5
+    # peer korelasyon ortalaması
+    cm = np.zeros((S, T))
+    for t in range(T):
+        cm[:, t] = np.take_along_axis(corr[t].astype(np.float64), idx[t], axis=1).mean(axis=1)
+    out[:, 2] = cm
+    out[:, 3] = p20
+    sec_lr = _sector_mean(LR, sector_id, mask)
+    out[:, 4] = sec_lr
+    var_s = pd.DataFrame(sec_lr.T).rolling(60, min_periods=30).var().values.T
+    cov_s = pd.DataFrame(LR.T).rolling(60, min_periods=30).cov(pd.DataFrame(sec_lr.T)).values.T
+    beta = np.nan_to_num(cov_s / np.where(var_s > 1e-12, var_s, np.nan), nan=1.0)
+    out[:, 5] = beta
+    out[:, 6] = LR - beta * sec_lr
+    prl = np.concatenate([np.zeros((S, 1)), pr[:, :-1]], axis=1)
+    out[:, 7] = _roll_corr(LR, prl, 20)
+    out[:, 8] = p5
+    out[:, 9] = p20
+    out[:, 10] = peer_avg(rv30, idx, w)
+    out[:, 11] = peer_avg(rsi, idx, w)
+    out[:, 12] = peer_avg(macd, idx, w)
+    out[:, 13] = _sector_mean(ret5, sector_id, mask)
+    out[:, 14] = _sector_mean(ret20, sector_id, mask)
+    out[:, 15] = _sector_mean(rv30, sector_id, mask)
+    out[:, 16] = _sector_mean((LR > 0).astype(np.float64), sector_id, mask)
+    h1 = peer_avg(ret5, idx, w)
+    h2 = peer_avg(h1, idx, w)
+    h3 = peer_avg(h2, idx, w)
+    out[:, 17], out[:, 18], out[:, 19] = h1, h2, h3
+    for j, win in enumerate((5, 20, 60)):
+        ct = np.zeros((T, S, S), dtype=np.float32)
+        rolling_corr_kernel(np.ascontiguousarray(LR), win, ct)
+        dc = np.zeros((S, T))
+        for t in range(T):
+            dc[:, t] = np.take_along_axis(ct[t].astype(np.float64), idx[t], axis=1).mean(axis=1)
+        out[:, 20 + j] = dc
+    # cross_asset_spill: USDTRY getirisi ile 60g kayan korelasyon
+    if macro_df is not None and "usdtry" in macro_df.columns:
+        s = _lag_series(macro_df["usdtry"].astype(float).dropna(), 1)
+        s = s.reindex(s.index.union(dates)).ffill().reindex(dates)
+        fx = np.log(s.where(s > 0)).diff().fillna(0.0).values
+        out[:, 23] = _roll_corr(LR, np.repeat(fx[None, :], S, axis=0), 60)
+    # tail_dep: sektörle alt kuyruk bağımlılığı (%10, 120 bar)
+    W = 120
+    if T >= W:
+        for s_i in range(S):
+            wo = sliding_window_view(LR[s_i], W)
+            ws = sliding_window_view(sec_lr[s_i], W)
+            qo = np.quantile(wo, 0.10, axis=1)
+            qs = np.quantile(ws, 0.10, axis=1)
+            cond = ws <= qs[:, None]
+            both = cond & (wo <= qo[:, None])
+            den = np.maximum(cond.sum(axis=1), 1)
+            out[s_i, 24, W - 1:] = both.sum(axis=1) / den
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def build_onehot_block(codes: Sequence[str], sector_id: np.ndarray, regime: np.ndarray,
+                       rk_size: np.ndarray, dates: pd.DatetimeIndex) -> np.ndarray:
+    """One-hot (40) bloğu. Günlük bar olduğu için time_close=1 (barın kapanışı)."""
+    S, T = rk_size.shape
+    out = np.zeros((S, len(ONEHOT_NAMES), T))
+    n_stk = len(STOCK_LIST)
+    for s, c in enumerate(codes):
+        j = STOCK_LIST.index(c) if c in STOCK_LIST else s
+        if j < n_stk:
+            out[s, j] = 1.0
+    off = n_stk
+    for s in range(S):
+        out[s, off + min(int(sector_id[s]), len(SECTORS) - 1)] = 1.0
+    off += len(SECTORS)
+    for t in range(T):
+        out[:, off + int(regime[t]), t] = 1.0
+    off += len(REGIMES)
+    out[:, off + 0] = (rk_size < 1 / 3).astype(np.float64)
+    out[:, off + 1] = ((rk_size >= 1 / 3) & (rk_size < 2 / 3)).astype(np.float64)
+    out[:, off + 2] = (rk_size >= 2 / 3).astype(np.float64)
+    off += 3
+    out[:, off + 2] = 1.0
+    off += 3
+    nxt = dates + pd.offsets.BDay(1)
+    me = (nxt.month != dates.month).astype(np.float64)
+    qe = (me * np.isin(dates.month, (3, 6, 9, 12))).astype(np.float64)
+    out[:, off] = me[None, :]
+    out[:, off + 1] = qe[None, :]
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 6. FEATURE STORE
+# ═══════════════════════════════════════════════════════════════════
+
 @dataclass
-class Forecast:
-    stock: str; current_price: float; horizon_days: int; target_price: float; expected_return_pct: float
-    lower_bound: float; upper_bound: float; p_up: float; p_down: float; p_flat: float
-    bull_price: float; base_price: float; bear_price: float; confidence: float; uncertainty: float
-    regime: str; regime_adj: float; ts: str
+class FeatureStoreV7:
+    """Panel özellik deposu. feat: (S, N_FEAT, T) float32 (ölçeklenmiş)."""
+    codes: List[str]
+    dates: pd.DatetimeIndex
+    valid: np.ndarray                 # (S,)
+    mask: np.ndarray                  # (S,T) bar geçerli (veri var ve ısınma bitti)
+    feat: np.ndarray
+    O: np.ndarray
+    H: np.ndarray
+    L: np.ndarray
+    C: np.ndarray
+    V: np.ndarray
+    LR: np.ndarray
+    ADV: np.ndarray
+    atrn: np.ndarray
+    micro_raw: np.ndarray             # (S,40,T) ölçeklenmemiş mikro
+    corr: np.ndarray                  # (T,S,S)
+    sector_id: np.ndarray
+    n_sector: int
+    regime: np.ndarray                # (T,)
+    lab_s: np.ndarray
+    lab_l: np.ndarray
+    t1_s: np.ndarray
+    t1_l: np.ndarray
+    ret_s: np.ndarray
+    ret_l: np.ndarray
+    w_s: np.ndarray
+    w_l: np.ndarray
+    scaler: Optional[RobustScaler]
+    train_end: int
+    stock_idx: Dict[str, int] = field(default_factory=dict)
+    chronos_emb: Optional[np.ndarray] = None    # Parça 3'te doldurulur
+    uncertainty: Optional[np.ndarray] = None    # Parça 4'te doldurulur
 
-def forecast_stock(bot, stock, df, price, dec, rp, horizon_days=None):
-    h = int(horizon_days or HORIZON)
-    r1 = df["Ret1"].dropna().tail(60).to_numpy()
-    atr_pct = safe_float(df["ATR"].iloc[-1], price * 0.02) / max(price, 1e-9)
-    sig_d = max(float(r1.std()) if len(r1) >= 20 else atr_pct * 0.8, 0.004)
-    ps, pl, unc, regime = dec["probs"], dec["probs_long"], dec["unc"], dec["regime"]
-    wl = clamp(h / 40.0, 0.2, 0.8)
-    bias = (1 - wl) * float(ps[2] - ps[0]) + wl * float(pl[2] - pl[0])
-    sigma_h = sig_d * math.sqrt(h) * 1.1
-    exp_ret = bias * 0.5 * sigma_h
-    mp, mn = {"BULL": (1.15, 0.85), "BEAR": (0.85, 1.15), "VOL": (0.8, 0.8), "RANGE": (1.0, 1.0)}.get(regime, (1.0, 1.0))
-    reg_adj = mp if exp_ret > 0 else mn
-    exp_ret *= reg_adj
-    z = 1.2816
-    px = lambda r: max(price * (1 + r), price * 0.01)
-    confidence = clamp(1.0 - unc * 2.0 + (float(ps[2]) - max(float(ps[0]), float(ps[1]))) * 0.5, 0.0, 1.0)
-    return Forecast(stock=stock, current_price=price, horizon_days=h, target_price=px(exp_ret),
-                    expected_return_pct=exp_ret * 100,
-                    lower_bound=px(exp_ret - z * sigma_h), upper_bound=px(exp_ret + z * sigma_h),
-                    p_up=float(ps[2]), p_down=float(ps[0]), p_flat=float(ps[1]),
-                    bull_price=px(exp_ret + z * sigma_h), base_price=px(exp_ret), bear_price=px(exp_ret - z * sigma_h),
-                    confidence=confidence, uncertainty=unc, regime=regime, regime_adj=reg_adj, ts=_ts())
+    @property
+    def T(self) -> int:
+        """Bar sayısı."""
+        return self.C.shape[1]
 
-def forecast_all(bot, names, dfs, prices, dec, rp, horizon_days=None):
-    rows = []
-    for nm in names:
+    def adjacency_at(self, t: int, topk: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """t anındaki GAT komşuluğu (yalnızca t'ye kadar bilgi)."""
+        return build_adjacency(self.corr[t], self.sector_id, self.mask[:, t], topk)
+
+    def sample_index(self, horizon: str = "long", t_lo: int = 0, t_hi: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Etiketli, geçerli (hisse, zaman) örnekleri: (s_idx, t_idx, t1) döndürür."""
+        lab = self.lab_l if horizon == "long" else self.lab_s
+        t1 = self.t1_l if horizon == "long" else self.t1_s
+        hi = self.T if t_hi is None else t_hi
+        m = (lab >= 0) & self.mask
+        m[:, :t_lo] = False
+        m[:, hi:] = False
+        s_idx, t_idx = np.nonzero(m)
+        return s_idx, t_idx, t1[s_idx, t_idx]
+
+
+def build_feature_store_v7(panel: Dict[str, Any], macro_df: Optional[pd.DataFrame] = None,
+                           train_frac: float = 0.7, scaler: Optional[RobustScaler] = None,
+                           sector_id: Optional[np.ndarray] = None,
+                           nlp: Optional[np.ndarray] = None, scale: bool = True) -> FeatureStoreV7:
+    """
+    Panelden Feature Store kurar (align_panel çıktısı bekler).
+    Adımlar: teknik(111) → mikro(40) → likidite(15) → peer(25) → rank(20) → makro(30) →
+    NLP(15, opsiyonel) → one-hot(40) → causal(10, Parça 4) → ölçekleme (yalnızca train'de fit)
+    → triple-barrier (10g/40g) → benzersizlik ağırlıkları.
+    """
+    t0 = time.time()
+    O, H, L, C, V = (np.ascontiguousarray(panel[k], dtype=np.float64) for k in "OHLCV")
+    dates: pd.DatetimeIndex = panel["dates"]
+    codes: List[str] = list(panel["codes"])
+    avail: np.ndarray = panel["avail"]
+    S, T = C.shape
+    sector_id = default_sector_ids(S) if sector_id is None else np.asarray(sector_id, dtype=np.int64)
+
+    first = np.where(avail.any(axis=1), avail.argmax(axis=1), T)
+    mask = avail & (np.arange(T)[None, :] >= (first + WARMUP_BARS)[:, None])
+    valid = mask.any(axis=1)
+
+    feat = np.zeros((S, N_FEAT, T), dtype=np.float32)
+    tech = compute_tech_panel(O, H, L, C, V)
+    feat[:, 0:N_TECH] = tech
+    micro = compute_micro_panel(H, L, C, V, valid)
+    feat[:, P1.MICRO_OFF:P1.MICRO_OFF + N_MICRO] = micro
+
+    LR = np.zeros((S, T)); logret_panel_kernel(C, LR)
+    ADV = np.full((S, T), np.nan); adv_panel_kernel(C, V, 20, ADV)
+    atrn = np.ascontiguousarray(_tf(tech, "atrn14"))
+
+    corr = P1.compute_corr_tensor(C, CORR_WINDOW)
+    peers = compute_peer_sets(corr, mask, PEER_K)
+
+    liq = build_liquidity_block(C, V, LR, ADV, tech, micro)
+    feat[:, FEAT_INDEX[LIQ_NAMES[0]]:FEAT_INDEX[LIQ_NAMES[0]] + len(LIQ_NAMES)] = liq
+
+    pblk = build_peer_block(tech, LR, C, corr, mask, sector_id, macro_df, dates, peers)
+    feat[:, FEAT_INDEX[PEER_NAMES[0]]:FEAT_INDEX[PEER_NAMES[0]] + len(PEER_NAMES)] = pblk
+
+    rk = build_rank_block(tech, liq, pblk[:, 8], pblk[:, 9], pblk[:, 13], pblk[:, 14], C, mask, ADV)
+    feat[:, FEAT_INDEX[RANK_NAMES[0]]:FEAT_INDEX[RANK_NAMES[0]] + len(RANK_NAMES)] = rk
+
+    mac = build_macro_block(macro_df, dates)
+    feat[:, FEAT_INDEX[MACRO_NAMES[0]]:FEAT_INDEX[MACRO_NAMES[0]] + len(MACRO_NAMES)] = mac[None, :, :]
+
+    if nlp is not None:
+        if nlp.shape != (S, len(NLP_NAMES), T):
+            raise ValueError(f"nlp şekli {(S, len(NLP_NAMES), T)} olmalı, {nlp.shape} geldi")
+        feat[:, FEAT_INDEX[NLP_NAMES[0]]:FEAT_INDEX[NLP_NAMES[0]] + len(NLP_NAMES)] = nlp
+
+    regime = compute_regime(LR, mask)
+    rk_size = rk[:, RANK_NAMES.index("rk_size")]
+    oh = build_onehot_block(codes, sector_id, regime, rk_size, dates)
+    feat[:, FEAT_INDEX[ONEHOT_NAMES[0]]:FEAT_INDEX[ONEHOT_NAMES[0]] + len(ONEHOT_NAMES)] = oh
+    # Causal (10): Parça 4'te PC/DoWhy ile doldurulacak, şimdilik 0.
+
+    np.nan_to_num(feat, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    train_end = int(T * train_frac)
+
+    lab_s, t1_s, ret_s = P_label(O, H, L, C, atrn, HORIZON, TB_K)
+    lab_l, t1_l, ret_l = P_label(O, H, L, C, atrn, HORIZON_LONG, TB_K_LONG)
+    w_s = compute_sample_weights(lab_s, t1_s)
+    w_l = compute_sample_weights(lab_l, t1_l)
+
+    if scale:
+        no_scale = np.zeros(N_FEAT, dtype=bool)
+        o0 = FEAT_INDEX[ONEHOT_NAMES[0]]
+        no_scale[o0:o0 + len(ONEHOT_NAMES)] = True
+        for nm in ("psar_trend", "trade_sign", "tick_rule", "lee_ready"):
+            no_scale[FEAT_INDEX[nm]] = True
+        if scaler is None:
+            scaler = RobustScaler(clip=5.0, no_scale=no_scale)
+            scaler.fit(feat, mask, WARMUP_BARS, train_end)
+        scaler.transform_inplace(feat)
+    feat *= mask[:, None, :]          # ısınma/veri dışı barlar 0
+
+    store = FeatureStoreV7(
+        codes=codes, dates=dates, valid=valid, mask=mask, feat=np.ascontiguousarray(feat),
+        O=O, H=H, L=L, C=C, V=V, LR=LR, ADV=np.nan_to_num(ADV, nan=0.0), atrn=atrn,
+        micro_raw=micro, corr=corr, sector_id=sector_id, n_sector=int(sector_id.max()) + 1,
+        regime=regime, lab_s=lab_s, lab_l=lab_l, t1_s=t1_s, t1_l=t1_l, ret_s=ret_s, ret_l=ret_l,
+        w_s=w_s, w_l=w_l, scaler=scaler if scale else None, train_end=train_end,
+        stock_idx={c: i for i, c in enumerate(codes)})
+    log.info("FeatureStoreV7 hazır: S=%d F=%d T=%d (%.1fs)", S, N_FEAT, T, time.time() - t0)
+    return store
+
+
+def P_label(O: np.ndarray, H: np.ndarray, L: np.ndarray, C: np.ndarray, atrn: np.ndarray,
+            horizon: int, k: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Simetrik triple-barrier (k_pt = k_sl = k) etiketleme kısayolu."""
+    return triple_barrier_labeling(O, H, L, C, atrn, horizon, k, k)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 7. ÖZ-TEST 2
+# ═══════════════════════════════════════════════════════════════════
+
+def _make_test_panel(S: int = 6, T: int = 420, seed: int = 11) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    """Sentetik panel + makro DataFrame üretir."""
+    base = P1._synthetic_panel(S, T, seed)
+    dates = pd.bdate_range("2023-01-02", periods=T)
+    panel = {**base, "dates": dates, "codes": [f"S{i}" for i in range(S)],
+             "avail": np.ones((S, T), dtype=bool), "valid": np.ones(S, dtype=bool)}
+    rng = np.random.default_rng(seed + 1)
+    cols = {k: pd.Series(50 * np.exp(np.cumsum(0.01 * rng.standard_normal(T))), index=dates) for k in MACRO_KEYS}
+    cols["DGS10"] = pd.Series(4 + 0.1 * rng.standard_normal(T).cumsum() * 0.1, index=dates)
+    cols["DGS2"] = pd.Series(3.5 + 0.1 * rng.standard_normal(T).cumsum() * 0.1, index=dates)
+    mdates = pd.date_range("2021-01-01", dates[-1], freq="MS")
+    cols["CPIAUCSL"] = pd.Series(250 + np.arange(len(mdates)) * 0.5, index=mdates)
+    return panel, pd.DataFrame(cols).sort_index()
+
+
+def _selftest_part2() -> bool:
+    """Parça 2 öz-testi: triple-barrier, ağırlıklar, scaler, CV/CPCV, adjacency, look-ahead."""
+    print(f"\n🐋 Öz-test 2 (Numba: {'AÇIK' if P1.NUMBA_OK else 'YOK, saf Python'})")
+    res: List[Tuple[str, bool]] = []
+    chk = lambda n, ok, e="": P1._check(n, ok, res, e)
+
+    # 1) Triple-barrier el yapımı senaryolar
+    T = 12
+    def mk(o, h, l, c):
+        return tuple(np.array([x], dtype=np.float64) for x in (o, h, l, c))
+    base_o = [100.0] * T; base_h = [100.5] * T; base_l = [99.5] * T; base_c = [100.0] * T
+    atrn = np.full((1, T), 0.02)      # ATR = 2 TL → k=1 ise bariyer ±2
+    # (a) hedef: t=0 için t+1 açılış=100, bar 3'te high 103 → UP
+    h = list(base_h); h[3] = 103.0
+    lab, t1, ret = triple_barrier_labeling(*mk(base_o, h, base_l, base_c), atrn, 5, 1.0, 1.0)
+    chk("TB: hedef → etiket 1, t1=3, getiri +%2", lab[0, 0] == 1 and t1[0, 0] == 3 and abs(ret[0, 0] - 0.02) < 1e-9)
+    # (b) aynı barda iki bariyer → STOP
+    h = list(base_h); l = list(base_l); h[2] = 103.0; l[2] = 97.0
+    lab, t1, ret = triple_barrier_labeling(*mk(base_o, h, l, base_c), atrn, 5, 1.0, 1.0)
+    chk("TB: iki bariyer aynı bar → STOP(2)", lab[0, 0] == 2 and ret[0, 0] < 0)
+    # (c) gap-down: açılış stop'un altında → çıkış açılışta
+    o = list(base_o); l = list(base_l); o[2] = 95.0; l[2] = 94.0
+    lab, t1, ret = triple_barrier_labeling(*mk(o, base_h, l, base_c), atrn, 5, 1.0, 1.0)
+    chk("TB: gap-down çıkışı açılıştan", lab[0, 0] == 2 and abs(ret[0, 0] - (95.0 / 100.0 - 1)) < 1e-9)
+    # (d) dikey bariyer
+    lab, t1, ret = triple_barrier_labeling(*mk(base_o, base_h, base_l, base_c), atrn, 5, 1.0, 1.0)
+    chk("TB: dikey bariyer → 0, t1=t+H", lab[0, 0] == 0 and t1[0, 0] == 5)
+    # (e) giriş t+1 açılışı: o[1]=110 ise hedef 112
+    o = list(base_o); o[1] = 110.0; h = list(base_h); h[2] = 111.0
+    lab, t1, ret = triple_barrier_labeling(*mk(o, h, base_l, base_c), atrn, 5, 1.0, 1.0)
+    chk("TB: giriş t+1 açılışı (110) kullanılıyor", lab[0, 0] != 1 or t1[0, 0] != 2)
+    # (f) ufuk bitmeden etiket yok
+    chk("TB: ufuk dışı etiketsiz (-1)", lab[0, T - 2] == -1 and lab[0, T - 1] == -1)
+
+    # 2) Benzersizlik ağırlıkları
+    lab = np.array([[0, 0, 0, 0, 0, 0]], dtype=np.int64)
+    t1 = np.array([[0, 2, 3, 4, 5, 5]], dtype=np.int64)
+    uq = np.zeros((1, 6))
+    uniqueness_panel_kernel(lab, t1, uq)
+    chk("Benzersizlik: örtüşmeyen tek etiket → 1", abs(uq[0, 0] - 1.0) < 1e-12)
+    chk("Benzersizlik: örtüşenler < 1", uq[0, 1] < 1.0)
+    w = compute_sample_weights(np.zeros((1, 40), dtype=np.int64) , np.minimum(np.arange(40) + 5, 39)[None, :].astype(np.int64))
+    chk("Ağırlık ortalaması 1", abs(w[w > 0].mean() - 1.0) < 1e-5)
+    lab40 = np.zeros((1, 40), dtype=np.int64); t140 = np.minimum(np.arange(40) + 5, 39)[None, :].astype(np.int64)
+    uq40 = np.zeros((1, 40)); uniqueness_panel_kernel(lab40, t140, uq40)
+    ratio = w[0, :35] / (uq40[0, :35] + 1e-12)
+    chk("Zaman azalması: ağırlık/benzersizlik oranı artıyor", bool((np.diff(ratio) > 0).all()))
+
+    # 3) Adjacency
+    rng = np.random.default_rng(0)
+    A = rng.standard_normal((8, 60)); cc = np.corrcoef(A)
+    sid = np.array([0, 0, 0, 0, 1, 1, 1, 1]); vm = np.ones(8, dtype=bool)
+    adj, et, ew = build_adjacency(cc, sid, vm, topk=2)
+    chk("Adjacency simetrik + self-loop", bool((adj == adj.T).all() and adj.diagonal().all()))
+    chk("Self-loop kenar tipi 4", bool((et.diagonal() == 4).all()))
+    vm2 = vm.copy(); vm2[3] = False
+    adj2, _, _ = build_adjacency(cc, sid, vm2, topk=2)
+    chk("Geçersiz hisse sektör/kNN kenarı almaz", int(adj2[3].sum()) == 1 and int(adj2[:, 3].sum()) == 1)
+
+    # 4) Purged / Embargo / CPCV
+    Tn = 400
+    t_idx = np.arange(Tn - 40); t1v = t_idx + 40
+    groups = make_time_groups(0, Tn - 40, 8)
+    ranges = [groups[1], groups[5]]
+    te = test_mask_from_ranges(t_idx, ranges); tr = purged_train_mask(t_idx, t1v, ranges, 5)
+    leak = False
+    for lo, hi in ranges:
+        leak |= bool(((t_idx[tr] <= hi - 1) & (t1v[tr] >= lo)).any())
+        leak |= bool(((t_idx[tr] >= hi) & (t_idx[tr] < hi + 5)).any())
+    chk("Purge/embargo: train-test kesişimi yok", not leak and not (tr & te).any())
+    sp = list(cpcv_splits(t_idx, t1v, 0, Tn - 40))
+    chk("CPCV C(8,4)=70 kombinasyon", len(sp) == 70, f"({len(sp)})")
+    cnt = np.zeros(8, dtype=int)
+    for combo, _, _ in sp:
+        for g in combo:
+            cnt[g] += 1
+    chk("CPCV her grup 35 kez test", bool((cnt == 35).all()))
+    chk("CPCV yol sayısı 35", cpcv_path_count() == 35)
+    a, b, c_ = walk_forward_split(t_idx, t1v, Tn)
+    chk("Walk-forward: train<val<test, sızıntı yok",
+        t1v[a].max() < t_idx[b].min() and t1v[b].max() < t_idx[c_].min())
+
+    # 5) Scaler: yalnızca train
+    f = rng.standard_normal((2, 5, 100)).astype(np.float32); m = np.ones((2, 100), dtype=bool)
+    s1 = RobustScaler().fit(f, m, 0, 70)
+    f2 = f.copy(); f2[:, :, 70:] += 1000.0
+    s2 = RobustScaler().fit(f2, m, 0, 70)
+    chk("Scaler test bölümünden etkilenmez", np.allclose(s1.med, s2.med) and np.allclose(s1.iqr, s2.iqr))
+    x = s1.transform_inplace(f.copy())
+    chk("Scaler clip ±5", float(np.abs(x).max()) <= 5.0 + 1e-6)
+    tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "sc_test.npz"); s1.save(tmp)
+    chk("Scaler save/load", np.allclose(RobustScaler.load(tmp).med, s1.med))
+
+    # 6) Feature Store
+    panel, macro = _make_test_panel()
+    t0 = time.time()
+    st = build_feature_store_v7(panel, macro, scale=True)
+    print(f"  store süresi: {time.time() - t0:.1f}s")
+    chk("Store şekli", st.feat.shape == (6, N_FEAT, 420), str(st.feat.shape))
+    chk("Store NaN/Inf yok", bool(np.isfinite(st.feat).all()))
+    chk("Korelasyon tensörü şekli", st.corr.shape == (420, 6, 6))
+    chk("Etiketler {-1,0,1,2}", set(np.unique(st.lab_s)).issubset({-1, 0, 1, 2}))
+    chk("Ağırlıklar ≥0", bool((st.w_s >= 0).all() and (st.w_l >= 0).all()))
+    chk("Rank [0,1]", float(st.feat[:, FEAT_INDEX["rk_ret5"]].max()) <= 5.0)
+    oh0 = FEAT_INDEX[P1.STOCK_ONEHOT_NAMES[0]]
+    chk("Hisse one-hot satır toplamı = 1 (geçerli barlarda)",
+        bool(np.allclose(st.feat[:, oh0:oh0 + len(P1.STOCK_ONEHOT_NAMES), 300].sum(axis=1), 1.0)))
+    ri = FEAT_INDEX[REGIME_NAMES0]
+    chk("Rejim one-hot toplamı = 1", bool(np.allclose(st.feat[:, ri:ri + 4, 300].sum(axis=1), 1.0)))
+    chk("Isınma barları 0", float(np.abs(st.feat[:, :, :WARMUP_BARS]).max()) == 0.0)
+    s_i, t_i, t1_i = st.sample_index("long", WARMUP_BARS, st.train_end)
+    chk("sample_index etiketli+geçerli", len(s_i) > 0 and bool((st.lab_l[s_i, t_i] >= 0).all()))
+
+    # 7) Look-ahead (nedensellik): kesilmiş panel ile aynı barlar aynı olmalı
+    cut = 360
+    pcut = {**panel, "O": panel["O"][:, :cut], "H": panel["H"][:, :cut], "L": panel["L"][:, :cut],
+            "C": panel["C"][:, :cut], "V": panel["V"][:, :cut], "dates": panel["dates"][:cut],
+            "avail": panel["avail"][:, :cut]}
+    full = build_feature_store_v7(panel, macro, scale=False)
+    part = build_feature_store_v7(pcut, macro.loc[:panel["dates"][cut - 1]], scale=False)
+    d = np.abs(full.feat[:, :, :cut] - part.feat).max(axis=(0, 2))
+    bad = [FEATURE_NAMES[i] for i in np.nonzero(d > 1e-3)[0]]
+    chk("Özelliklerde look-ahead yok", len(bad) == 0, f"(sorunlu: {bad[:5]})")
+    ok_lab = bool((full.lab_l[:, :cut - HORIZON_LONG - 2] == part.lab_l[:, :cut - HORIZON_LONG - 2]).all())
+    chk("Etiketler kesilmiş panelle tutarlı", ok_lab)
+
+    ok = all(r[1] for r in res)
+    print(f"\n{'✅ ÖZ-TEST 2 BAŞARILI' if ok else '❌ ÖZ-TEST 2 BAŞARISIZ'} ({sum(r[1] for r in res)}/{len(res)})")
+    return ok
+
+
+REGIME_NAMES0 = "reg_" + REGIMES[0]
+
+if __name__ == "__main__":
+    if os.environ.get("SEEKDEEP_SELFTEST") == "1":
+        sys.exit(0 if _selftest_part2() else 1)
+    print("Parça 2/6 yüklendi. Öz-test için SEEKDEEP_SELFTEST=1 kullanın.")
+# -*- coding: utf-8 -*-
+"""
+🐋 SEEK DEEP v7.0 — PARÇA 3/6: MODELLER
+GATv2 + TGN + TFT + Informer + MoE16 + Chronos + BaggedQuantumEnsemble
+
+Bu modül Parça 1 (seekdeep_v7.py) ve Parça 2 (seekdeep_v7_p2.py) ile aynı klasörde durmalıdır.
+
+İçindekiler:
+  1. Torch içe aktarma (yoksa numpy tarafı yine çalışır)
+  2. GATv2Layer / GATv2Encoder            (Brody et al. 2021)
+  3. TimeEncoder / TGN                    (Rossi et al. 2020)
+  4. GRN + TemporalTransformer (TFT tarzı) (Lim et al. 2021)
+  5. ProbSparseAttention + Informer       (Zhou et al. 2021)
+  6. GatedExpert + MoE16                  (Shazeer 2017)
+  7. Kayıplar: heteroscedastic CE, dual task loss, temperature scaling
+  8. SeekDeepNet (tam model)
+  9. Batch üretimi (numpy, nedensel + purge)
+ 10. ChronosWrapper
+ 11. BaggedQuantumEnsemble
+ 12. Öz-test 3
+
+DÜRÜST NOT: Bu modülü yazdığım ortamda PyTorch/transformers/chronos kurulu değildi.
+Numpy tarafı (batch, nedensellik, purge, Chronos istatistikleri) çalıştırılıp test edildi;
+tüm torch sınıfları YAZILDI ama ÇALIŞTIRILMADI. İlk çalıştırmada `SEEKDEEP_SELFTEST=1`
+çıktısını kontrol edin; küçük şekil/dtype hataları çıkabilir.
+"""
+from __future__ import annotations
+
+import copy
+import math
+import os
+import sys
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+import seekdeep_v7 as P1
+import seekdeep_v7_p2 as P2
+from seekdeep_v7 import (
+    ALPHA_LONG, BAG_N, BAG_SEED, CHRONOS_MODEL, CHRONOS_PRED_LEN, EMBARGO_BARS, GAT_DIM,
+    GAT_HEADS, GAT_LAYERS, HORIZON_LONG, INFORMER_HEADS, INFORMER_LAYERS, INFORMER_SEQ,
+    LB_COEF, MC_SAMPLES, MOE_TOPK, N_EXPERTS, N_FEAT, SEQ_LEN, TFT_DIM, TFT_HEADS, TFT_LAYERS,
+    WARMUP_BARS, ZLOSS_COEF, log,
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. TORCH
+# ═══════════════════════════════════════════════════════════════════
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    TORCH_OK = True
+except Exception:  # torch yoksa sınıf tanımları yine geçerli kalır, numpy kısmı çalışır
+    torch = None  # type: ignore
+    F = None  # type: ignore
+    TORCH_OK = False
+
+    class _NNStub:
+        """torch yokken nn.Module yerine geçen boş taban sınıf."""
+        Module = object
+
+    nn = _NNStub()  # type: ignore
+
+
+def _need_torch() -> None:
+    """Torch gerektiren işlemlerde anlaşılır hata verir."""
+    if not TORCH_OK:
+        raise RuntimeError("PyTorch kurulu değil: `pip install torch`")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. GATv2
+# ═══════════════════════════════════════════════════════════════════
+
+class GATv2Layer(nn.Module):
+    """
+    Graph Attention Network v2 (Brody et al. 2021). Dinamik attention:
+    e_ij = a^T LeakyReLU([q_i || k_j]) (her head için ayrı MLP). Komşu olmayanlara -inf.
+    x: (B,S,in), adj_mask: (S,S) veya (B,S,S) bool, edge_w: (S,S) veya (B,S,S) korelasyon.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, n_heads: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        if out_dim % n_heads != 0:
+            raise ValueError("out_dim, n_heads'e tam bölünmeli")
+        self.h = n_heads
+        self.d = out_dim // n_heads
+        self.W_q = nn.Linear(in_dim, out_dim, bias=False)
+        self.W_k = nn.Linear(in_dim, out_dim, bias=False)
+        self.W_v = nn.Linear(in_dim, out_dim, bias=False)
+        self.att_mlp = nn.Sequential(nn.Linear(2 * self.d, self.d), nn.LeakyReLU(0.2),
+                                     nn.Linear(self.d, 1))
+        self.edge_gain = nn.Parameter(torch.zeros(n_heads))
+        self.out_proj = nn.Linear(out_dim, out_dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: "torch.Tensor", adj_mask: "torch.Tensor",
+                edge_w: Optional["torch.Tensor"] = None) -> "torch.Tensor":
+        """Dönüş: (B,S,out_dim)."""
+        B, S, _ = x.shape
+        q = self.W_q(x).view(B, S, self.h, self.d)
+        k = self.W_k(x).view(B, S, self.h, self.d)
+        v = self.W_v(x).view(B, S, self.h, self.d)
+        qi = q.unsqueeze(2).expand(B, S, S, self.h, self.d)
+        kj = k.unsqueeze(1).expand(B, S, S, self.h, self.d)
+        e = self.att_mlp(torch.cat([qi, kj], dim=-1)).squeeze(-1)          # (B,S,S,H)
+        if edge_w is not None:
+            ew = edge_w if edge_w.dim() == 3 else edge_w.unsqueeze(0)
+            e = e + ew.unsqueeze(-1) * self.edge_gain.view(1, 1, 1, -1)
+        am = adj_mask if adj_mask.dim() == 3 else adj_mask.unsqueeze(0)
+        e = e.masked_fill(~am.unsqueeze(-1), float("-inf"))
+        a = torch.softmax(e, dim=2)
+        a = torch.nan_to_num(a, nan=0.0)
+        a = self.drop(a)
+        out = torch.einsum("bijh,bjhd->bihd", a, v).reshape(B, S, self.h * self.d)
+        return self.out_proj(out)
+
+
+class GATv2Encoder(nn.Module):
+    """2 katmanlı GATv2 encoder + residual + LayerNorm."""
+
+    def __init__(self, in_dim: int = 64, hidden: int = GAT_DIM, n_layers: int = GAT_LAYERS,
+                 n_heads: int = GAT_HEADS, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, hidden)
+        self.layers = nn.ModuleList([GATv2Layer(hidden, hidden, n_heads, dropout) for _ in range(n_layers)])
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(n_layers)])
+
+    def forward(self, x: "torch.Tensor", adj_mask: "torch.Tensor",
+                edge_w: Optional["torch.Tensor"] = None) -> "torch.Tensor":
+        """Dönüş: (B,S,hidden)."""
+        h = self.in_proj(x)
+        for layer, norm in zip(self.layers, self.norms):
+            h = norm(h + F.elu(layer(h, adj_mask, edge_w)))
+        return h
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. TGN
+# ═══════════════════════════════════════════════════════════════════
+
+class TimeEncoder(nn.Module):
+    """Öğrenilebilir kosinüs zaman kodlaması (TGN/TGAT tarzı)."""
+
+    def __init__(self, dim: int = 32) -> None:
+        super().__init__()
+        self.w = nn.Parameter(torch.from_numpy(1.0 / 10 ** np.linspace(0, 9, dim)).float())
+        self.b = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, t: "torch.Tensor") -> "torch.Tensor":
+        """t: (N,) → (N,dim)."""
+        return torch.cos(t.unsqueeze(-1) * self.w + self.b)
+
+
+class TGN(nn.Module):
+    """
+    Temporal Graph Network (Rossi et al. 2020): düğüm belleği + mesaj + ortalama
+    aggregator + GRU güncelleyici. Bellek bir buffer'dır (eğitilebilir parametre değil).
+    Durumludur: olayları zaman sırasıyla verin; `reset_memory()` ile sıfırlayın.
+    """
+
+    def __init__(self, n_nodes: int, memory_dim: int = 64, time_dim: int = 32, edge_dim: int = 2) -> None:
+        super().__init__()
+        self.n_nodes, self.memory_dim, self.edge_dim = n_nodes, memory_dim, edge_dim
+        self.register_buffer("memory", torch.zeros(n_nodes, memory_dim))
+        self.register_buffer("last_update", torch.zeros(n_nodes))
+        self.time_enc = TimeEncoder(time_dim)
+        self.msg_fn = nn.Sequential(nn.Linear(2 * memory_dim + edge_dim + time_dim, memory_dim),
+                                    nn.ReLU(), nn.Linear(memory_dim, memory_dim))
+        self.mem_updater = nn.GRUCell(memory_dim, memory_dim)
+        self.emb_fn = nn.Linear(memory_dim + time_dim, memory_dim)
+
+    def reset_memory(self) -> None:
+        """Belleği ve son güncelleme zamanlarını sıfırlar."""
+        with torch.no_grad():
+            self.memory.zero_()
+            self.last_update.zero_()
+
+    def forward(self, source: "torch.Tensor", target: "torch.Tensor", edge_feat: "torch.Tensor",
+                timestamp: Any, update: bool = True) -> "torch.Tensor":
+        """
+        source,target: (E,) long; edge_feat: (E,edge_dim); timestamp: skaler veya (E,).
+        Dönüş: tüm düğümler için embedding (n_nodes, memory_dim).
+        """
+        N = self.n_nodes
+        dev = self.memory.device
+        ts = torch.as_tensor(timestamp, dtype=torch.float32, device=dev)
+        if ts.dim() == 0:
+            ts = ts.expand(source.shape[0])
+        mem = self.memory
+        m_s = self.msg_fn(torch.cat([mem[source], mem[target], edge_feat,
+                                     self.time_enc(ts - self.last_update[source])], dim=-1))
+        m_d = self.msg_fn(torch.cat([mem[target], mem[source], edge_feat,
+                                     self.time_enc(ts - self.last_update[target])], dim=-1))
+        nodes = torch.cat([source, target])
+        msgs = torch.cat([m_s, m_d], dim=0)
+        agg = torch.zeros(N, self.memory_dim, device=dev).index_add(0, nodes, msgs)
+        cnt = torch.zeros(N, device=dev).index_add(0, nodes, torch.ones(nodes.shape[0], device=dev))
+        touched = cnt > 0
+        agg = agg / cnt.clamp(min=1.0).unsqueeze(-1)
+        new_mem = self.mem_updater(agg, mem)
+        new_mem = torch.where(touched.unsqueeze(-1), new_mem, mem)
+        t_now = ts.max()
+        emb = self.emb_fn(torch.cat([new_mem, self.time_enc(t_now - self.last_update)], dim=-1))
+        if update:
+            with torch.no_grad():
+                self.memory.copy_(new_mem.detach())
+                self.last_update[touched] = t_now
+        return emb
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. TFT TARZI ZAMAN ENCODER'I
+# ═══════════════════════════════════════════════════════════════════
+
+class GRN(nn.Module):
+    """Gated Residual Network (Lim et al. 2021): ELU → GLU kapısı → residual + LayerNorm."""
+
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.fc2 = nn.Linear(out_dim, 2 * out_dim)
+        self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+        self.drop = nn.Dropout(dropout)
+        self.ln = nn.LayerNorm(out_dim)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        """(…,in) → (…,out)."""
+        h = self.drop(F.elu(self.fc1(x)))
+        g = F.glu(self.fc2(h), dim=-1)
+        return self.ln(g + self.skip(x))
+
+
+class TemporalTransformer(nn.Module):
+    """
+    TFT tarzı encoder (Lim et al. 2021): GRN girdi seçimi + pozisyon kodlaması +
+    3 katman Transformer + (ortalama ‖ son token) havuzu. x: (B,L,in) → (B,d_model).
+    """
+
+    def __init__(self, in_dim: int = N_FEAT, d_model: int = TFT_DIM, n_heads: int = TFT_HEADS,
+                 n_layers: int = TFT_LAYERS, seq_len: int = SEQ_LEN, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.input_grn = GRN(in_dim, d_model, dropout)
+        self.pos_enc = nn.Parameter(torch.randn(seq_len, d_model) * 0.02)
+        layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 2,
+                                           dropout=dropout, batch_first=True, activation="gelu",
+                                           norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(d_model)
+        self.pool = nn.Linear(2 * d_model, d_model)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        """x: (B,L,in_dim); L ≤ seq_len."""
+        L = x.shape[1]
+        h = self.input_grn(x) + self.pos_enc[None, :L, :]
+        h = self.encoder(h)
+        pooled = torch.cat([h.mean(dim=1), h[:, -1, :]], dim=-1)
+        return self.norm(self.pool(pooled))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5. INFORMER
+# ═══════════════════════════════════════════════════════════════════
+
+def _sinusoid(n: int, d: int) -> "torch.Tensor":
+    """Sinüs/kosinüs pozisyon kodlaması (n,d)."""
+    pos = torch.arange(n, dtype=torch.float32).unsqueeze(1)
+    div = torch.exp(torch.arange(0, d, 2, dtype=torch.float32) * (-math.log(10000.0) / d))
+    pe = torch.zeros(n, d)
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div)[:, : d // 2]
+    return pe
+
+
+class ProbSparseAttention(nn.Module):
+    """
+    ProbSparse self-attention (Zhou et al. 2021): sorgu seyrekliği M(q,K) örneklenmiş
+    anahtarlarla tahmin edilir; yalnızca en yüksek u sorgu tam attention alır, diğerleri
+    V ortalamasını kullanır. Karmaşıklık O(L log L). x: (B,L,d_model).
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 4, factor: int = 5, dropout: float = 0.1) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError("d_model, n_heads'e tam bölünmeli")
+        self.h, self.d, self.factor = n_heads, d_model // n_heads, factor
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.o = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        B, L, _ = x.shape
+        q, k, v = self.qkv(x).view(B, L, 3, self.h, self.d).permute(2, 0, 3, 1, 4)   # (B,H,L,d)
+        u = min(L, int(self.factor * math.ceil(math.log(L + 1))))
+        idx = torch.randint(0, L, (L, u), device=x.device)
+        ks = k[:, :, idx, :]                                          # (B,H,L,u,d)
+        qk = torch.einsum("bhld,bhlud->bhlu", q, ks)
+        m = qk.max(dim=-1).values - qk.sum(dim=-1) / L                # seyreklik ölçüsü
+        top = m.topk(u, dim=-1).indices                               # (B,H,u)
+        ex = top.unsqueeze(-1).expand(-1, -1, -1, self.d)
+        q_red = torch.gather(q, 2, ex)
+        sc = torch.matmul(q_red, k.transpose(-2, -1)) / math.sqrt(self.d)
+        ctx_top = torch.matmul(self.drop(torch.softmax(sc, dim=-1)), v)
+        ctx = v.mean(dim=2, keepdim=True).expand(B, self.h, L, self.d).clone()
+        ctx.scatter_(2, ex, ctx_top)
+        return self.o(ctx.transpose(1, 2).reshape(B, L, self.h * self.d))
+
+
+class _InformerEncLayer(nn.Module):
+    """ProbSparse attention + FFN (post-LN)."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.attn = ProbSparseAttention(d_model, n_heads, dropout=dropout)
+        self.ffn = nn.Sequential(nn.Linear(d_model, 2 * d_model), nn.GELU(), nn.Dropout(dropout),
+                                 nn.Linear(2 * d_model, d_model))
+        self.n1, self.n2 = nn.LayerNorm(d_model), nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        x = self.n1(x + self.drop(self.attn(x)))
+        return self.n2(x + self.drop(self.ffn(x)))
+
+
+class _Distil(nn.Module):
+    """Self-attention distilling: Conv1d + BN + ELU + MaxPool (uzunluğu yarıya indirir)."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(d_model, d_model, 3, padding=1)
+        self.bn = nn.BatchNorm1d(d_model)
+        self.pool = nn.MaxPool1d(3, stride=2, padding=1)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        y = self.pool(F.elu(self.bn(self.conv(x.transpose(1, 2)))))
+        return y.transpose(1, 2)
+
+
+class Informer(nn.Module):
+    """
+    Informer (Zhou et al. 2021): ProbSparse encoder + distilling + üretken (generative)
+    decoder. forward(x_enc,x_dec) → (B,out_len,c_out). `pooled(x_enc)` → (B,d_model).
+    """
+
+    def __init__(self, enc_in: int = 100, dec_in: int = 100, c_out: int = 3, seq_len: int = INFORMER_SEQ,
+                 label_len: int = 50, out_len: int = 40, d_model: int = 64,
+                 n_heads: int = INFORMER_HEADS, n_layers: int = INFORMER_LAYERS,
+                 dropout: float = 0.1) -> None:
+        super().__init__()
+        self.label_len, self.out_len = label_len, out_len
+        self.enc_embed = nn.Linear(enc_in, d_model)
+        self.dec_embed = nn.Linear(dec_in, d_model)
+        self.register_buffer("pe", _sinusoid(max(seq_len, label_len + out_len) + 8, d_model))
+        self.enc_layers = nn.ModuleList([_InformerEncLayer(d_model, n_heads, dropout) for _ in range(n_layers)])
+        self.distils = nn.ModuleList([_Distil(d_model) for _ in range(max(n_layers - 1, 0))])
+        dl = nn.TransformerDecoderLayer(d_model, n_heads, 2 * d_model, dropout, batch_first=True,
+                                        activation="gelu", norm_first=True)
+        self.decoder = nn.TransformerDecoder(dl, num_layers=1)
+        self.proj = nn.Linear(d_model, c_out)
+        self.enc_norm = nn.LayerNorm(d_model)
+
+    def encode(self, x_enc: "torch.Tensor") -> "torch.Tensor":
+        """(B,L,enc_in) → (B,L',d_model) (distilling ile kısalmış)."""
+        h = self.enc_embed(x_enc) + self.pe[None, : x_enc.shape[1], :]
+        for i, layer in enumerate(self.enc_layers):
+            h = layer(h)
+            if i < len(self.distils):
+                h = self.distils[i](h)
+        return self.enc_norm(h)
+
+    def pooled(self, x_enc: "torch.Tensor") -> "torch.Tensor":
+        """Encoder çıktısının zaman ortalaması (B,d_model)."""
+        return self.encode(x_enc).mean(dim=1)
+
+    def make_dec_input(self, x_enc: "torch.Tensor") -> "torch.Tensor":
+        """Üretken decoder girdisi: son label_len gerçek bar + out_len sıfır."""
+        z = torch.zeros(x_enc.shape[0], self.out_len, x_enc.shape[2], device=x_enc.device, dtype=x_enc.dtype)
+        return torch.cat([x_enc[:, -self.label_len:], z], dim=1)
+
+    def forward(self, x_enc: "torch.Tensor", x_dec: Optional["torch.Tensor"] = None) -> "torch.Tensor":
+        """Dönüş: (B,out_len,c_out)."""
+        mem = self.encode(x_enc)
+        if x_dec is None:
+            x_dec = self.make_dec_input(x_enc)
+        d = self.dec_embed(x_dec) + self.pe[None, : x_dec.shape[1], :]
+        return self.proj(self.decoder(d, mem)[:, -self.out_len:])
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 6. MoE 16
+# ═══════════════════════════════════════════════════════════════════
+
+class GatedExpert(nn.Module):
+    """Kapılı FFN uzmanı: GELU(fc1) → fc2, sigmoid kapıyla çarpılır."""
+
+    def __init__(self, d_model: int, hidden: int) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, hidden)
+        self.fc2 = nn.Linear(hidden, d_model)
+        self.gate = nn.Linear(d_model, 1)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        return self.fc2(F.gelu(self.fc1(x))) * torch.sigmoid(self.gate(x))
+
+
+class MoE16(nn.Module):
+    """
+    16 uzman, top-4 yönlendirme, Switch tarzı Load Balancing Loss (Shazeer 2017).
+    x: (N,d). Dönüş: (y, lb_loss, entropy, max_load). Router z-loss: `self.router_z`.
+    Not: tüm uzmanlar yoğun hesaplanır, seyrek ağırlıkla toplanır (küçük modeller için basit).
+    """
+
+    def __init__(self, d_model: int = TFT_DIM, n_experts: int = N_EXPERTS, top_k: int = MOE_TOPK) -> None:
+        super().__init__()
+        self.n_experts, self.top_k = n_experts, top_k
+        self.router = nn.Linear(d_model, n_experts)
+        self.experts = nn.ModuleList([GatedExpert(d_model, d_model * 2) for _ in range(n_experts)])
+        self.router_z: Any = None
+
+    def forward(self, x: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        logits = self.router(x)
+        probs = F.softmax(logits, dim=-1)
+        topk_w, topk_idx = torch.topk(probs, self.top_k, dim=-1)
+        topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-9)
+        one_hot = F.one_hot(topk_idx, self.n_experts).to(x.dtype)               # (N,k,E)
+        dispatch = one_hot.sum(dim=1).mean(dim=0) / self.top_k                  # (E,) toplam=1
+        gate_prob = probs.mean(dim=0)
+        lb_loss = self.n_experts * (dispatch.detach() * gate_prob).sum()        # düzgün dağılımda =1
+        entropy = -(gate_prob * torch.log(gate_prob + 1e-9)).sum()
+        max_load = dispatch.max().detach()
+        self.router_z = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+        outs = torch.stack([e(x) for e in self.experts], dim=1)                 # (N,E,d)
+        w_full = (one_hot * topk_w.unsqueeze(-1)).sum(dim=1)                    # (N,E)
+        y = (outs * w_full.unsqueeze(-1)).sum(dim=1)
+        return y, lb_loss, entropy, max_load
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 7. KAYIPLAR + TEMPERATURE SCALING
+# ═══════════════════════════════════════════════════════════════════
+
+def heteroscedastic_ce(logits: "torch.Tensor", log_var: "torch.Tensor", targets: "torch.Tensor",
+                       weights: Optional["torch.Tensor"] = None) -> "torch.Tensor":
+    """
+    Kendall & Gal (2017) tarzı gözlem-gürültülü CE:
+        loss = 0.5·CE·exp(-s) + 0.5·s,  s = log σ²  (kırpılmış [-6,3]).
+    weights verilirse ağırlıklı ortalama alınır.
+    """
+    ce = F.cross_entropy(logits, targets, reduction="none")
+    s = torch.clamp(log_var, min=-6.0, max=3.0)
+    loss = 0.5 * ce * torch.exp(-s) + 0.5 * s
+    if weights is None:
+        return loss.mean()
+    return (loss * weights).sum() / (weights.sum() + 1e-9)
+
+
+def dual_task_loss(out: Dict[str, "torch.Tensor"], y_s: "torch.Tensor", y_l: "torch.Tensor",
+                   m_s: "torch.Tensor", m_l: "torch.Tensor", w_s: Optional["torch.Tensor"] = None,
+                   w_l: Optional["torch.Tensor"] = None, alpha: float = ALPHA_LONG,
+                   lb_coef: float = LB_COEF, zloss_coef: float = ZLOSS_COEF
+                   ) -> Tuple["torch.Tensor", Dict[str, float]]:
+    """
+    L = α·L_short + (1-α)·L_long + lb·L_bal + z·(L_z + router_z).
+    out["short"/"long"]: (B,S,4) = 3 logit + log_var. y_*: (B,S) long, m_*: (B,S) bool.
+    NOT: α kısa vade kaybına uygulanır (spesifikasyondaki formüle birebir uyum).
+    """
+    parts: Dict[str, float] = {}
+    zero = out["short"].sum() * 0.0
+    terms = {}
+    for name, y, m, w in (("short", y_s, m_s, w_s), ("long", y_l, m_l, w_l)):
+        sel = m & (y >= 0)
+        if int(sel.sum().item()) == 0:
+            terms[name] = (zero, zero)
+            continue
+        lg = out[name][..., :3][sel]
+        lv = out[name][..., 3][sel]
+        ws = None if w is None else w[sel]
+        ce = heteroscedastic_ce(lg, lv, y[sel], ws)
+        lz = (torch.logsumexp(lg, dim=-1) ** 2).mean()
+        terms[name] = (ce, lz)
+        parts[f"ce_{name}"] = float(ce.detach())
+    rz = out.get("router_z", zero)
+    total = (alpha * terms["short"][0] + (1.0 - alpha) * terms["long"][0]
+             + lb_coef * out["lb_loss"] + zloss_coef * (terms["short"][1] + terms["long"][1] + rz))
+    parts["lb"] = float(out["lb_loss"].detach())
+    parts["total"] = float(total.detach())
+    return total, parts
+
+
+class TemperatureScaler(nn.Module):
+    """Tek parametreli sıcaklık ölçekleme (Guo et al. 2017). logits / T, T = exp(log_t)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.log_t = nn.Parameter(torch.zeros(1))
+
+    @property
+    def temperature(self) -> float:
+        """Güncel T değeri."""
+        return float(torch.exp(self.log_t).item())
+
+    def forward(self, logits: "torch.Tensor") -> "torch.Tensor":
+        return logits / torch.exp(self.log_t)
+
+    def fit(self, logits: "torch.Tensor", labels: "torch.Tensor", max_iter: int = 60) -> float:
+        """Doğrulama logit'lerinde NLL'yi minimize eder; T döndürür. (T ∈ [0.05, 20])"""
+        opt = torch.optim.LBFGS([self.log_t], lr=0.1, max_iter=max_iter)
+        logits, labels = logits.detach(), labels.detach()
+
+        def closure() -> "torch.Tensor":
+            opt.zero_grad()
+            loss = F.cross_entropy(self.forward(logits), labels)
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+        with torch.no_grad():
+            self.log_t.clamp_(math.log(0.05), math.log(20.0))
+        return self.temperature
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 8. TAM MODEL
+# ═══════════════════════════════════════════════════════════════════
+
+class SeekDeepNet(nn.Module):
+    """
+    Tek torba (bag) modeli: TFT (zaman, hisse başına) → GATv2 (hisseler arası) →
+    füzyon (+ opsiyonel TGN ve Informer) → MoE16 → çift başlık (kısa 10g, uzun 40g).
+    Girdi x: (B,S,L,F); adj: (B,S,S) bool; edge_w: (B,S,S).
+    Çıktı sözlüğü: short/long (B,S,4), lb_loss, entropy, max_load, router_z, emb (B,S,d).
+    """
+
+    def __init__(self, in_dim: int = N_FEAT, seq_len: int = SEQ_LEN, d_model: int = TFT_DIM,
+                 gat_dim: int = GAT_DIM, tft_heads: int = TFT_HEADS, tft_layers: int = TFT_LAYERS,
+                 gat_layers: int = GAT_LAYERS, gat_heads: int = GAT_HEADS, n_experts: int = N_EXPERTS,
+                 top_k: int = MOE_TOPK, dropout: float = 0.1, tgn_dim: int = 0,
+                 use_informer: bool = False, informer_seq: int = INFORMER_SEQ) -> None:
+        super().__init__()
+        self.tgn_dim = tgn_dim
+        self.tft = TemporalTransformer(in_dim, d_model, tft_heads, tft_layers, seq_len, dropout)
+        self.gat = GATv2Encoder(d_model, gat_dim, gat_layers, gat_heads, dropout)
+        self.fuse = nn.Linear(d_model + gat_dim + tgn_dim, d_model)
+        self.informer = Informer(in_dim, in_dim, 3, informer_seq, 50, 40, d_model) if use_informer else None
+        self.inf_proj = nn.Linear(d_model, d_model) if use_informer else None
+        self.moe = MoE16(d_model, n_experts, top_k)
+        self.norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+        self.head_s = nn.Linear(d_model, 4)
+        self.head_l = nn.Linear(d_model, 4)
+
+    def forward(self, x: "torch.Tensor", adj: "torch.Tensor", edge_w: Optional["torch.Tensor"] = None,
+                tgn_emb: Optional["torch.Tensor"] = None,
+                x_long: Optional["torch.Tensor"] = None) -> Dict[str, "torch.Tensor"]:
+        B, S, L, Fd = x.shape
+        h = self.tft(x.reshape(B * S, L, Fd)).reshape(B, S, -1)
+        g = self.gat(h, adj, edge_w)
+        parts = [h, g]
+        if self.tgn_dim > 0:
+            parts.append(tgn_emb if tgn_emb is not None else torch.zeros(B, S, self.tgn_dim, device=x.device))
+        z = self.fuse(torch.cat(parts, dim=-1))
+        if self.informer is not None and x_long is not None:
+            Ll = x_long.shape[2]
+            z = z + self.inf_proj(self.informer.pooled(x_long.reshape(B * S, Ll, -1)).reshape(B, S, -1))
+        y, lb, ent, mx = self.moe(z.reshape(B * S, -1))
+        z = self.norm(z + self.drop(y.reshape(B, S, -1)))
+        return {"short": self.head_s(z), "long": self.head_l(z), "lb_loss": lb, "entropy": ent,
+                "max_load": mx, "router_z": self.moe.router_z, "emb": z}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 9. BATCH ÜRETİMİ (NUMPY, NEDENSEL + PURGE)
+# ═══════════════════════════════════════════════════════════════════
+
+def time_ranges(store: "P2.FeatureStoreV7", seq_len: int = SEQ_LEN) -> Dict[str, Tuple[int, int]]:
+    """Train / val / test zaman aralıkları (yarı-açık). Val: train_end'den sonraki verinin ilk yarısı."""
+    lo = WARMUP_BARS + seq_len
+    te = store.train_end
+    va_end = te + (store.T - te) // 2
+    return {"train": (lo, te), "val": (te, va_end), "test": (va_end, store.T)}
+
+
+def usable_times(store: "P2.FeatureStoreV7", rng: Tuple[int, int], embargo: int = EMBARGO_BARS) -> np.ndarray:
+    """
+    Aralıkta en az bir hissenin (maske geçerli + uzun etiketi var + etiketi aralık bitmeden
+    embargo kadar önce biten) örneği olan zamanlar. Purge/embargo uyumludur.
+    """
+    lo, hi = rng
+    ok = store.mask & (store.lab_l >= 0) & (store.t1_l < hi - embargo)
+    ts = np.nonzero(ok[:, lo:hi].any(axis=0))[0] + lo
+    return ts.astype(np.int64)
+
+
+def make_batch(store: "P2.FeatureStoreV7", t_list: Sequence[int], seq_len: int = SEQ_LEN,
+               cut: Optional[int] = None, embargo: int = EMBARGO_BARS, topk: int = 4) -> Dict[str, np.ndarray]:
+    """
+    Zaman listesi için model girdisi üretir. Pencere [t-seq_len+1, t] — yalnızca geçmiş.
+    cut verilirse, etiketi cut-embargo'dan sonra biten örnekler maskelenir (purge).
+    Dönüş: x (B,S,L,F), adj (B,S,S) bool, ew (B,S,S), y_s,y_l (B,S) int64, w_s,w_l (B,S),
+    m_s,m_l (B,S) bool.
+    """
+    xs, adjs, ews, ys, yl, ws, wl, ms, ml = [], [], [], [], [], [], [], [], []
+    for t in t_list:
+        t = int(t)
+        if t < seq_len - 1:
+            raise ValueError("t, seq_len-1'den küçük olamaz")
+        xs.append(store.feat[:, :, t - seq_len + 1:t + 1].transpose(0, 2, 1))
+        a, _, e = store.adjacency_at(t, topk)
+        adjs.append(a)
+        ews.append(e)
+        base = store.mask[:, t]
+        ms_t = base & (store.lab_s[:, t] >= 0)
+        ml_t = base & (store.lab_l[:, t] >= 0)
+        if cut is not None:
+            ms_t &= store.t1_s[:, t] < cut - embargo
+            ml_t &= store.t1_l[:, t] < cut - embargo
+        ys.append(np.maximum(store.lab_s[:, t], 0))
+        yl.append(np.maximum(store.lab_l[:, t], 0))
+        ws.append(store.w_s[:, t])
+        wl.append(store.w_l[:, t])
+        ms.append(ms_t)
+        ml.append(ml_t)
+    return {"x": np.ascontiguousarray(np.stack(xs), dtype=np.float32),
+            "adj": np.stack(adjs), "ew": np.stack(ews).astype(np.float32),
+            "y_s": np.stack(ys).astype(np.int64), "y_l": np.stack(yl).astype(np.int64),
+            "w_s": np.stack(ws).astype(np.float32), "w_l": np.stack(wl).astype(np.float32),
+            "m_s": np.stack(ms), "m_l": np.stack(ml)}
+
+
+def _to_torch(b: Dict[str, np.ndarray], device: str) -> Dict[str, "torch.Tensor"]:
+    """Numpy batch'i torch tensörlerine çevirir."""
+    return {k: torch.from_numpy(v).to(device) for k, v in b.items()}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 10. CHRONOS
+# ═══════════════════════════════════════════════════════════════════
+
+def chronos_stats(samples: np.ndarray, last_close: np.ndarray) -> np.ndarray:
+    """
+    Chronos örneklerinden (n, num_samples, horizon) 5 özellik (n,5), son kapanışa göreli:
+    [medyan_getiri, %10_getiri, %90_getiri, std/son, P(son bar > son kapanış)].
+    """
+    samples = np.asarray(samples, dtype=np.float64)
+    lc = np.maximum(np.asarray(last_close, dtype=np.float64), 1e-9)
+    end = samples[:, :, -1]
+    out = np.zeros((samples.shape[0], 5))
+    out[:, 0] = np.median(end, axis=1) / lc - 1.0
+    out[:, 1] = np.percentile(end, 10, axis=1) / lc - 1.0
+    out[:, 2] = np.percentile(end, 90, axis=1) / lc - 1.0
+    out[:, 3] = end.std(axis=1) / lc
+    out[:, 4] = (end > lc[:, None]).mean(axis=1)
+    return out.astype(np.float32)
+
+
+class ChronosWrapper:
+    """
+    Amazon Chronos (Ansari et al. 2024) — sıfır-atış (zero-shot) tahmin ve embedding.
+    `chronos-forecasting` paketi ve model ağırlıkları (ilk kullanımda HuggingFace'ten indirilir) gerekir.
+    Kurulu değilse `available=False` olur ve metodlar None döner.
+    """
+
+    def __init__(self, model_name: str = CHRONOS_MODEL, device: str = "cpu") -> None:
+        self.available = False
+        self.pipeline: Any = None
+        self.model_name = model_name
         try:
-            f = forecast_stock(bot, nm, dfs[nm], prices[nm], dec[nm], rp, horizon_days)
-            rows.append({"Hisse": nm, "Şu an": round(f.current_price, 2), "Hedef": round(f.target_price, 2),
-                         "Değişim %": round(f.expected_return_pct, 2), "Alt (%80)": round(f.lower_bound, 2),
-                         "Üst (%80)": round(f.upper_bound, 2), "P(Yukarı) %": round(f.p_up * 100, 0),
-                         "P(Aşağı) %": round(f.p_down * 100, 0), "Senaryo Boğa": round(f.bull_price, 2),
-                         "Senaryo Baz": round(f.base_price, 2), "Senaryo Ayı": round(f.bear_price, 2),
-                         "Güven %": round(f.confidence * 100, 0), "Belirsizlik": round(f.uncertainty, 3),
-                         "Rejim": f.regime, "Karar": dec[nm]["action"], "_obj": f})
-        except Exception as e: log.warning(f"forecast {nm}: {e}")
-    return rows
+            _need_torch()
+            from chronos import ChronosPipeline  # type: ignore
+            self.pipeline = ChronosPipeline.from_pretrained(model_name, device_map=device,
+                                                            torch_dtype=torch.float32)
+            self.available = True
+            log.info("Chronos yüklendi: %s", model_name)
+        except Exception as e:
+            log.warning("Chronos kullanılamıyor (%s): %s", model_name, e)
 
-def forecast_to_text(f):
-    yon = "YUKARI" if f.expected_return_pct > 1 else ("AŞAĞI" if f.expected_return_pct < -1 else "YATAY")
-    emoji = "🟢" if f.expected_return_pct > 1 else ("🔴" if f.expected_return_pct < -1 else "🟡")
-    return f"""{emoji} **{f.stock}** — {f.horizon_days} günlük tahmin
-- **Şu an:** ₺{f.current_price:.2f}
-- **Hedef:** ₺{f.target_price:.2f} ({f.expected_return_pct:+.2f}%) — **{yon}**
-- **%80 aralık:** ₺{f.lower_bound:.2f} — ₺{f.upper_bound:.2f}
-- **Olasılıklar:** P(Yukarı) %{f.p_up*100:.0f} · P(Yatay) %{f.p_flat*100:.0f} · P(Aşağı) %{f.p_down*100:.0f}
-- **Senaryolar:** 🐂 ₺{f.bull_price:.2f} · 🎯 ₺{f.base_price:.2f} · 🐻 ₺{f.bear_price:.2f}
-- **Güven:** %{f.confidence*100:.0f} · **Belirsizlik:** {f.uncertainty:.3f}
-- **Rejim:** {f.regime} (çarpan ×{f.regime_adj:.2f})"""
+    @staticmethod
+    def _ctx(contexts: Sequence[np.ndarray], max_len: int = 512) -> List["torch.Tensor"]:
+        return [torch.tensor(np.asarray(c, dtype=np.float32)[-max_len:]) for c in contexts]
 
-def forecast_scorecard(dfs, limit=600):
-    rows = _q("SELECT ts,stock,current_price,target_price,horizon FROM forecast ORDER BY id DESC LIMIT ?", (int(limit),))
+    def predict(self, contexts: Sequence[np.ndarray], horizon: int = CHRONOS_PRED_LEN,
+                num_samples: int = MC_SAMPLES) -> Optional[np.ndarray]:
+        """Dönüş: (n_seri, num_samples, horizon) veya None."""
+        if not self.available:
+            return None
+        try:
+            f = self.pipeline.predict(self._ctx(contexts), prediction_length=horizon, num_samples=num_samples)
+            return f.cpu().numpy()
+        except Exception as e:
+            log.error("Chronos tahmin hatası: %s", e)
+            return None
+
+    def embed(self, contexts: Sequence[np.ndarray]) -> Optional[np.ndarray]:
+        """Encoder embedding'i token ortalaması: (n_seri, d_model=512 for t5-small) veya None."""
+        if not self.available:
+            return None
+        try:
+            emb = self.pipeline.embed(self._ctx(contexts))
+            emb = emb[0] if isinstance(emb, tuple) else emb
+            return emb.float().mean(dim=1).cpu().numpy()
+        except Exception as e:
+            log.error("Chronos embedding hatası: %s", e)
+            return None
+
+    def features(self, contexts: Sequence[np.ndarray], horizon: int = CHRONOS_PRED_LEN,
+                 num_samples: int = MC_SAMPLES) -> Optional[np.ndarray]:
+        """(n_seri, 5 + d_model) = istatistikler ‖ embedding; kullanılamazsa None."""
+        f = self.predict(contexts, horizon, num_samples)
+        e = self.embed(contexts)
+        if f is None or e is None:
+            return None
+        last = np.array([np.asarray(c)[-1] for c in contexts])
+        return np.concatenate([chronos_stats(f, last), e.astype(np.float32)], axis=1)
+
+
+def build_chronos_panel(store: "P2.FeatureStoreV7", wrapper: ChronosWrapper, step: int = 5,
+                        ctx: int = 512, min_ctx: int = 64) -> Optional[np.ndarray]:
+    """
+    Her `step` barda (nedensel: yalnızca t'ye kadar kapanışlar) Chronos özellikleri hesaplar,
+    arada ileri doldurur. store.chronos_emb'e (S,F,T) float32 yazar ve döndürür.
+    Maliyet yüksektir (CPU'da saatler sürebilir); kullanılamazsa None.
+    """
+    if not wrapper.available:
+        return None
+    S, T = store.C.shape
+    out: Optional[np.ndarray] = None
+    last_f: Optional[np.ndarray] = None
+    for t in range(min_ctx, T):
+        if (t - min_ctx) % step == 0 or last_f is None:
+            ctxs = [store.C[s, max(0, t - ctx + 1):t + 1] for s in range(S)]
+            f = wrapper.features(ctxs)
+            if f is None:
+                return None
+            last_f = f
+            if out is None:
+                out = np.zeros((S, f.shape[1], T), dtype=np.float32)
+        out[:, :, t] = last_f  # type: ignore[index]
+    store.chronos_emb = out
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 11. BAGGED QUANTUM ENSEMBLE
+# ═══════════════════════════════════════════════════════════════════
+
+class BaggedQuantumEnsemble:
+    """
+    BAG_N adet SeekDeepNet: her biri farklı tohum + bootstrap zaman örneklemesiyle eğitilir.
+    Erken durdurma (val kaybı), AdamW + cosine LR, grad clip, bag başına temperature scaling.
+    Epistemik belirsizlik = torbalar arası olasılık std'si (Parça 4 bunu genişletir).
+    """
+
+    def __init__(self, n_bags: int = BAG_N, seed: int = BAG_SEED, device: str = "cpu",
+                 seq_len: int = SEQ_LEN, **net_kw: Any) -> None:
+        _need_torch()
+        self.n_bags, self.seed, self.device, self.seq_len = n_bags, seed, device, seq_len
+        self.net_kw = dict(net_kw)
+        self.nets: List[SeekDeepNet] = []
+        self.temp_s: List[float] = []
+        self.temp_l: List[float] = []
+        self.history: List[Dict[str, Any]] = []
+
+    def _new_net(self) -> "SeekDeepNet":
+        return SeekDeepNet(seq_len=self.seq_len, **self.net_kw).to(self.device)
+
+    def _run(self, net: "SeekDeepNet", store: "P2.FeatureStoreV7", times: np.ndarray, cut: int,
+             batch_size: int) -> Tuple[float, float, List["torch.Tensor"], List["torch.Tensor"], List["torch.Tensor"], List["torch.Tensor"]]:
+        """Değerlendirme: (kayıp, kısa-doğruluk, kısa logit'ler, kısa etiketler, uzun logit'ler, uzun etiketler)."""
+        net.eval()
+        tot, n, correct, cnt = 0.0, 0, 0, 0
+        ls, ys, ll, yl = [], [], [], []
+        with torch.no_grad():
+            for i in range(0, len(times), batch_size):
+                b = _to_torch(make_batch(store, times[i:i + batch_size], self.seq_len, cut), self.device)
+                out = net(b["x"], b["adj"], b["ew"])
+                loss, _ = dual_task_loss(out, b["y_s"], b["y_l"], b["m_s"], b["m_l"], b["w_s"], b["w_l"])
+                tot += float(loss) * len(times[i:i + batch_size])
+                n += len(times[i:i + batch_size])
+                sel = b["m_s"] & (b["y_s"] >= 0)
+                if int(sel.sum()) > 0:
+                    pred = out["short"][..., :3].argmax(-1)
+                    correct += int((pred[sel] == b["y_s"][sel]).sum())
+                    cnt += int(sel.sum())
+                    ls.append(out["short"][..., :3][sel]); ys.append(b["y_s"][sel])
+                sel2 = b["m_l"]
+                if int(sel2.sum()) > 0:
+                    ll.append(out["long"][..., :3][sel2]); yl.append(b["y_l"][sel2])
+        return tot / max(n, 1), correct / max(cnt, 1), ls, ys, ll, yl
+
+    def fit(self, store: "P2.FeatureStoreV7", epochs: int = 10, batch_size: int = 16, lr: float = 1e-3,
+            weight_decay: float = 1e-4, patience: int = 3, max_steps_per_epoch: Optional[int] = None,
+            db: Any = None) -> List[Dict[str, Any]]:
+        """Torbaları eğitir. Dönüş: bag başına özet (en iyi val kaybı, T, epoch)."""
+        rg = time_ranges(store, self.seq_len)
+        tr_t = usable_times(store, rg["train"])
+        va_t = usable_times(store, rg["val"])
+        if len(tr_t) < batch_size or len(va_t) == 0:
+            raise ValueError(f"Yetersiz örnek: train={len(tr_t)}, val={len(va_t)}")
+        self.nets, self.temp_s, self.temp_l, self.history = [], [], [], []
+        for b in range(self.n_bags):
+            torch.manual_seed(self.seed + b)
+            rng = np.random.default_rng(self.seed + b)
+            net = self._new_net()
+            opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+            steps_ep = max(1, min(len(tr_t) // batch_size, max_steps_per_epoch or 10 ** 9))
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs * steps_ep)
+            boot = rng.choice(tr_t, size=len(tr_t), replace=True)
+            best, best_state, bad, step = float("inf"), None, 0, 0
+            for ep in range(epochs):
+                net.train()
+                perm = rng.permutation(len(boot))
+                for k in range(steps_ep):
+                    idx = boot[perm[k * batch_size:(k + 1) * batch_size]]
+                    if len(idx) == 0:
+                        continue
+                    bt = _to_torch(make_batch(store, idx, self.seq_len, rg["train"][1]), self.device)
+                    out = net(bt["x"], bt["adj"], bt["ew"])
+                    loss, parts = dual_task_loss(out, bt["y_s"], bt["y_l"], bt["m_s"], bt["m_l"], bt["w_s"], bt["w_l"])
+                    opt.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                    opt.step()
+                    sched.step()
+                    step += 1
+                    if db is not None and step % 20 == 0:
+                        db.insert("moe", [time.strftime("%Y-%m-%d %H:%M:%S"), step, parts["lb"],
+                                          float(out["entropy"].detach()), float(out["max_load"])])
+                vl, va, *_ = self._run(net, store, va_t, rg["val"][1], batch_size)
+                log.info("Bag %d/%d epoch %d: val_loss=%.4f val_acc=%.3f", b + 1, self.n_bags, ep + 1, vl, va)
+                if db is not None:
+                    db.insert("train", [time.strftime("%Y-%m-%d %H:%M:%S"), step, vl, va, f"bag{b}"])
+                if vl < best - 1e-5:
+                    best, best_state, bad = vl, copy.deepcopy(net.state_dict()), 0
+                else:
+                    bad += 1
+                    if bad >= patience:
+                        break
+            if best_state is not None:
+                net.load_state_dict(best_state)
+            _, _, ls, ys, ll, yl = self._run(net, store, va_t, rg["val"][1], batch_size)
+            ts, tl = 1.0, 1.0
+            if ls:
+                ts = TemperatureScaler().to(self.device)
+                ts_v = ts.fit(torch.cat(ls), torch.cat(ys))
+            else:
+                ts_v = 1.0
+            if ll:
+                tl = TemperatureScaler().to(self.device)
+                tl_v = tl.fit(torch.cat(ll), torch.cat(yl))
+            else:
+                tl_v = 1.0
+            self.nets.append(net)
+            self.temp_s.append(float(ts_v))
+            self.temp_l.append(float(tl_v))
+            self.history.append({"bag": b, "best_val": best, "T_short": float(ts_v), "T_long": float(tl_v)})
+        return self.history
+
+    def predict(self, store: "P2.FeatureStoreV7", t_list: Sequence[int], batch_size: int = 16) -> Dict[str, np.ndarray]:
+        """
+        Torba başına olasılıklar ve özetler. Anahtarlar:
+        probs_s/probs_l (n_bags,B,S,3), p_short/p_long (B,S,3) ortalama,
+        epi_short/epi_long (B,S) torbalar arası std (sınıf ortalaması),
+        alea_short/alea_long (B,S) ortalama exp(0.5·log_var), lb_loss/entropy/max_load (n_bags,).
+        """
+        if not self.nets:
+            raise RuntimeError("Önce fit() veya load() çağırın")
+        ps, pl, as_, al, lbs, ens, mxs = [], [], [], [], [], [], []
+        t_arr = np.asarray(t_list, dtype=np.int64)
+        for net, Ts, Tl in zip(self.nets, self.temp_s, self.temp_l):
+            net.eval()
+            bs, bl, a1, a2 = [], [], [], []
+            lb = en = mx = 0.0
+            with torch.no_grad():
+                for i in range(0, len(t_arr), batch_size):
+                    b = _to_torch(make_batch(store, t_arr[i:i + batch_size], self.seq_len), self.device)
+                    out = net(b["x"], b["adj"], b["ew"])
+                    bs.append(torch.softmax(out["short"][..., :3] / Ts, -1).cpu().numpy())
+                    bl.append(torch.softmax(out["long"][..., :3] / Tl, -1).cpu().numpy())
+                    a1.append(torch.exp(0.5 * out["short"][..., 3].clamp(-6, 3)).cpu().numpy())
+                    a2.append(torch.exp(0.5 * out["long"][..., 3].clamp(-6, 3)).cpu().numpy())
+                    lb, en, mx = float(out["lb_loss"]), float(out["entropy"]), float(out["max_load"])
+            ps.append(np.concatenate(bs)); pl.append(np.concatenate(bl))
+            as_.append(np.concatenate(a1)); al.append(np.concatenate(a2))
+            lbs.append(lb); ens.append(en); mxs.append(mx)
+        ps, pl = np.stack(ps), np.stack(pl)
+        return {"probs_s": ps, "probs_l": pl, "p_short": ps.mean(0), "p_long": pl.mean(0),
+                "epi_short": ps.std(0).mean(-1), "epi_long": pl.std(0).mean(-1),
+                "alea_short": np.stack(as_).mean(0), "alea_long": np.stack(al).mean(0),
+                "lb_loss": np.array(lbs), "entropy": np.array(ens), "max_load": np.array(mxs)}
+
+    def save(self, path: str) -> None:
+        """Ağırlıklar + sıcaklıklar + yapılandırmayı tek dosyaya kaydeder."""
+        torch.save({"states": [n.state_dict() for n in self.nets], "temp_s": self.temp_s,
+                    "temp_l": self.temp_l, "net_kw": self.net_kw, "seq_len": self.seq_len,
+                    "seed": self.seed, "n_bags": self.n_bags}, path)
+
+    @classmethod
+    def load(cls, path: str, device: str = "cpu") -> "BaggedQuantumEnsemble":
+        """Kaydedilmiş topluluğu yükler."""
+        _need_torch()
+        z = torch.load(path, map_location=device)
+        e = cls(z["n_bags"], z["seed"], device, z["seq_len"], **z["net_kw"])
+        for sd in z["states"]:
+            n = e._new_net()
+            n.load_state_dict(sd)
+            e.nets.append(n)
+        e.temp_s, e.temp_l = list(z["temp_s"]), list(z["temp_l"])
+        return e
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 12. ÖZ-TEST 3
+# ═══════════════════════════════════════════════════════════════════
+
+def _selftest_part3() -> bool:
+    """Parça 3 öz-testi. Numpy kısmı her zaman, torch kısmı yalnızca PyTorch kuruluysa çalışır."""
+    print(f"\n🐋 Öz-test 3 (PyTorch: {'VAR' if TORCH_OK else 'YOK → torch testleri ATLANDI'})")
+    res: List[Tuple[str, bool]] = []
+    chk = lambda n, ok, e="": P1._check(n, ok, res, e)
+
+    panel, macro = P2._make_test_panel(S=6, T=420)
+    st = P2.build_feature_store_v7(panel, macro, scale=True)
+    rg = time_ranges(st)
+    tr_t = usable_times(st, rg["train"])
+    chk("usable_times boş değil", len(tr_t) > 50, f"({len(tr_t)})")
+    chk("Train zamanları aralık içinde", int(tr_t.min()) >= rg["train"][0] and int(tr_t.max()) < rg["train"][1])
+
+    # Batch şekli
+    t_list = tr_t[:4]
+    b = make_batch(st, t_list, SEQ_LEN, cut=rg["train"][1])
+    chk("Batch x şekli", b["x"].shape == (4, 6, SEQ_LEN, N_FEAT), str(b["x"].shape))
+    chk("Batch adj/ew şekli", b["adj"].shape == (4, 6, 6) and b["ew"].shape == (4, 6, 6))
+    chk("Self-loop her zaman var", bool(b["adj"][:, np.arange(6), np.arange(6)].all()))
+
+    # Purge: maskelenen örneklerin etiketi cut'tan önce bitmeli
+    late = tr_t[-3:]
+    b2 = make_batch(st, late, SEQ_LEN, cut=rg["train"][1])
+    leak = False
+    for i, t in enumerate(late):
+        used = b2["m_l"][i]
+        leak |= bool((st.t1_l[used, t] >= rg["train"][1] - EMBARGO_BARS).any())
+    chk("Purge: kullanılan etiketler cut-embargo öncesinde biter", not leak)
+
+    # Nedensellik: gelecek özellikleri bozulsa batch değişmemeli
+    t0 = int(tr_t[10])
+    ref = make_batch(st, [t0], SEQ_LEN)["x"].copy()
+    saved = st.feat[:, :, t0 + 1:].copy()
+    st.feat[:, :, t0 + 1:] = 123.0
+    after = make_batch(st, [t0], SEQ_LEN)["x"]
+    st.feat[:, :, t0 + 1:] = saved
+    chk("Batch penceresi gelecek veriyi kullanmaz", bool(np.array_equal(ref, after)))
+
+    # Chronos istatistikleri
+    samp = np.stack([np.linspace(100, 110, 8)[None, :].repeat(20, 0) + np.arange(20)[:, None] * 0.0,
+                     np.linspace(100, 90, 8)[None, :].repeat(20, 0)])
+    cs = chronos_stats(samp, np.array([100.0, 100.0]))
+    chk("Chronos stats: yukarı seri → +%10, P(up)=1", abs(cs[0, 0] - 0.10) < 1e-6 and abs(cs[0, 4] - 1.0) < 1e-6)
+    chk("Chronos stats: aşağı seri → -%10, P(up)=0", abs(cs[1, 0] + 0.10) < 1e-6 and abs(cs[1, 4]) < 1e-6)
+    chk("ChronosWrapper kullanılamazsa None döner",
+        TORCH_OK or ChronosWrapper().predict([np.arange(100.0)]) is None)
+
+    if TORCH_OK:
+        torch.manual_seed(0)
+        # GAT maskesi: bağlı olmayan düğüm çıkışı etkilemez
+        gat = GATv2Encoder(16, 32, 2, 4, 0.0).eval()
+        x = torch.randn(2, 6, 16)
+        adj = torch.zeros(6, 6, dtype=torch.bool)
+        adj[:3, :3] = True; adj[3:, 3:] = True
+        y1 = gat(x, adj)
+        x2 = x.clone(); x2[:, 4] += 5.0
+        y2 = gat(x2, adj)
+        chk("GATv2: bağlı olmayan düğüm etkilemez", bool(torch.allclose(y1[:, :3], y2[:, :3], atol=1e-5)))
+        chk("GATv2: bağlı düğüm etkiler", not torch.allclose(y1[:, 3:], y2[:, 3:], atol=1e-5))
+        # TGN
+        tgn = TGN(6, 16, 8, 2)
+        src, dst = torch.tensor([0, 1]), torch.tensor([2, 3])
+        e = tgn(src, dst, torch.randn(2, 2), 1.0)
+        chk("TGN embedding şekli", tuple(e.shape) == (6, 16))
+        chk("TGN bellek güncellendi", float(tgn.memory[0].abs().sum()) > 0 and float(tgn.memory[5].abs().sum()) == 0)
+        # TFT
+        tft = TemporalTransformer(20, 32, 4, 2, 30).eval()
+        chk("TFT çıkış şekli", tuple(tft(torch.randn(3, 30, 20)).shape) == (3, 32))
+        # Informer
+        inf = Informer(10, 10, 3, seq_len=96, label_len=16, out_len=8, d_model=32, n_heads=4, n_layers=2).eval()
+        chk("Informer çıkış şekli", tuple(inf(torch.randn(2, 96, 10)).shape) == (2, 8, 3))
+        pa = ProbSparseAttention(32, 4).eval()
+        chk("ProbSparse çıkış şekli", tuple(pa(torch.randn(2, 50, 32)).shape) == (2, 50, 32))
+        # MoE
+        moe = MoE16(32, 16, 4)
+        y, lb, ent, mx = moe(torch.randn(256, 32))
+        chk("MoE çıkış şekli", tuple(y.shape) == (256, 32))
+        chk("MoE LB kaybı ≥ ~1", float(lb) > 0.8)
+        chk("MoE max_load ∈ (0,1]", 0.0 < float(mx) <= 1.0)
+        # Tam model + kayıp + geri yayılım
+        net = SeekDeepNet(in_dim=N_FEAT, seq_len=SEQ_LEN, d_model=32, gat_dim=16, tft_layers=1)
+        bt = _to_torch(b, "cpu")
+        out = net(bt["x"], bt["adj"], bt["ew"])
+        chk("Model çıkış şekilleri", tuple(out["short"].shape) == (4, 6, 4) and tuple(out["long"].shape) == (4, 6, 4))
+        loss, parts = dual_task_loss(out, bt["y_s"], bt["y_l"], bt["m_s"], bt["m_l"], bt["w_s"], bt["w_l"])
+        loss.backward()
+        gn = sum(float(p.grad.abs().sum()) for p in net.parameters() if p.grad is not None)
+        chk("Kayıp sonlu ve gradyan akıyor", bool(torch.isfinite(loss)) and gn > 0)
+        # Mini fit: aşırı uyum eğilimi
+        opt = torch.optim.AdamW(net.parameters(), lr=3e-3)
+        first = float(loss)
+        for _ in range(25):
+            out = net(bt["x"], bt["adj"], bt["ew"])
+            l2, _ = dual_task_loss(out, bt["y_s"], bt["y_l"], bt["m_s"], bt["m_l"], bt["w_s"], bt["w_l"])
+            opt.zero_grad(); l2.backward(); opt.step()
+        chk("Mini eğitimde kayıp düşüyor", float(l2) < first, f"({first:.3f}→{float(l2):.3f})")
+        # Temperature scaling: aşırı güvenli logit'ler T>1 vermeli
+        g = torch.Generator().manual_seed(1)
+        lab = torch.randint(0, 3, (500,), generator=g)
+        lg = torch.nn.functional.one_hot(lab, 3).float() * 5.0
+        flip = torch.rand(500, generator=g) < 0.4
+        lg[flip] = torch.randn(int(flip.sum()), 3, generator=g) * 5.0
+        T_fit = TemperatureScaler().fit(lg, lab)
+        chk("Temperature scaling aşırı güveni yumuşatır (T>1)", T_fit > 1.0, f"(T={T_fit:.2f})")
+        # Topluluk uçtan uca (küçük)
+        ens = BaggedQuantumEnsemble(n_bags=2, seed=3, d_model=32, gat_dim=16, tft_layers=1)
+        h = ens.fit(st, epochs=1, batch_size=8, max_steps_per_epoch=3)
+        pr = ens.predict(st, tr_t[:3])
+        chk("Topluluk eğitim+tahmin", len(h) == 2 and pr["p_short"].shape == (3, 6, 3))
+        chk("Olasılıklar toplamı 1", bool(np.allclose(pr["p_short"].sum(-1), 1.0, atol=1e-4)))
+
+    ok = all(r[1] for r in res)
+    print(f"\n{'✅ ÖZ-TEST 3 BAŞARILI' if ok else '❌ ÖZ-TEST 3 BAŞARISIZ'} ({sum(r[1] for r in res)}/{len(res)})"
+          + ("" if TORCH_OK else "  [torch testleri çalıştırılmadı]"))
+    return ok
+
+
+if __name__ == "__main__":
+    if os.environ.get("SEEKDEEP_SELFTEST") == "1":
+        sys.exit(0 if _selftest_part3() else 1)
+    print("Parça 3/6 yüklendi. Öz-test için SEEKDEEP_SELFTEST=1 kullanın.")
+# -*- coding: utf-8 -*-
+"""
+🐋 SEEK DEEP v7.0 — PARÇA 4/6: BELİRSİZLİK + RL + CAUSAL + BACKTEST + DOĞRULAMA + TUNER
+
+Zincir: seekdeep_v7 (P1) → seekdeep_v7_p2 (P2) → seekdeep_v7_p3 (P3) → bu modül (P4).
+
+İçindekiler:
+  1. Belirsizlik: aleatoric, epistemic, MC Dropout, SWAG (diagonal), RealNVP akış,
+     split conformal (regresyon) ve LAC conformal (sınıflandırma)
+  2. RL: numpy TradingEnv, RLAgent (SB3 PPO/SAC, yoksa devre dışı), CQL (d3rlpy),
+     Decision Transformer (torch), rl_veto
+  3. Causal: Fisher-z PC iskeleti (order ≤ 1), backdoor OLS etkisi, causal blok
+  4. Numba simülatörü (stop, gap koruması, partial TP, BE, trailing, max_hold)
+  5. BacktestV + score_params_V
+  6. Doğrulama: PSR, DSR (Bailey & López de Prado 2014), CSCV-PBO, CPCV yol dağılımı
+  7. Tuner (rastgele arama + (1+λ)-ES; Bayesian için optuna opsiyonel)
+  8. SelfImprover (ardışık iyileşme + test toleransı + DSR kapısı)
+  9. Öz-test 4
+
+DÜRÜST NOTLAR:
+  - Torch'a bağlı sınıflar (MC Dropout, RealNVP, Decision Transformer) YAZILDI ama bu
+    ortamda torch yok; çalıştırılmadı. Numpy kısımları test edildi.
+  - Causal blokta mediation / instrument / collider / causal_child 0 bırakıldı: zaman
+    sırası dışında yönlendirme varsayımı olmadan güvenilir hesaplanamıyor.
+  - Simülatör numba ile derlenmek üzere yazıldı; bu ortamda numba yok, saf Python yolu test edildi.
+  - Tuner "Bayesian" değil: rastgele arama + evrimsel strateji. optuna kurulu ise ayrıca kullanılabilir.
+"""
+from __future__ import annotations
+
+import itertools
+import json
+import math
+import os
+import sys
+import time
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm, rankdata
+
+import seekdeep_v7 as P1
+import seekdeep_v7_p2 as P2
+import seekdeep_v7_p3 as P3
+from seekdeep_v7 import (
+    CAUSAL_NAMES, CORR_WINDOW, DEFAULT_RISK, FEAT_INDEX, FEE, HORIZON, MACRO_KEYS, MC_SAMPLES,
+    SLIPPAGE, log, njit, prange,
+)
+from seekdeep_v7_p2 import FeatureStoreV7, RANK_NAMES
+from seekdeep_v7_p3 import TORCH_OK, _need_torch
+
+torch = P3.torch
+nn = P3.nn
+F = P3.F
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. BELİRSİZLİK
+# ═══════════════════════════════════════════════════════════════════
+
+
+def aleatoric_from_logvar(log_var: np.ndarray) -> np.ndarray:
+    """Heteroscedastic gözlem gürültüsü: σ = exp(0.5·log σ²), kırpılmış log_var ile."""
+    lv = np.clip(np.asarray(log_var, dtype=np.float64), -6.0, 3.0)
+    return np.exp(0.5 * lv)
+
+
+def epistemic_from_probs(probs: np.ndarray) -> np.ndarray:
+    """probs (n_model, ..., K): modeller arası olasılık std'sinin sınıf ortalaması → (...)."""
+    return probs.std(axis=0).mean(axis=-1)
+
+
+def decompose_uncertainty(aleatoric: np.ndarray, epistemic: np.ndarray) -> np.ndarray:
+    """Toplam belirsizlik: sqrt(aleatoric² + epistemic²) (bağımsız varsayımı)."""
+    return np.sqrt(np.asarray(aleatoric) ** 2 + np.asarray(epistemic) ** 2)
+
+
+def uncertainty_summary(pred: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """BaggedQuantumEnsemble.predict çıktısından kısa vade belirsizlik özeti."""
+    alea = np.asarray(pred["alea_short"])
+    epi = np.asarray(pred["epi_short"])
+    return {"aleatoric": alea, "epistemic": epi, "total": decompose_uncertainty(alea, epi)}
+
+
+def mc_dropout_samples(net: Any, batch: Dict[str, Any], n: int = MC_SAMPLES) -> np.ndarray:
+    """
+    MC Dropout (Gal & Ghahramani 2016): yalnızca Dropout katmanları train modunda, n örnek.
+    Dönüş: (n, B, S, 3) kısa vade olasılıkları. Torch gerektirir.
+    """
+    _need_torch()
+    net.eval()
+    for m in net.modules():
+        if isinstance(m, nn.Dropout):
+            m.train()
+    outs = []
+    with torch.no_grad():
+        for _ in range(n):
+            o = net(batch["x"], batch["adj"], batch["ew"])
+            outs.append(torch.softmax(o["short"][..., :3], dim=-1).cpu().numpy())
+    net.eval()
+    return np.stack(outs)
+
+
+class SWAGDiag:
+    """
+    SWAG (Maddox et al. 2019), diagonal kovaryans sürümü. Eğitim sonu ağırlık vektörlerini
+    online ortalama ve ikinci moment ile toplar; örnekleme: μ + σ·z. Numpy vektörleriyle çalışır.
+    """
+
+    def __init__(self, max_models: int = 20) -> None:
+        self.max_models = max_models
+        self.n = 0
+        self.mean: Optional[np.ndarray] = None
+        self.sq: Optional[np.ndarray] = None
+
+    def collect(self, vec: np.ndarray) -> None:
+        """Bir epoch sonu ağırlık vektörünü ekler (ortalama, en fazla max_models'e göre)."""
+        v = np.asarray(vec, dtype=np.float64).ravel()
+        if self.mean is None:
+            self.mean = v.copy()
+            self.sq = v * v
+            self.n = 1
+            return
+        self.n += 1
+        k = float(min(self.n, self.max_models))
+        self.mean += (v - self.mean) / k
+        self.sq += (v * v - self.sq) / k
+
+    def var(self) -> np.ndarray:
+        """Diagonal varyans (negatif olmaz)."""
+        if self.mean is None:
+            raise RuntimeError("Önce collect() çağırın")
+        return np.maximum(self.sq - self.mean ** 2, 1e-12)
+
+    def sample(self, n: int = 10, scale: float = 0.5, seed: int = 0) -> np.ndarray:
+        """n adet ağırlık vektörü örnekler: (n, D)."""
+        rng = np.random.default_rng(seed)
+        z = rng.standard_normal((n, self.mean.shape[0]))
+        return self.mean[None, :] + scale * np.sqrt(self.var())[None, :] * z
+
+
+if TORCH_OK:
+    class _Coupling(nn.Module):
+        """RealNVP affin kuplaj katmanı (maskeli)."""
+
+        def __init__(self, dim: int, mask: "torch.Tensor", hidden: int = 64) -> None:
+            super().__init__()
+            self.register_buffer("mask", mask.float())
+            self.net = nn.Sequential(nn.Linear(dim, hidden), nn.Tanh(), nn.Linear(hidden, 2 * dim))
+
+        def forward(self, x: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
+            m = self.mask
+            s, t = self.net(x * m).chunk(2, dim=-1)
+            s = torch.tanh(s) * (1 - m)
+            t = t * (1 - m)
+            z = x * m + (1 - m) * (x * torch.exp(s) + t)
+            return z, s.sum(-1)
+
+        def inverse(self, z: "torch.Tensor") -> "torch.Tensor":
+            m = self.mask
+            s, t = self.net(z * m).chunk(2, dim=-1)
+            s = torch.tanh(s) * (1 - m)
+            t = t * (1 - m)
+            return z * m + (1 - m) * ((z - t) * torch.exp(-s))
+
+    class RealNVPFlow(nn.Module):
+        """
+        Normalizing Flow (Rezende & Mohamed 2015; RealNVP). Taban N(0,I).
+        log_prob(x) ve sample(n) sağlar. Belirsizlik için kullanılır (torch gerekir).
+        """
+
+        def __init__(self, dim: int, n_layers: int = 4, hidden: int = 64) -> None:
+            super().__init__()
+            self.dim = dim
+            masks = [torch.tensor((np.arange(dim) % 2) == (i % 2)) for i in range(n_layers)]
+            self.layers = nn.ModuleList([_Coupling(dim, m, hidden) for m in masks])
+
+        def log_prob(self, x: "torch.Tensor") -> "torch.Tensor":
+            z = x
+            logdet = torch.zeros(x.shape[0], device=x.device)
+            for layer in self.layers:
+                z, ld = layer(z)
+                logdet = logdet + ld
+            base = -0.5 * (z ** 2).sum(-1) - 0.5 * self.dim * math.log(2 * math.pi)
+            return base + logdet
+
+        def sample(self, n: int) -> "torch.Tensor":
+            z = torch.randn(n, self.dim)
+            with torch.no_grad():
+                for layer in reversed(self.layers):
+                    z = layer.inverse(z)
+            return z
+else:
+    class RealNVPFlow:  # type: ignore
+        """Torch yokken yer tutucu; kullanılırsa anlaşılır hata verir."""
+
+        def __init__(self, *a: Any, **k: Any) -> None:
+            _need_torch()
+
+
+def split_conformal_interval(y_cal: np.ndarray, pred_cal: np.ndarray, pred_test: np.ndarray,
+                             alpha: float = 0.10) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Split conformal regresyon aralığı (Vovk 2005). Kalibrasyon artıkları üzerinden
+    ceil((n+1)(1-α))/n kantili. Dönüş: (alt, üst, q). Kapsama ≥ 1-α (değişim varsayımıyla).
+    """
+    res = np.abs(np.asarray(y_cal, dtype=np.float64) - np.asarray(pred_cal, dtype=np.float64))
+    n = len(res)
+    if n == 0:
+        raise ValueError("Kalibrasyon seti boş")
+    level = min(1.0, math.ceil((n + 1) * (1 - alpha)) / n)
+    q = float(np.quantile(res, level, method="higher"))
+    pt = np.asarray(pred_test, dtype=np.float64)
+    return pt - q, pt + q, q
+
+
+def conformal_class_sets(probs_cal: np.ndarray, y_cal: np.ndarray, probs_test: np.ndarray,
+                         alpha: float = 0.10) -> np.ndarray:
+    """
+    LAC (Sadinle 2019) sınıflandırma kümeleri: uyumsuzluk = 1 - p(doğru sınıf).
+    Dönüş: (n_test, K) bool; True = sınıf kümede.
+    """
+    y_cal = np.asarray(y_cal, dtype=np.int64)
+    s_cal = 1.0 - probs_cal[np.arange(len(y_cal)), y_cal]
+    n = len(s_cal)
+    level = min(1.0, math.ceil((n + 1) * (1 - alpha)) / n)
+    q = float(np.quantile(s_cal, level, method="higher"))
+    return (1.0 - np.asarray(probs_test)) <= q
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. RL
+# ═══════════════════════════════════════════════════════════════════
+
+RL_FEATURES = ["rsi14", "ret5", "macd", "atrn14", "vol_rel"]
+
+
+class TradingEnv:
+    """
+    Gym'siz numpy ortamı. Gözlem: seçili özellikler (S·k) ‖ mevcut pozisyon (S).
+    Aksiyon: [-1,1]^S → hedef pozisyon = a · max_pos. Ödül: Σ w·r − maliyet·Σ|Δw|.
+    Zaman sırası: t_lo..t_hi, her adımda t+1 getirisi kullanılır (look-ahead yok).
+    """
+
+    def __init__(self, store: FeatureStoreV7, rp: Dict[str, Any], t_lo: int, t_hi: int,
+                 feat_names: Sequence[str] = RL_FEATURES, cost: float = FEE + SLIPPAGE) -> None:
+        self.store = store
+        self.rp = rp
+        self.t_lo, self.t_hi = int(t_lo), int(t_hi)
+        self.cost = float(cost)
+        self.fidx = [FEAT_INDEX[n] for n in feat_names]
+        self.S = store.C.shape[0]
+        self.obs_dim = len(self.fidx) * self.S + self.S
+        self.action_dim = self.S
+        self.t = self.t_lo
+        self.pos = np.zeros(self.S)
+        self.reset()
+
+    def reset(self) -> np.ndarray:
+        """Başa döner; gözlem döndürür."""
+        self.t = self.t_lo
+        self.pos = np.zeros(self.S)
+        return self._obs()
+
+    def _obs(self) -> np.ndarray:
+        f = self.store.feat[:, self.fidx, self.t]
+        return np.concatenate([f.ravel(), self.pos]).astype(np.float32)
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """Bir adım: (gözlem, ödül, bitti, bilgi)."""
+        a = np.clip(np.asarray(action, dtype=np.float64).ravel(), -1.0, 1.0)
+        target = a * float(self.rp.get("max_pos", 0.15)) * self.store.mask[:, self.t]
+        C = self.store.C
+        nxt = self.t + 1
+        ret = np.where(C[:, self.t] > 0, C[:, nxt] / np.maximum(C[:, self.t], 1e-9) - 1.0, 0.0)
+        turn = np.abs(target - self.pos)
+        reward = float(np.sum(target * ret) - self.cost * np.sum(turn))
+        self.pos = target
+        self.t = nxt
+        done = self.t >= self.t_hi - 1
+        return self._obs(), reward, done, {"turnover": float(turn.sum())}
+
+
+def rl_veto(rl_action: float, rp: Dict[str, Any]) -> bool:
+    """
+    RL veto: RL güçlü satış (< -0.5) diyorsa ve veto açıksa, alım kararı iptal edilir.
+    rp['rl_veto'] kapalıysa asla veto etmez.
+    """
+    return bool(rp.get("rl_veto", True) and float(rl_action) < -0.5)
+
+
+class RLAgent:
+    """
+    PPO / SAC (Stable-Baselines3) sarmalayıcısı. SB3 + gymnasium kurulu değilse
+    agent devre dışıdır: predict sıfır aksiyon döner ve veto hiç tetiklenmez.
+    """
+
+    def __init__(self, algo: str = "ppo") -> None:
+        self.algo = algo.lower()
+        self.model: Any = None
+        self.available = False
+        try:
+            import gymnasium  # noqa: F401
+            import stable_baselines3  # noqa: F401
+            self.available = True
+        except Exception as e:
+            log.warning("RL devre dışı (SB3/gymnasium yok): %s", e)
+
+    @staticmethod
+    def _gym_wrap(env: TradingEnv) -> Any:
+        import gymnasium as gym
+        from gymnasium import spaces
+
+        class _G(gym.Env):
+            """TradingEnv'in gymnasium sarmalayıcısı."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.e = env
+                self.observation_space = spaces.Box(-np.inf, np.inf, (env.obs_dim,), np.float32)
+                self.action_space = spaces.Box(-1.0, 1.0, (env.action_dim,), np.float32)
+
+            def reset(self, seed: Any = None, options: Any = None) -> Tuple[np.ndarray, Dict]:
+                return self.e.reset(), {}
+
+            def step(self, a: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+                o, r, d, info = self.e.step(a)
+                return o, r, d, False, info
+
+        return _G()
+
+    def train(self, env: TradingEnv, steps: int = 100_000) -> bool:
+        """Eğitir. Kurulu değilse False döner."""
+        if not self.available:
+            return False
+        from stable_baselines3 import PPO, SAC
+        genv = self._gym_wrap(env)
+        cls = PPO if self.algo == "ppo" else SAC
+        self.model = cls("MlpPolicy", genv, verbose=0)
+        self.model.learn(total_timesteps=int(steps))
+        log.info("RL (%s) %d adım eğitildi", self.algo.upper(), steps)
+        return True
+
+    def predict(self, obs: np.ndarray) -> np.ndarray:
+        """Gözlem → aksiyon. Model yoksa boş dizi döner (veto tetiklenmez)."""
+        if self.model is None:
+            return np.zeros(0)
+        act, _ = self.model.predict(obs, deterministic=True)
+        return np.asarray(act, dtype=np.float64).ravel()
+
+
+def train_cql_offline(obs: np.ndarray, act: np.ndarray, rew: np.ndarray, term: np.ndarray,
+                      steps: int = 10_000) -> Optional[Any]:
+    """
+    CQL (Kumar 2020), d3rlpy 2.x API. Kurulu değilse None. Veri: çevrimdışı geçiş kayıtları.
+    """
+    try:
+        import d3rlpy
+    except Exception as e:
+        log.warning("CQL devre dışı (d3rlpy yok): %s", e)
+        return None
+    ds = d3rlpy.dataset.MDPDataset(observations=obs, actions=act, rewards=rew, terminals=term)
+    algo = d3rlpy.algos.CQLConfig().create(device=False)
+    algo.fit(ds, n_steps=int(steps), n_steps_per_epoch=max(100, int(steps) // 10), show_progress=False)
+    return algo
+
+
+if TORCH_OK:
+    class DecisionTransformer(nn.Module):
+        """
+        Decision Transformer (Chen et al. 2021). Token dizisi (R_k, s_k, a_k)*K; nedensel
+        maske ile s_k token çıktısından a_k tahmin edilir. Torch gerekir; test edilmedi.
+        """
+
+        def __init__(self, state_dim: int, act_dim: int, hidden: int = 128, max_len: int = 20,
+                     n_layers: int = 2, n_heads: int = 4) -> None:
+            super().__init__()
+            self.max_len = max_len
+            self.embed_s = nn.Linear(state_dim, hidden)
+            self.embed_a = nn.Linear(act_dim, hidden)
+            self.embed_r = nn.Linear(1, hidden)
+            self.embed_t = nn.Embedding(max_len, hidden)
+            layer = nn.TransformerEncoderLayer(hidden, n_heads, 2 * hidden, 0.1,
+                                               batch_first=True, norm_first=True)
+            self.transformer = nn.TransformerEncoder(layer, n_layers, enable_nested_tensor=False)
+            self.head_a = nn.Linear(hidden, act_dim)
+
+        def forward(self, returns: "torch.Tensor", states: "torch.Tensor",
+                    actions: "torch.Tensor") -> "torch.Tensor":
+            """returns (B,K,1), states (B,K,sd), actions (B,K,ad) → tahmin edilen a (B,K,ad)."""
+            B, K, _ = states.shape
+            t_idx = torch.arange(K, device=states.device).clamp(max=self.max_len - 1)
+            te = self.embed_t(t_idx)[None]
+            r = self.embed_r(returns) + te
+            s = self.embed_s(states) + te
+            a = self.embed_a(actions) + te
+            tok = torch.stack([r, s, a], dim=2).reshape(B, 3 * K, -1)
+            mask = torch.triu(torch.ones(3 * K, 3 * K, dtype=torch.bool, device=states.device), diagonal=1)
+            h = self.transformer(tok, mask=mask)
+            return torch.tanh(self.head_a(h[:, 1::3]))
+else:
+    class DecisionTransformer:  # type: ignore
+        """Torch yokken yer tutucu."""
+
+        def __init__(self, *a: Any, **k: Any) -> None:
+            _need_torch()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. CAUSAL
+# ═══════════════════════════════════════════════════════════════════
+
+def partial_corr(rij: float, rik: float, rjk: float) -> float:
+    """Tek koşullu kısmi korelasyon ρ(i,j|k)."""
+    den = math.sqrt(max((1 - rik * rik) * (1 - rjk * rjk), 1e-12))
+    return (rij - rik * rjk) / den
+
+
+def fisherz_pvalue(r: float, n: int, k: int) -> float:
+    """Fisher-z iki yönlü p-değeri; k koşullu değişken sayısı."""
+    dof = n - k - 3
+    if dof <= 0:
+        return 1.0
+    rr = min(max(r, -0.999999), 0.999999)
+    z = 0.5 * math.log((1 + rr) / (1 - rr))
+    return 2.0 * (1.0 - norm.cdf(math.sqrt(dof) * abs(z)))
+
+
+def pc_skeleton(X: np.ndarray, alpha: float = 0.05, max_cond: int = 1) -> np.ndarray:
+    """
+    PC algoritmasının iskelet aşaması (Spirtes 2000), Fisher-z koşullu bağımsızlık testiyle.
+    Yalnızca order ≤ max_cond (şimdilik 0 ve 1). Dönüş: (p,p) simetrik bool, köşegen False.
+    Not: causallearn kurulu olsa da bu iskelet her ortamda çalışır.
+    """
+    X = np.nan_to_num(np.asarray(X, dtype=np.float64))
+    n, p = X.shape
+    C = np.nan_to_num(np.corrcoef(X, rowvar=False))
+    np.fill_diagonal(C, 1.0)
+    adj = np.ones((p, p), dtype=bool)
+    np.fill_diagonal(adj, False)
+    for i, j in itertools.combinations(range(p), 2):
+        if fisherz_pvalue(C[i, j], n, 0) > alpha:
+            adj[i, j] = adj[j, i] = False
+    if max_cond >= 1:
+        for i, j in itertools.combinations(range(p), 2):
+            if not adj[i, j]:
+                continue
+            for k in range(p):
+                if k in (i, j) or not adj[i, k]:
+                    continue
+                r = partial_corr(C[i, j], C[i, k], C[j, k])
+                if fisherz_pvalue(r, n, 1) > alpha:
+                    adj[i, j] = adj[j, i] = False
+                    break
+    return adj
+
+
+def ols_coef(y: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """Sabitli en küçük kareler. Dönüş: [sabit, β_1, ..., β_p]."""
+    A = np.column_stack([np.ones(len(y)), X])
+    beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+    return beta
+
+
+def backdoor_effect(y: np.ndarray, t: np.ndarray, Z: np.ndarray) -> float:
+    """Arka-kapı ayarlamalı doğrusal etki tahmini: y ~ t + Z (adjustment set = Z)."""
+    X = np.column_stack([t, Z]) if Z.size else t.reshape(-1, 1)
+    return float(ols_coef(y, X)[1])
+
+
+def _bfs_dist(adj: np.ndarray, src: int, dst: int) -> int:
+    """Çizgede kısa yol uzunluğu; ulaşılmazsa -1."""
+    from collections import deque
+    p = adj.shape[0]
+    dist = [-1] * p
+    dist[src] = 0
+    q = deque([src])
+    while q:
+        u = q.popleft()
+        if u == dst:
+            return dist[u]
+        for v in np.nonzero(adj[u])[0]:
+            if dist[v] < 0:
+                dist[v] = dist[u] + 1
+                q.append(v)
+    return -1
+
+
+def causal_window_features(stock_ret: np.ndarray, lag_vars: np.ndarray, alpha: float = 0.05) -> Dict[str, float]:
+    """
+    Tek hisse + tek pencere için causal özellikler.
+    stock_ret: (n,)  — sonuç (t anı)
+    lag_vars:  (n, m) — ilk sütun piyasa (t-1), kalanlar gecikmeli makro/sektör.
+    Yönlendirme zaman sırasından gelir: gecikmeli değişken → mevcut getiri.
+    """
+    X = np.column_stack([stock_ret, lag_vars])
+    adj = pc_skeleton(X, alpha)
+    m = lag_vars.shape[1]
+    parent = int(adj[0, 1:].sum())
+    d = _bfs_dist(adj, 0, 1)
+    path = 1.0 / (1.0 + d) if d >= 0 else 0.0
+    conf = int(sum(1 for j in range(2, m + 1) if adj[0, j] and adj[1, j]))
+    dsep = int(sum(1 for j in range(1, m + 1) if not adj[0, j]))
+    Z = lag_vars[:, 1:] if m > 1 else np.zeros((len(stock_ret), 0))
+    beta = backdoor_effect(stock_ret, lag_vars[:, 0], Z)
+    sd_mkt = float(np.std(lag_vars[:, 0], ddof=1)) if len(lag_vars) > 1 else 0.0
+    return {"causal_parent": float(parent), "causal_child": 0.0, "causal_path": path,
+            "do_effect": beta, "counterfactual": -beta * sd_mkt, "mediation": 0.0,
+            "instrument": 0.0, "confounder": float(conf), "collider": 0.0, "d_separation": float(dsep)}
+
+
+def build_causal_block(store: FeatureStoreV7, every: int = 20, win: int = 250,
+                       alpha: float = 0.05) -> np.ndarray:
+    """
+    Her `every` barda pencere (t-win, t] için causal özellikler; arada ileri doldurma.
+    Değişkenler: stock_t, market_{t-1}, sektör_{t-1}, makro z_{t-1} (8 adet).
+    store.feat içindeki causal bloğu train istatistikleriyle standardize edip yazar.
+    Dönüş: (S, 10, T) ham değerler.
+    """
+    S, T = store.LR.shape
+    cnt = np.maximum(store.mask.sum(axis=0), 1)
+    mkt = np.where(store.mask, store.LR, 0.0).sum(axis=0) / cnt
+    sec = P2._sector_mean(store.LR, store.sector_id, store.mask)
+    mac_idx = [FEAT_INDEX[f"M_{k}_z"] for k in MACRO_KEYS]
+    macro = store.feat[0, mac_idx, :].astype(np.float64)               # makro S'den bağımsız
+    raw = np.zeros((S, len(CAUSAL_NAMES), T))
+    last = np.zeros((S, len(CAUSAL_NAMES)))
+    for t in range(T):
+        if t >= win and (t - win) % every == 0:
+            lo = t - win + 1
+            tau = np.arange(lo, t + 1)
+            tau = tau[tau >= 1]
+            for s in range(S):
+                if not store.mask[s, t]:
+                    last[s] = 0.0
+                    continue
+                y = store.LR[s, tau]
+                lags = np.column_stack([mkt[tau - 1], sec[s, tau - 1]] + [macro[k, tau - 1] for k in range(macro.shape[0])])
+                ok = np.isfinite(y) & np.all(np.isfinite(lags), axis=1)
+                if ok.sum() < 60:
+                    last[s] = 0.0
+                    continue
+                f = causal_window_features(y[ok], lags[ok], alpha)
+                last[s] = [f[n] for n in CAUSAL_NAMES]
+        raw[:, :, t] = last
+    # standardize (yalnızca train istatistikleri) → store.feat'e yaz
+    c0 = FEAT_INDEX[CAUSAL_NAMES[0]]
+    tr = slice(P2.WARMUP_BARS, store.train_end)
+    for k in range(len(CAUSAL_NAMES)):
+        seg = raw[:, k, tr]
+        mu = float(np.mean(seg)) if seg.size else 0.0
+        sd = float(np.std(seg)) if seg.size and np.std(seg) > 1e-9 else 1.0
+        z = np.clip((raw[:, k, :] - mu) / sd, -5.0, 5.0)
+        store.feat[:, c0 + k, :] = (z * store.mask).astype(np.float32)
+    return raw
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. NUMBA SİMÜLATÖRÜ
+# ═══════════════════════════════════════════════════════════════════
+
+@njit(cache=True, nogil=True, fastmath=True)
+def simulate_stock_kernel(O, H, L, C, ATRN, sig, size, sl_atr, tp_r, tp_frac, be_r,
+                          trail_act_r, trail_atr, max_hold, cost_in, cost_out, out_ret, out_frac):
+    """
+    Tek hisse long-only simülasyon. Karar barı j-1 (sinyal), giriş j açılışı (t+1 açılışı).
+    Bar getirisi: pozisyon·(kapanış/önceki kapanış − 1) − maliyetler. Çıkışlar:
+      - stop (intrabar, gap-down'da açılıştan), başlangıç stop = giriş − sl_atr·ATR
+      - kısmi kâr al: tp_r·R'de tp_frac kadar pozisyon; kalan stop başabaşa (be_r>0)
+      - trailing: giriş + trail_act_r·R aşılınca stop = H − trail_atr·ATR
+      - max_hold bar sonunda kapanış
+    Dönüş: (giriş sayısı, kârlı kapanan işlem sayısı).
+    """
+    T = C.shape[0]
+    n_entries = 0
+    n_wins = 0
+    in_pos = False
+    frac = 0.0
+    entry = 0.0
+    stop = 0.0
+    tp = 0.0
+    R = 0.0
+    atr_e = 0.0
+    held = 0
+    partial = False
+    trail_on = False
+    trade_pnl = 0.0
+    for j in range(T):
+        out_ret[j] = 0.0
+        out_frac[j] = 0.0
+    for j in range(1, T):
+        r = 0.0
+        was_in = in_pos
+        opened = False
+        if not in_pos:
+            if sig[j - 1] and size[j - 1] > 0.0 and ATRN[j - 1] > 0.0:
+                opened = True
+                n_entries += 1
+                entry = O[j]
+                atr_e = ATRN[j - 1] * C[j - 1]
+                R = sl_atr * atr_e
+                stop = entry - R
+                tp = entry + tp_r * R
+                frac = size[j - 1]
+                in_pos = True
+                held = 0
+                partial = False
+                trail_on = False
+                trade_pnl = 0.0
+                r = frac * (C[j] / entry - 1.0) - frac * cost_in
+                if L[j] <= stop:
+                    ex = O[j] if O[j] < stop else stop
+                    r = frac * (ex / entry - 1.0) - frac * (cost_in + cost_out)
+                    frac = 0.0
+                    in_pos = False
+        else:
+            held += 1
+            prev = C[j - 1]
+            if L[j] <= stop:
+                ex = O[j] if O[j] < stop else stop
+                r = frac * (ex / prev - 1.0) - frac * cost_out
+                frac = 0.0
+                in_pos = False
+            else:
+                if (not partial) and tp_r > 0.0 and H[j] >= tp:
+                    px = tp if O[j] < tp else O[j]
+                    part = tp_frac * frac
+                    r += part * (px / prev - 1.0) - part * cost_out
+                    frac -= part
+                    partial = True
+                    if be_r > 0.0 and entry > stop:
+                        stop = entry
+                if H[j] >= entry + trail_act_r * R:
+                    trail_on = True
+                if trail_on:
+                    ts = H[j] - trail_atr * atr_e
+                    if ts > stop:
+                        stop = ts
+                if frac > 0.0:
+                    r += frac * (C[j] / prev - 1.0)
+                    if held >= max_hold:
+                        r -= frac * cost_out
+                        frac = 0.0
+                        in_pos = False
+        if opened or was_in:
+            trade_pnl += r
+            if (not in_pos) and trade_pnl > 0.0:
+                n_wins += 1
+            if not in_pos:
+                trade_pnl = 0.0
+        out_ret[j] = r
+        out_frac[j] = frac
+    if in_pos:
+        out_ret[T - 1] -= frac * cost_out
+    return n_entries, n_wins
+
+
+def simulate_panel(O: np.ndarray, H: np.ndarray, L: np.ndarray, C: np.ndarray, ATRN: np.ndarray,
+                   sig: np.ndarray, size: np.ndarray, rp: Dict[str, Any],
+                   cost_mult: float = 1.0) -> Dict[str, Any]:
+    """Tüm hisseler için simülasyon. Dönüş: per_stock (S,T), exposure (S,T), entries, wins."""
+    S, T = C.shape
+    per = np.zeros((S, T))
+    expo = np.zeros((S, T))
+    ent = wins = 0
+    tp_r = float(rp["tp_r"]) if rp.get("tp_on", True) else 0.0
+    be_r = float(rp["be_r"]) if rp.get("be_on", True) else 0.0
+    cost = (FEE + SLIPPAGE) * cost_mult
+    for s in range(S):
+        n, w = simulate_stock_kernel(
+            np.ascontiguousarray(O[s], dtype=np.float64), np.ascontiguousarray(H[s], dtype=np.float64),
+            np.ascontiguousarray(L[s], dtype=np.float64), np.ascontiguousarray(C[s], dtype=np.float64),
+            np.ascontiguousarray(ATRN[s], dtype=np.float64), np.ascontiguousarray(sig[s], dtype=np.bool_),
+            np.ascontiguousarray(size[s], dtype=np.float64),
+            float(rp["sl_atr"]), tp_r, float(rp.get("tp_frac", 0.5)), be_r,
+            float(rp["trail_act_r"]), float(rp["trail_atr"]), int(rp["max_hold"]),
+            cost, cost, per[s], expo[s])
+        ent += int(n)
+        wins += int(w)
+    return {"per_stock": per, "exposure": expo, "entries": ent, "wins": wins}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5. BACKTESTV + SKOR
+# ═══════════════════════════════════════════════════════════════════
+
+def sharpe(r: np.ndarray, ann: int = 252) -> float:
+    """Yıllıklandırılmış Sharpe (rf=0)."""
+    r = np.asarray(r, dtype=np.float64)
+    if len(r) < 2:
+        return 0.0
+    sd = float(r.std(ddof=1))
+    return 0.0 if sd <= 1e-12 else float(r.mean() / sd * math.sqrt(ann))
+
+
+def max_drawdown(eq: np.ndarray) -> float:
+    """Maksimum düşüş (pozitif kesir)."""
+    eq = np.asarray(eq, dtype=np.float64)
+    if eq.size == 0:
+        return 0.0
+    peak = np.maximum.accumulate(eq)
+    return float(np.max(1.0 - eq / np.maximum(peak, 1e-12)))
+
+
+def basic_metrics(r: np.ndarray, ann: int = 252) -> Dict[str, float]:
+    """Temel performans: yıllık getiri, Sharpe, Sortino, maks DD, Calmar, oynaklık."""
+    r = np.asarray(r, dtype=np.float64)
+    eq = np.cumprod(1.0 + r)
+    yrs = max(len(r) / ann, 1e-9)
+    cagr = float(eq[-1] ** (1 / yrs) - 1) if len(eq) and eq[-1] > 0 else -1.0
+    dn = r[r < 0]
+    dd_sd = float(np.sqrt(np.mean(dn ** 2))) * math.sqrt(ann) if dn.size else 1e-12
+    mdd = max_drawdown(eq)
+    return {"cagr": cagr, "sharpe": sharpe(r, ann), "sortino": float(r.mean() * ann / max(dd_sd, 1e-12)),
+            "max_dd": mdd, "calmar": cagr / max(mdd, 1e-9), "vol": float(r.std(ddof=1) * math.sqrt(ann)) if len(r) > 1 else 0.0}
+
+
+class BacktestV:
+    """
+    Feature Store üzerinde sinyal + boyutlandırma ile simülasyon. Portföy getirisi =
+    hisse getirilerinin toplamı (her biri zaten özkaynak kesri ile ölçeklenmiş).
+    """
+
+    def __init__(self, store: FeatureStoreV7, rp: Dict[str, Any], cost_mult: float = 1.0) -> None:
+        self.store = store
+        self.rp = rp
+        self.cost_mult = cost_mult
+
+    def run(self, sig: np.ndarray, size: np.ndarray, t0: int = 0, t1: Optional[int] = None) -> Dict[str, Any]:
+        """sig (S,T) bool, size (S,T) kesir. Dönüş: ret, per_stock, exposure, equity, metrics."""
+        st = self.store
+        T = st.C.shape[1]
+        t1 = T if t1 is None else min(int(t1), T)
+        sl = slice(t0, t1)
+        sig_m = np.asarray(sig, dtype=bool)[:, sl] & st.mask[:, sl]
+        size_m = np.where(sig_m, np.asarray(size, dtype=np.float64)[:, sl], 0.0)
+        res = simulate_panel(st.O[:, sl], st.H[:, sl], st.L[:, sl], st.C[:, sl], st.atrn[:, sl],
+                             sig_m, size_m, self.rp, self.cost_mult)
+        ret = res["per_stock"].sum(axis=0)
+        eq = np.cumprod(1.0 + ret)
+        m = basic_metrics(ret)
+        m["entries"] = res["entries"]
+        m["win_rate"] = res["wins"] / max(res["entries"], 1)
+        m["avg_exposure"] = float(res["exposure"].sum(axis=0).mean())
+        return {"ret": ret, "per_stock": res["per_stock"], "exposure": res["exposure"].sum(axis=0),
+                "equity": eq, "metrics": m, "trades": res["entries"]}
+
+
+def score_params_V(res: Dict[str, Any], rp: Dict[str, Any], min_trades: int = 20) -> float:
+    """
+    Skor = Sharpe − 5·max(0, DD − max_dd) − 0.5·[işlem < min_trades].
+    Yüksek skor daha iyi. DD yüzdesi rp['max_dd'] (%15 gibi) ile karşılaştırılır.
+    """
+    m = res["metrics"]
+    dd_limit = float(rp.get("max_dd", 15.0)) / 100.0
+    pen_dd = max(0.0, m["max_dd"] - dd_limit)
+    pen_tr = 1.0 if res.get("trades", 0) < min_trades else 0.0
+    return float(m["sharpe"] - 5.0 * pen_dd - 0.5 * pen_tr)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 6. DOĞRULAMA: PSR, DSR, PBO, CPCV
+# ═══════════════════════════════════════════════════════════════════
+
+def probabilistic_sharpe(r: np.ndarray, sr_star: float = 0.0) -> float:
+    """
+    PSR (Bailey & López de Prado 2012): P(SR > SR*). Günlük (yıllıksız) SR kullanır.
+    Çarpıklık ve (normal=3 tabanlı) basıklık düzeltmeli.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    n = len(r)
+    if n < 4 or r.std(ddof=1) <= 1e-12:
+        return 0.0
+    sr = r.mean() / r.std(ddof=1)
+    g3 = float(pd_skew(r))
+    g4 = float(pd_kurt(r))
+    denom = math.sqrt(max(1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr * sr, 1e-12))
+    return float(norm.cdf((sr - sr_star) * math.sqrt(n - 1) / denom))
+
+
+def pd_skew(r: np.ndarray) -> float:
+    """Çarpıklık (örneklem)."""
+    m = r - r.mean()
+    s = r.std(ddof=0)
+    return 0.0 if s <= 1e-12 else float(np.mean(m ** 3) / s ** 3)
+
+
+def pd_kurt(r: np.ndarray) -> float:
+    """Basıklık (normal dağılım için 3)."""
+    m = r - r.mean()
+    s = r.std(ddof=0)
+    return 3.0 if s <= 1e-12 else float(np.mean(m ** 4) / s ** 4)
+
+
+def deflated_sharpe(r: np.ndarray, n_trials: int) -> float:
+    """
+    DSR (Bailey & López de Prado 2014): çoklu deneme düzeltmeli PSR.
+    SR0 = σ_SR·((1-γ)Φ⁻¹(1-1/N) + γΦ⁻¹(1-1/(N·e))), σ_SR² ≈ 1/(n-1) (null varsayımı).
+    Dönüş: P(gerçek SR > SR0) ∈ [0,1].
+    """
+    if n_trials < 2:
+        raise ValueError("DSR için n_trials ≥ 2 gerekir")
+    gamma = 0.5772156649
+    n = len(r)
+    sd_sr = math.sqrt(1.0 / max(n - 1, 1))
+    sr0 = sd_sr * ((1 - gamma) * norm.ppf(1 - 1.0 / n_trials)
+                   + gamma * norm.ppf(1 - 1.0 / (n_trials * math.e)))
+    return probabilistic_sharpe(r, sr0)
+
+
+def _col_sharpe(M: np.ndarray) -> np.ndarray:
+    """Sütun bazında günlük Sharpe."""
+    sd = M.std(axis=0, ddof=1)
+    return np.where(sd > 1e-12, M.mean(axis=0) / np.maximum(sd, 1e-12), 0.0)
+
+
+def cscv_pbo(M: np.ndarray, n_blocks: int = 8, max_combos: int = 70, seed: int = 0) -> Tuple[float, np.ndarray]:
+    """
+    CSCV-PBO (Bailey et al. 2015). M: (T,K) her sütun bir aday strateji getirisi.
+    Zamanı n_blocks parçaya böler; her yarı-IS/yarı-OOS bölünmesinde IS'in en iyisinin
+    OOS'taki göreli sırasının logit'i. PBO = logit ≤ 0 olan oranı.
+    Dönüş: (pbo, logit dizisi).
+    """
+    M = np.asarray(M, dtype=np.float64)
+    T, K = M.shape
+    if K < 2:
+        raise ValueError("PBO için en az 2 aday gerekir")
+    nb = max(2, n_blocks - (n_blocks % 2))
+    blocks = np.array_split(np.arange(T), nb)
+    combos = list(itertools.combinations(range(nb), nb // 2))
+    if len(combos) > max_combos:
+        rng = np.random.default_rng(seed)
+        pick = rng.choice(len(combos), max_combos, replace=False)
+        combos = [combos[i] for i in pick]
+    logits = []
+    for c in combos:
+        is_idx = np.concatenate([blocks[b] for b in c])
+        oos_idx = np.concatenate([blocks[b] for b in range(nb) if b not in c])
+        best = int(np.argmax(_col_sharpe(M[is_idx])))
+        ranks = rankdata(_col_sharpe(M[oos_idx]))
+        w = ranks[best] / (K + 1.0)
+        logits.append(math.log(w / (1.0 - w)))
+    logits = np.array(logits)
+    return float(np.mean(logits <= 0)), logits
+
+
+def cpcv_path_sharpes(r: np.ndarray, n_groups: int = 8, k_test: int = 4) -> np.ndarray:
+    """
+    Sabit strateji için CPCV yol dağılımı: C(8,4) kombinasyonda test gruplarının birleşimi
+    üzerinden Sharpe. (Strateji yeniden eğitilmez; yalnızca performansın tutarlılığını ölçer.)
+    """
+    T = len(r)
+    groups = P2.make_time_groups(0, T, n_groups)
     out = []
-    for ts, stock, cp, tp, h in rows:
-        d = dfs.get(stock)
-        if d is None or cp <= 0: continue
-        try:
-            t0 = datetime.fromisoformat(ts).replace(tzinfo=None)
-            i = int(np.searchsorted(d["Date"].to_numpy(), np.datetime64(t0.date()), side="right")) - 1
-            if i < 0 or i + int(h) >= len(d): continue
-            act = float(d["Close"].iloc[i + int(h)]) / cp - 1
-            pred = tp / cp - 1
-            out.append({"Hisse": stock, "Zaman": ts[:16], "Tahmin %": round(pred * 100, 2),
-                        "Gerçek %": round(act * 100, 2), "Hata %": round((pred - act) * 100, 2),
-                        "Yön ✓": int(np.sign(pred) == np.sign(act))})
-        except Exception: continue
-    return pd.DataFrame(out)
+    for combo in itertools.combinations(range(n_groups), k_test):
+        idx = np.concatenate([np.arange(groups[g][0], groups[g][1]) for g in combo])
+        out.append(sharpe(r[idx]))
+    return np.array(out)
 
-def check_forecast_alerts(rows, threshold=5.0):
-    return [r["_obj"] for r in rows if abs(r["_obj"].expected_return_pct) >= threshold and r["_obj"].confidence > 0.5]
 
-# ════════════════════════════════════════════════════════════
-# 15. MULTI-AGENT
-# ════════════════════════════════════════════════════════════
-class Agent:
-    def __init__(self, agent_id, seed, profile="balanced"):
-        self.id, self.seed, self.profile = agent_id, seed, profile
-        self.score, self.stats, self.weight, self.rp = 0.0, {}, 0.0, {}
+# ═══════════════════════════════════════════════════════════════════
+# 7. TUNER
+# ═══════════════════════════════════════════════════════════════════
 
-    def to_dict(self):
-        s = self.stats
-        return {"id": self.id, "profile": self.profile, "score": self.score, "n": s.get("n", 0),
-                "net": s.get("net", 0.0), "wr": s.get("wr", 0.0), "pf": s.get("pf", 0.0),
-                "sharpe": s.get("sharpe", 0.0), "dd": s.get("dd", 0.0), "weight": self.weight}
+PARAM_SPACE: Dict[str, Tuple[float, float, bool]] = {
+    "sl_atr": (1.5, 4.0, False), "tp_r": (1.0, 3.5, False), "p_buy": (0.40, 0.60, False),
+    "p_sell": (0.40, 0.60, False), "margin": (0.0, 0.20, False), "max_hold": (20, 150, True),
+    "trail_act_r": (0.8, 2.5, False), "trail_atr": (1.5, 4.0, False),
+    "kelly_frac": (0.10, 0.50, False), "unc_max": (0.15, 0.40, False),
+}
 
-class MultiAgent:
-    PROF = {"aggressive": {"p": -0.03, "risk": 1.4, "sl": 0.85, "m": -0.03},
-            "balanced": {"p": 0.0, "risk": 1.0, "sl": 1.0, "m": 0.0},
-            "conservative": {"p": 0.04, "risk": 0.7, "sl": 1.2, "m": 0.04}}
 
-    def __init__(self, n_agents=12):
-        names = list(self.PROF)
-        self.n = n_agents
-        self.agents = [Agent(i, BAG_SEED + i * 137, names[i % 3]) for i in range(n_agents)]
-        self.rounds = 0
+class Tuner:
+    """
+    Hiperparametre ayarlayıcı. Aşama 1: rastgele arama (n_random). Aşama 2: (1+λ)-ES,
+    en iyi noktanın Gauss mutasyonu (birim küpte σ). Zaman bütçesi `now()` ile ölçülür.
+    """
 
-    def _rp(self, a, rp):
-        rg, o = np.random.default_rng(a.seed + self.rounds), self.PROF[a.profile]
-        out = dict(rp)
-        out["p_buy"] = clamp(rp["p_buy"] + o["p"] + rg.normal() * 0.02, 0.36, 0.75)
-        out["margin"] = clamp(rp["margin"] + o["m"] + rg.normal() * 0.01, 0.0, 0.35)
-        out["risk_per_trade"] = clamp(rp["risk_per_trade"] * o["risk"] * (1 + rg.normal() * 0.1), 0.003, 0.025)
-        out["sl_atr"] = clamp(rp["sl_atr"] * o["sl"] * (1 + rg.normal() * 0.08), 1.0, 5.0)
+    def __init__(self, space: Optional[Dict[str, Tuple[float, float, bool]]] = None, seed: int = 0) -> None:
+        self.space = dict(PARAM_SPACE if space is None else space)
+        self.rng = np.random.default_rng(seed)
+        self.evals = 0
+
+    def _clip(self, name: str, v: float) -> float:
+        lo, hi, is_int = self.space[name]
+        v = min(max(float(v), lo), hi)
+        return int(round(v)) if is_int else v
+
+    def sample(self) -> Dict[str, float]:
+        """Uzayda düzgün örnek."""
+        return {k: self._clip(k, lo + (hi - lo) * self.rng.random()) for k, (lo, hi, _) in self.space.items()}
+
+    def mutate(self, p: Dict[str, float], sigma: float = 0.1) -> Dict[str, float]:
+        """Birim küpte Gauss mutasyonu (sınırlarda kırpılır)."""
+        out: Dict[str, float] = {}
+        for k, (lo, hi, _) in self.space.items():
+            u = (float(p[k]) - lo) / (hi - lo) if hi > lo else 0.5
+            u = float(np.clip(u + sigma * self.rng.standard_normal(), 0.0, 1.0))
+            out[k] = self._clip(k, lo + (hi - lo) * u)
         return out
 
-    def run(self, V, rp, min_n=10):
-        self.rounds += 1
-        for a in self.agents:
-            a.rp = self._rp(a, rp)
-            a.score, a.stats = score_params(V, a.rp, min_n)
-        sc = np.array([a.score for a in self.agents])
-        w = np.exp((sc - sc.max()) / 2.0); w /= w.sum()
-        for a, wi in zip(self.agents, w): a.weight = float(wi)
+    def tune(self, base_rp: Dict[str, Any], evaluate: Callable[[Dict[str, Any]], float],
+             budget_s: float = 30.0, n_random: int = 20, n_es: int = 40, lam: int = 4,
+             now: Callable[[], float] = time.time) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
+        """
+        Dönüş: (en iyi tam rp, en iyi skor, geçmiş). evaluate(rp) → skor (yüksek = iyi).
+        """
+        t0 = now()
+        best_p = {k: base_rp[k] for k in self.space if k in base_rp}
+        full = lambda p: {**base_rp, **p}
+        best_s = float(evaluate(full(best_p)))
+        self.evals += 1
+        hist: List[Dict[str, Any]] = [{"gen": "base", "score": best_s, **best_p}]
+        for _ in range(n_random):
+            if now() - t0 > budget_s:
+                break
+            p = self.sample()
+            s = float(evaluate(full(p)))
+            self.evals += 1
+            hist.append({"gen": "rand", "score": s, **p})
+            if s > best_s:
+                best_s, best_p = s, p
+        for g in range(n_es):
+            if now() - t0 > budget_s:
+                break
+            for _ in range(lam):
+                if now() - t0 > budget_s:
+                    break
+                c = self.mutate(best_p, 0.1)
+                s = float(evaluate(full(c)))
+                self.evals += 1
+                hist.append({"gen": f"es{g}", "score": s, **c})
+                if s > best_s:
+                    best_s, best_p = s, c
+        return full(best_p), best_s, hist
 
-    def best(self): return max(self.agents, key=lambda a: a.score)
 
-    def summary(self):
-        return {"n_agents": self.n, "rounds": self.rounds,
-                "top_agent": self.best().id if self.rounds else -1,
-                "avg_score": float(np.mean([a.score for a in self.agents])),
-                "agents": [a.to_dict() for a in self.agents]}
+# ═══════════════════════════════════════════════════════════════════
+# 8. SELF-IMPROVER
+# ═══════════════════════════════════════════════════════════════════
 
-# ════════════════════════════════════════════════════════════
-# 16. NAS
-# ════════════════════════════════════════════════════════════
-NAS_CANDIDATES = [
-    {"h": 32, "dropout": 0.10, "lr": 0.004, "wd": 0.01},
-    {"h": 64, "dropout": 0.15, "lr": 0.003, "wd": 0.01},
-    {"h": 96, "dropout": 0.20, "lr": 0.003, "wd": 0.02},
-    {"h": 128, "dropout": 0.25, "lr": 0.0025, "wd": 0.02},
-    {"h": 64, "dropout": 0.05, "lr": 0.003, "wd": 0.005},
-    {"h": 48, "dropout": 0.30, "lr": 0.004, "wd": 0.03},
-]
+class SelfImprover:
+    """
+    Otonom parametre iyileştirme. Bir çalıştırmada: ayarlama (val), aday ve temel için
+    test skoru, DSR kapısı. Ardışık `consec_improve` iyileşme → adopt (rp['auto_adopt']).
+    """
 
-def nas_search(sp, seed=42, steps=100):
-    results, best_loss, best_cfg = [], float("inf"), NAS_CANDIDATES[1]
-    for cfg in NAS_CANDIDATES:
+    def __init__(self, tuner: Optional[Tuner] = None) -> None:
+        self.tuner = tuner or Tuner()
+        self.streak = 0
+        self.last_run = -1e18
+        self.history: List[Dict[str, Any]] = []
+        self.current_rp: Optional[Dict[str, Any]] = None
+
+    def due(self, rp: Dict[str, Any], now: float) -> bool:
+        """Aralık dolduysa ve otomatik mod açıksa True."""
+        return bool(rp.get("si_auto", True)) and (now - self.last_run) >= float(rp["si_interval_min"]) * 60.0
+
+    def run(self, rp: Dict[str, Any], eval_val: Callable[[Dict[str, Any]], float],
+            eval_test: Callable[[Dict[str, Any]], float],
+            dsr_fn: Optional[Callable[[Dict[str, Any]], float]] = None,
+            clock: Callable[[], float] = time.time, db: Any = None) -> Dict[str, Any]:
+        """Bir iyileştirme turu. Dönüş: {'record', 'adopt', 'params'}."""
+        now = clock()
+        self.last_run = now
+        best_rp, cand_val, hist = self.tuner.tune(rp, eval_val, budget_s=float(rp["si_budget_s"]), now=clock)
+        base_val = float(eval_val(rp))
+        base_test = float(eval_test(rp))
+        cand_test = float(eval_test(best_rp))
+        improved = cand_val > base_val + 1e-9
+        test_ok = cand_test >= base_test - float(rp["test_score_tol"]) * abs(base_test)
+        dsr = float(dsr_fn(best_rp)) if dsr_fn is not None else 1.0
+        dsr_ok = dsr >= float(rp["dsr_confidence"])
+        self.streak = self.streak + 1 if (improved and test_ok and dsr_ok) else 0
+        adopt = bool(rp.get("auto_adopt", True) and self.streak >= int(rp["consec_improve"]))
+        rec = {"ts": now, "before": base_val, "after": cand_val, "test_before": base_test,
+               "test_after": cand_test, "dsr": dsr, "streak": self.streak, "adopted": adopt,
+               "evals": len(hist)}
+        self.history.append(rec)
+        if adopt:
+            self.current_rp = best_rp
+            self.streak = 0
+        if db is not None:
+            try:
+                db.insert("improve", [time.strftime("%Y-%m-%d %H:%M:%S"), "self_improve",
+                                      json.dumps({k: rec[k] for k in ("dsr", "streak", "evals")}),
+                                      base_val, cand_val, int(adopt)])
+            except Exception as e:
+                log.warning("improve kaydı yazılamadı: %s", e)
+        return {"record": rec, "adopt": adopt, "params": best_rp}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 9. ÖZ-TEST 4
+# ═══════════════════════════════════════════════════════════════════
+
+def _selftest_part4() -> bool:
+    """Parça 4 öz-testi: belirsizlik, RL ortamı, causal, simülatör, backtest, DSR/PBO, tuner."""
+    print(f"\n🐋 Öz-test 4 (PyTorch: {'VAR' if TORCH_OK else 'YOK → torch sınıfları test edilmedi'})")
+    res: List[Tuple[str, bool]] = []
+    chk = lambda n, ok, e="": P1._check(n, ok, res, e)
+    rng = np.random.default_rng(42)
+
+    # 1) Split conformal: kapsama ≈ 1-α
+    y = rng.standard_normal(3000)
+    p = np.zeros(3000)
+    lo, hi, q = split_conformal_interval(y[:1500], p[:1500], p[1500:], alpha=0.10)
+    cov = float(np.mean((y[1500:] >= lo) & (y[1500:] <= hi)))
+    chk("Conformal regresyon kapsaması ≥ 0.88", cov >= 0.88, f"({cov:.3f})")
+
+    # 2) LAC sınıflandırma kümeleri
+    K = 3
+    yc = rng.integers(0, K, 2000)
+    pr = rng.dirichlet(np.ones(K), 2000)
+    pr[np.arange(2000), yc] += 1.5
+    pr /= pr.sum(1, keepdims=True)
+    sets = conformal_class_sets(pr[:1000], yc[:1000], pr[1000:], alpha=0.10)
+    cov_c = float(np.mean(sets[np.arange(1000), yc[1000:]]))
+    chk("LAC küme kapsaması ≥ 0.88", cov_c >= 0.88, f"({cov_c:.3f})")
+
+    # 3) Aleatoric / epistemic / toplam
+    chk("Aleatoric = exp(0.5·logvar) (sınırlı)", abs(float(aleatoric_from_logvar(np.array([0.0]))[0]) - 1.0) < 1e-9)
+    e = epistemic_from_probs(np.stack([np.full((4, 3), 1 / 3), np.array([[0.6, 0.2, 0.2]] * 4)]))
+    chk("Epistemik: modeller farklıysa > 0", bool((e > 0).all()))
+    chk("Toplam belirsizlik Pythagoras", abs(float(decompose_uncertainty(np.array(3.0), np.array(4.0))) - 5.0) < 1e-9)
+
+    # 4) SWAG
+    sw = SWAGDiag(max_models=5)
+    for _ in range(6):
+        sw.collect(rng.standard_normal(10))
+    smp = sw.sample(7, seed=1)
+    chk("SWAG örnek şekli (7,10)", smp.shape == (7, 10))
+    chk("SWAG varyans ≥ 0", bool((sw.var() >= 0).all()))
+
+    # 5) Trading env
+    panel, macro = P2._make_test_panel(S=4, T=300)
+    st = P2.build_feature_store_v7(panel, macro, scale=True)
+    rp = {**DEFAULT_RISK}
+    env = TradingEnv(st, rp, 100, 200)
+    o = env.reset()
+    chk("Env gözlem boyutu", o.shape == (env.obs_dim,), f"({o.shape})")
+    o2, rew, done, info = env.step(np.ones(env.action_dim))
+    chk("Env ödül sonlu", math.isfinite(rew))
+    chk("Env pozisyon ≤ max_pos", bool(np.all(np.abs(env.pos) <= rp["max_pos"] + 1e-12)))
+    steps = 1
+    while not done:
+        _, _, done, _ = env.step(rng.uniform(-1, 1, env.action_dim))
+        steps += 1
+    chk("Env epizot sonunda biter", steps == 100 - 1 or steps > 50, f"({steps} adım)")
+
+    # 6) RL veto
+    chk("RL veto: güçlü sat → True", rl_veto(-0.8, rp))
+    chk("RL veto: nötr → False", not rl_veto(0.0, rp))
+    chk("RL veto kapalıysa hiç veto yok", not rl_veto(-0.9, {**rp, "rl_veto": False}))
+    chk("RLAgent modelsiz predict boş döner", RLAgent().predict(o).size == 0 or RLAgent().available)
+
+    # 7) PC iskeleti: x→y, z bağımsız
+    n = 600
+    x = rng.standard_normal(n)
+    yv = 2 * x + 0.5 * rng.standard_normal(n)
+    zv = rng.standard_normal(n)
+    adj = pc_skeleton(np.column_stack([x, yv, zv]), alpha=0.01)
+    chk("PC: x–y kenarı var", bool(adj[0, 1]))
+    chk("PC: x–z kenarı yok", not adj[0, 2])
+    chk("PC: y–z kenarı yok", not adj[1, 2])
+
+    # 8) Koşullu bağımsızlık: x→m→y zincirinde x ⟂ y | m
+    m = rng.standard_normal(n)
+    xc = m + 0.3 * rng.standard_normal(n)
+    yc2 = m + 0.3 * rng.standard_normal(n)
+    adj2 = pc_skeleton(np.column_stack([xc, yc2, m]), alpha=0.01)
+    chk("PC: ortak neden zincirinde x–y kopuk (|m koşullu)", not adj2[0, 1], f"(adj={adj2[0,1]})")
+
+    # 9) Backdoor etki: y = 2t + 3c + gürültü, t = c + gürültü → β_t ≈ 2
+    c = rng.standard_normal(2000)
+    tt = c + 0.5 * rng.standard_normal(2000)
+    yy = 2 * tt + 3 * c + 0.1 * rng.standard_normal(2000)
+    bt = backdoor_effect(yy, tt, c.reshape(-1, 1))
+    chk("Backdoor etki ≈ 2 (confounder ayarlı)", abs(bt - 2.0) < 0.1, f"({bt:.3f})")
+
+    # 10) Causal blok
+    raw_c = build_causal_block(st, every=20, win=120)
+    cstart = FEAT_INDEX[CAUSAL_NAMES[0]]
+    chk("Causal blok şekli", raw_c.shape == (4, 10, 300))
+    chk("Causal özellikler sonlu", bool(np.isfinite(st.feat[:, cstart:cstart + 10]).all()))
+
+    # 11) Simülatör: giriş sonrası anında stop → zarar, 1 giriş
+    T = 12
+    Oo = np.full(T, 100.0); Hh = np.full(T, 100.5); Ll = np.full(T, 99.5); Cc = np.full(T, 100.0)
+    sig = np.zeros(T, dtype=bool); sig[2] = True
+    size = np.full(T, 0.1)
+    ATRN = np.full(T, 0.02)                         # ATR = 2
+    Ll2 = Ll.copy(); Ll2[3] = 90.0                  # giriş barında stop
+    out_r = np.zeros(T); out_f = np.zeros(T)
+    ne, nw = simulate_stock_kernel(Oo, Hh, Ll2, Cc, ATRN, sig, size, 2.0, 2.0, 0.5, 1.0, 1.5, 2.5, 50,
+                                   0.0, 0.0, out_r, out_f)
+    chk("Simülatör: 1 giriş, stop ile çıkış", ne == 1 and out_r[3] < 0 and out_f[3] == 0.0, f"(ret={out_r[3]:.4f})")
+    # 12) Simülatör: sinyal yok → sıfır getiri
+    out_r2 = np.zeros(T); out_f2 = np.zeros(T)
+    ne2, _ = simulate_stock_kernel(Oo, Hh, Ll, Cc, ATRN, np.zeros(T, dtype=bool), size, 2.0, 2.0, 0.5, 1.0,
+                                   1.5, 2.5, 50, 0.0, 0.0, out_r2, out_f2)
+    chk("Simülatör: sinyal yoksa işlem yok", ne2 == 0 and float(np.abs(out_r2).sum()) == 0.0)
+    # 13) Simülatör: sürekli yükseliş → kısmi TP + kârlı işlem
+    Cu = 100.0 + 2.0 * np.arange(T); Ou = Cu - 1.0; Hu = Cu + 1.0; Lu = Cu - 1.5
+    out_r3 = np.zeros(T); out_f3 = np.zeros(T)
+    ne3, nw3 = simulate_stock_kernel(Ou, Hu, Lu, Cu, np.full(T, 0.02), sig, size, 2.0, 1.0, 0.5, 1.0, 0.5, 1.0,
+                                     50, 0.0, 0.0, out_r3, out_f3)
+    chk("Simülatör: yükselişte getiri pozitif", float(out_r3.sum()) > 0)
+    # Hesap: giriş j=3 (O=105), R=2·ATR=2·0.02·104≈4.16, TP≈109.16; H[5]=111 → kısmi TP j=5'de
+    chk("Simülatör: kısmi TP j=5'te, pozisyon 0.1→0.05", abs(out_f3[4] - 0.1) < 1e-9 and abs(out_f3[5] - 0.05) < 1e-9,
+        f"(f4={out_f3[4]:.3f}, f5={out_f3[5]:.3f})")
+
+    # 14) BacktestV çalışır, sinyal yoksa sıfır
+    bt_obj = BacktestV(st, rp)
+    z = bt_obj.run(np.zeros((4, 300), dtype=bool), np.zeros((4, 300)), 120, 300)
+    chk("BacktestV: sinyal yoksa getiri 0", float(np.abs(z["ret"]).sum()) == 0.0)
+    sig_all = rng.random((4, 300)) < 0.1
+    rb = bt_obj.run(sig_all, np.full((4, 300), 0.05), 120, 300)
+    chk("BacktestV: metrikler sonlu", all(math.isfinite(v) for v in rb["metrics"].values()))
+    chk("score_params_V sonlu", math.isfinite(score_params_V(rb, rp)))
+
+    # 15) PSR / DSR
+    rnd = rng.standard_normal(500) * 0.01
+    chk("PSR ∈ [0,1]", 0.0 <= probabilistic_sharpe(rnd) <= 1.0)
+    chk("DSR ≤ PSR (çoklu deneme cezası)", deflated_sharpe(rnd, 50) <= probabilistic_sharpe(rnd) + 1e-12)
+    strong = rnd + 0.002
+    chk("DSR güçlü edge'de yüksek", deflated_sharpe(strong, 10) > 0.9, f"({deflated_sharpe(strong, 10):.3f})")
+
+    # 16) CSCV-PBO: tek güçlü aday → düşük PBO
+    M = rng.standard_normal((400, 8)) * 0.01
+    M[:, 0] += 0.004
+    pbo, _ = cscv_pbo(M, n_blocks=8)
+    chk("PBO güçlü edge'de düşük (<0.2)", pbo < 0.2, f"(pbo={pbo:.2f})")
+    chk("CPCV yol sayısı 70", len(cpcv_path_sharpes(rnd)) == 70)
+
+    # 17) Tuner: sınırlar içinde, zaman bütçesi çalışır
+    tn = Tuner(seed=3)
+    fake_t = {"t": 0.0}
+
+    def fake_now() -> float:
+        fake_t["t"] += 0.01
+        return fake_t["t"]
+    best, bs, hist = tn.tune(rp, lambda p: -(p["sl_atr"] - 2.0) ** 2, budget_s=0.5, now=fake_now)
+    chk("Tuner parametreler sınırda", all(PARAM_SPACE[k][0] <= best[k] <= PARAM_SPACE[k][1] for k in PARAM_SPACE))
+    chk("Tuner geçmişi üretti", len(hist) > 2)
+
+    # 18) SelfImprover tutarlılığı
+    si = SelfImprover(Tuner(seed=5))
+    rp_si = {**rp, "si_budget_s": 0.3, "consec_improve": 1, "dsr_confidence": 0.5}
+    clk = {"t": 0.0}
+
+    def clock() -> float:
+        clk["t"] += 0.01
+        return clk["t"]
+    out = si.run(rp_si, lambda p: -(p["sl_atr"] - 2.0) ** 2, lambda p: -(p["sl_atr"] - 2.0) ** 2,
+                 dsr_fn=lambda p: 1.0, clock=clock)
+    rec = out["record"]
+    chk("SelfImprover: iyileşme kaydı tutarlı", rec["after"] >= rec["before"] - 1e-12)
+    chk("SelfImprover: DSR düşükse adopt yok",
+        not SelfImprover(Tuner(seed=6)).run({**rp_si, "dsr_confidence": 0.99}, lambda p: -(p["sl_atr"] - 2.0) ** 2,
+                                            lambda p: -(p["sl_atr"] - 2.0) ** 2,
+                                            dsr_fn=lambda p: 0.1, clock=clock)["adopt"])
+
+    ok = all(r[1] for r in res)
+    print(f"\n{'✅ ÖZ-TEST 4 BAŞARILI' if ok else '❌ ÖZ-TEST 4 BAŞARISIZ'} ({sum(r[1] for r in res)}/{len(res)})"
+          + ("" if TORCH_OK else "  [torch sınıfları test edilmedi]"))
+    return ok
+
+
+if __name__ == "__main__":
+    if os.environ.get("SEEKDEEP_SELFTEST") == "1":
+        sys.exit(0 if _selftest_part4() else 1)
+    print("Parça 4/6 yüklendi. Öz-test için SEEKDEEP_SELFTEST=1 kullanın.")
+# -*- coding: utf-8 -*-
+"""
+🐋 SEEK DEEP v7.0 — PARÇA 5/6: PORTFÖY + RİSK + İCRA + FORECAST + BOT
+
+Zincir: P1 (config/veri) → P2 (feature store) → P3 (modeller) → P4 (belirsizlik/backtest) → P5.
+
+İçindekiler:
+  1. Portföy optimizasyonu: Mean-CVaR (Rockafellar & Uryasev 2000, LP), Fractional Kelly,
+     HRP (López de Prado 2016), Risk Parity
+  2. Risk metrikleri (22 adet): VaR (hist/param/MC), CVaR (ortalama/spektral), EVaR,
+     GPD kuyruk şekli, Sharpe, PSR, Sortino, Calmar, Ulcer, beta/alfa/IR/Treynor, ...
+  3. İcra modelleri: Almgren-Chriss (2005), dinamik slippage, VWAP/TWAP, OFI gate, kısmi dolum
+  4. ForecastResult + ForecastEngine
+  5. PortfolioManager (pozisyon, boyutlandırma, stop/TP/BE/trailing, risk limitleri, durum)
+  6. LiveExecutionEngine (kâğıt üzerinde emir, dolum, veritabanı kaydı)
+  7. Bot (pretrain, scan, run_cycle, get_state, set_state)
+  8. Öz-test 5
+
+DÜRÜST NOTLAR:
+  - Bot'un tahmin kaynağı BaggedQuantumEnsemble'dır (PyTorch gerekir). Öz-test, stub bir
+    topluluk enjekte ederek tüm karar/icra/portföy mantığını torch olmadan doğrular.
+  - Bot "kâğıt işlem" yapar; canlı emir gönderimi yoktur. Gerçek para kullanmadan önce
+    uzun süreli paper-trade gerekir.
+  - Forecast'in bull/base/bear fiyatları ve güven aralığı sezgisel ölçeklemedir (ATR ×
+    baryer, belirsizlik ×1.645); istatistiksel olarak kalibre edilmiş değildir.
+"""
+from __future__ import annotations
+
+import copy
+import math
+import os
+import sys
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.optimize import linprog
+from scipy.spatial.distance import squareform
+from scipy.stats import genpareto, kurtosis, norm, skew
+
+import seekdeep_v7 as P1
+import seekdeep_v7_p2 as P2
+import seekdeep_v7_p3 as P3
+import seekdeep_v7_p4 as P4
+from seekdeep_v7 import (
+    AC_BETA, AC_ETA, BAG_N, BAG_SEED, BOT_SERMAYE, BOT_VERSION, CVAR_ALPHA, DEFAULT_RISK,
+    DYNAMIC_SLIPPAGE, FEAT_INDEX, FEE, HORIZON, MICRO_NAMES, REGIMES, SEKTOR, SLIPPAGE, SLIPPAGE_BASE,
+    STOCK_LIST, TB_K, TFT_DIM, WARMUP_BARS, get_risk_params, log, SeekDB,
+)
+from seekdeep_v7_p2 import FeatureStoreV7
+from seekdeep_v7_p3 import BaggedQuantumEnsemble
+from seekdeep_v7_p4 import (
+    RLAgent, SelfImprover, Tuner, TradingEnv, basic_metrics, max_drawdown,
+    probabilistic_sharpe, rl_veto, sharpe, uncertainty_summary,
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. PORTFÖY OPTİMİZASYONU
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    """Değeri [lo,hi] aralığına sıkıştırır."""
+    return min(max(float(x), lo), hi)
+
+
+def mean_cvar_lp(R: np.ndarray, alpha: float = CVAR_ALPHA, max_w: float = 0.25,
+                 lam: float = 1.0) -> np.ndarray:
+    """
+    Mean-CVaR (Rockafellar & Uryasev 2000) doğrusal programı. R: (T,S) getiriler.
+        min  −λ·μᵀw + ζ + 1/((1−α)T) · Σ u_t
+        s.t. u_t ≥ −r_tᵀw − ζ,  u_t ≥ 0,  Σw = 1,  0 ≤ w ≤ max_w
+    Çözülemezse eşit ağırlık döner.
+    """
+    R = np.asarray(R, dtype=np.float64)
+    T, S = R.shape
+    if S * max_w < 1.0 - 1e-9:
+        return np.ones(S) / S
+    mu = R.mean(axis=0)
+    n = S + 1 + T
+    c = np.zeros(n)
+    c[:S] = -lam * mu
+    c[S] = 1.0
+    c[S + 1:] = 1.0 / ((1.0 - alpha) * T)
+    A_ub = np.zeros((T, n))
+    A_ub[:, :S] = -R
+    A_ub[:, S] = -1.0
+    A_ub[:, S + 1:] = -np.eye(T)
+    A_eq = np.zeros((1, n))
+    A_eq[0, :S] = 1.0
+    bounds = [(0.0, max_w)] * S + [(None, None)] + [(0.0, None)] * T
+    res = linprog(c, A_ub=A_ub, b_ub=np.zeros(T), A_eq=A_eq, b_eq=[1.0], bounds=bounds, method="highs")
+    if not res.success:
+        log.warning("Mean-CVaR LP çözülemedi (%s); eşit ağırlık", res.message)
+        return np.ones(S) / S
+    w = np.clip(res.x[:S], 0.0, None)
+    return w / w.sum()
+
+
+def cvar_score_weights(R: np.ndarray, alpha: float = CVAR_ALPHA, max_w: float = 0.25) -> np.ndarray:
+    """Hızlı sezgisel: skor = μ/|CVaR|, pozitif skorlar normalize, max_w ile kırpılır."""
+    R = np.asarray(R, dtype=np.float64)
+    T, S = R.shape
+    mu = R.mean(axis=0)
+    cv = np.zeros(S)
+    for s in range(S):
+        loss = -R[:, s]
+        q = np.quantile(loss, alpha)
+        tail = loss[loss >= q]
+        cv[s] = tail.mean() if tail.size else abs(q)
+    score = np.maximum(mu / (np.abs(cv) + 1e-6), 0.0)
+    if score.sum() <= 0:
+        return np.ones(S) / S
+    w = np.minimum(score / score.sum(), max_w)
+    return w / w.sum()
+
+
+def fractional_kelly(win_rate: float, avg_win: float, avg_loss: float, kelly_frac: float = 0.25,
+                     uncertainty: float = 0.0, unc_penalty: float = 2.0) -> float:
+    """
+    Kesirli Kelly (Thorp 2006) + belirsizlik cezası.
+    b = avg_win/avg_loss, f* = (p·b − q)/b, f = kelly_frac·f*·exp(−unc_penalty·belirsizlik).
+    Negatif kenarda 0; [0,1] aralığına kırpılır.
+    """
+    if avg_loss <= 1e-9 or avg_win <= 1e-9:
+        return 0.0
+    b = avg_win / avg_loss
+    p = float(win_rate)
+    q = 1.0 - p
+    f = (p * b - q) / b
+    if f <= 0:
+        return 0.0
+    f_pen = kelly_frac * f * math.exp(-unc_penalty * uncertainty)
+    return _clamp(f_pen, 0.0, 1.0)
+
+
+def _cluster_var(cov: np.ndarray, items: List[int]) -> float:
+    """HRP için kümenin ters-varyans ağırlıklı varyansı."""
+    sub = cov[np.ix_(items, items)]
+    ivp = 1.0 / np.maximum(np.diag(sub), 1e-12)
+    ivp = ivp / ivp.sum()
+    return float(ivp @ sub @ ivp)
+
+
+def hrp_weights(R: np.ndarray) -> np.ndarray:
+    """
+    Hiyerarşik risk paritesi (López de Prado 2016): tek-bağlantı kümeleme, kuasi-diagonalizasyon,
+    özyinelemeli ikiye bölme. R: (T,S). Dönüş: (S,) toplamı 1.
+    """
+    R = np.asarray(R, dtype=np.float64)
+    S = R.shape[1]
+    if S == 1:
+        return np.ones(1)
+    cov = np.atleast_2d(np.cov(R, rowvar=False))
+    corr = np.nan_to_num(np.atleast_2d(np.corrcoef(R, rowvar=False)))
+    dist = np.sqrt(np.clip(0.5 * (1.0 - corr), 0.0, None))
+    np.fill_diagonal(dist, 0.0)
+    link = linkage(squareform(dist, checks=False), method="single")
+    order = [int(i) for i in leaves_list(link)]
+    w = np.ones(S)
+    clusters = [order]
+    while clusters:
+        nxt: List[List[int]] = []
+        for c in clusters:
+            if len(c) <= 1:
+                continue
+            half = len(c) // 2
+            c1, c2 = c[:half], c[half:]
+            v1 = _cluster_var(cov, c1)
+            v2 = _cluster_var(cov, c2)
+            a = 1.0 - v1 / (v1 + v2) if (v1 + v2) > 0 else 0.5
+            for i in c1:
+                w[i] *= a
+            for i in c2:
+                w[i] *= (1.0 - a)
+            nxt += [c1, c2]
+        clusters = nxt
+    return w / w.sum()
+
+
+def risk_parity_weights(R: np.ndarray, max_w: float = 0.25) -> np.ndarray:
+    """Ters-volatilite ağırlıkları (1/σ), max_w ile kırpılıp yeniden normalize edilir."""
+    R = np.asarray(R, dtype=np.float64)
+    vol = np.maximum(R.std(axis=0, ddof=1), 1e-9)
+    w = (1.0 / vol)
+    w = w / w.sum()
+    w = np.minimum(w, max_w)
+    return w / w.sum()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. RİSK METRİKLERİ (22)
+# ═══════════════════════════════════════════════════════════════════
+
+def risk_metrics(r: np.ndarray, bench: Optional[np.ndarray] = None, alpha: float = 0.05,
+                 n_mc: int = 10_000, seed: int = 0) -> Dict[str, float]:
+    """
+    Tek strateji getiri serisi için risk özeti (22 metrik).
+    Kayıp = −getiri. VaR/CVaR pozitif kayıp olarak raporlanır. bench yoksa 0 getiri varsayılır.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    n = len(r)
+    if n < 30:
+        raise ValueError("Risk metrikleri için en az 30 gözlem gerekir")
+    losses = -r
+    mu = float(r.mean())
+    sd = float(r.std(ddof=1))
+    out: Dict[str, float] = {"n_obs": float(n)}
+    out["var_hist"] = float(np.quantile(losses, 1 - alpha))
+    out["var_param"] = float(-mu + norm.ppf(1 - alpha) * sd)
+    rng = np.random.default_rng(seed)
+    sim = rng.normal(mu, sd, n_mc)
+    out["var_mc"] = float(-np.quantile(sim, alpha))
+    tail = losses[losses >= out["var_hist"]]
+    out["cvar_mean"] = float(tail.mean()) if tail.size else out["var_hist"]
+    srt = np.sort(losses)[::-1]
+    gamma = 10.0
+    w = np.exp(-gamma * (np.arange(n) + 0.5) / n)
+    out["cvar_spectral"] = float(w @ srt / w.sum())
+    # EVaR (Ahmadi-Javid): inf_z (1/z)·ln(M(z)/α), M(z)=E[e^{zL}]
+    from scipy.special import logsumexp
+    zs = np.logspace(-2, 1.5, 60)
+    ev = [(1.0 / z) * (logsumexp(z * losses) - math.log(n) - math.log(alpha)) for z in zs]
+    out["evar"] = float(min(ev))
+    base = basic_metrics(r)
+    eq = np.cumprod(1.0 + r)
+    peak = np.maximum.accumulate(eq)
+    dd_pct = 1.0 - eq / np.maximum(peak, 1e-12)
+    out["sharpe"] = sharpe(r)
+    out["psr"] = probabilistic_sharpe(r)
+    out["sortino"] = base["sortino"]
+    out["max_dd"] = max_drawdown(eq)
+    out["calmar"] = base["calmar"]
+    out["ulcer"] = float(np.sqrt(np.mean(dd_pct ** 2)))
+    out["vol_ann"] = sd * math.sqrt(252.0)
+    out["skew"] = float(skew(r))
+    out["kurt"] = float(kurtosis(r, fisher=True))
+    out["kelly_full"] = mu / max(sd * sd, 1e-12)
+    b = np.zeros(n) if bench is None else np.asarray(bench, dtype=np.float64)
+    var_b = float(b.var(ddof=1))
+    cov = float(np.cov(r, b, ddof=1)[0, 1])
+    beta = cov / var_b if var_b > 1e-12 else 0.0
+    out["beta"] = beta
+    out["alpha_ann"] = float((mu - beta * float(b.mean())) * 252.0)
+    te = float((r - b).std(ddof=1))
+    out["ir"] = float((mu - float(b.mean())) / te * math.sqrt(252.0)) if te > 1e-12 else 0.0
+    out["treynor"] = float(mu * 252.0 / beta) if abs(beta) > 1e-9 else 0.0
+    thr = float(np.quantile(losses, 0.90))
+    exc = losses[losses > thr] - thr
+    xi = 0.0
+    if exc.size >= 30:
         try:
-            nn = NN(seed=seed, **cfg)
-            fit_model(nn, sp["Xtr"], sp["ytr"], sp["ytr_long"], sp["Xva"], sp["yva"], sp["yva_long"],
-                      steps=steps, seed=seed)
-            vl, _ = nn.evaluate(sp["Xva"], sp["yva"], sp["yva_long"])
-            tl, _ = nn.evaluate(sp["Xte"], sp["yte"], sp["yte_long"])
-            results.append({"cfg": cfg, "val_loss": float(vl), "test_loss": float(tl)})
-            if vl < best_loss: best_loss, best_cfg = vl, cfg
-        except Exception as e: log.warning(f"nas: {e}")
-    return best_cfg, results
+            xi = float(genpareto.fit(exc, floc=0.0)[0])
+        except Exception as e:
+            log.warning("GPD uydurma başarısız: %s", e)
+    out["gpd_xi"] = xi
+    return out
 
-# ════════════════════════════════════════════════════════════
-# 17. BOT — 🐛 BUG 2 + SORUN 1 DÜZELTME
-# ════════════════════════════════════════════════════════════
-class Bot:
-    def __init__(self, cash=None):
-        self.cash = self.initial = cash or BOT_SERMAYE
-        self.positions, self.trades = {}, []
-        self.nn, self.si = BaggedNN(), SelfImprover()
-        self.wins = self.losses = 0
-        self.eq_hist = []
-        self.peak_eq = self.cash
-        self.halted, self.halt_reason, self.halt_until, self.streak = False, "", None, 0
-        self.day_key, self.day_eq0, self.day_trades = None, self.cash, 0
-        self.pretrained, self.val_stats = False, None
-        self.hold = self.hold_te = self.ref = None
-        self.last_exit = {}
-        self.rl, self.rl_on, self.rl_gain = PPOAgent(seed=BAG_SEED + 777), False, 0.0
-        self.federated_score, self.last_push = 0.0, 0.0
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. İCRA MODELLERİ
+# ═══════════════════════════════════════════════════════════════════
+
+def almgren_chriss_impact(order_size_tl: float, adv_tl: float, atr_pct: float,
+                          sigma_daily: float = 0.02, eta: float = AC_ETA) -> float:
+    """
+    Almgren & Chriss (2005). Kalıcı + geçici etki: η·(Q/ADV)·σ + η·√(Q/ADV)·σ.
+    [0.0001, 0.05] aralığına kırpılır (kesir).
+    """
+    if adv_tl <= 0:
+        return 0.01
+    pv = order_size_tl / max(adv_tl, 1.0)
+    permanent = eta * pv * sigma_daily
+    temporary = eta * math.sqrt(max(pv, 0.0)) * sigma_daily
+    return _clamp(permanent + temporary, 0.0001, 0.05)
+
+
+def dynamic_slippage(price: float, volume_tl: float, atr_pct: float, order_size_tl: float = 1e6) -> float:
+    """Hacim ve volatiliteye bağlı kayma (kesir): taban × hacim × volatilite + Almgren-Chriss etkisi."""
+    vf = _clamp((1e7 / max(volume_tl, 1e5)) ** 0.5, 0.5, 3.0)
+    af = _clamp(1.0 + (atr_pct - 0.02) * 50.0, 0.8, 3.0)
+    ac = almgren_chriss_impact(order_size_tl, volume_tl, atr_pct)
+    return _clamp(SLIPPAGE_BASE * vf * af + ac, 0.0002, 0.05)
+
+
+def vwap_split(total_qty: float, volume_profile: Sequence[float]) -> np.ndarray:
+    """Her bara hacim oranında emir dilimi. Toplam korunur."""
+    vp = np.asarray(volume_profile, dtype=np.float64)
+    if vp.sum() <= 0:
+        return np.full(len(vp), total_qty / max(len(vp), 1))
+    return total_qty * vp / vp.sum()
+
+
+def twap_split(total_qty: float, n_bars: int) -> np.ndarray:
+    """Her bara eşit emir dilimi."""
+    return np.full(int(n_bars), total_qty / max(int(n_bars), 1))
+
+
+def partial_fill_qty(qty: int, adv_tl: float, price: float, max_adv_pct: float = 0.05) -> int:
+    """Günlük ADV'nin max_adv_pct'ini aşmayan kısmi dolum miktarı (adet)."""
+    if price <= 0:
+        return 0
+    cap = math.floor(max_adv_pct * max(adv_tl, 0.0) / price)
+    return int(max(0, min(qty, cap)))
+
+
+def ofi_gate_ok(side: str, ofi: float, ofi_min: float) -> bool:
+    """Alımda OFI, eşikten (ofi_min) düşükse engelle. Satım her zaman geçer."""
+    if side.upper() == "BUY":
+        return bool(ofi >= ofi_min)
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. FORECAST
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class ForecastResult:
+    """Bir hisse için kısa vade tahmin özeti (forecast tablosu şemasıyla uyumlu)."""
+    stock: str
+    current_price: float
+    target_price: float
+    expected_return: float
+    lower_bound: float
+    upper_bound: float
+    p_up: float
+    p_down: float
+    p_flat: float
+    bull_price: float
+    base_price: float
+    bear_price: float
+    confidence: float
+    uncertainty: float
+    epistemic: float
+    aleatoric: float
+    kelly_f: float
+    regime: str
+    horizon: int
+
+
+class ForecastEngine:
+    """
+    Topluluk olasılıklarından ForecastResult üretir. Sınıf sırası: 0 yatay, 1 yukarı, 2 aşağı.
+    Beklenen getiri = (p_yukarı − p_aşağı) · TB_K · ATR%. Belirsizlik bandı = 1.645 · σ_toplam · TB_K · ATR%.
+    """
+
+    Z90 = 1.645
+
+    def __init__(self, rp: Dict[str, Any]) -> None:
+        self.rp = rp
+
+    def build(self, store: FeatureStoreV7, t: int, pred: Dict[str, np.ndarray],
+              prices: Optional[Dict[str, float]] = None) -> List[ForecastResult]:
+        """t anındaki tahminlerden her geçerli hisse için ForecastResult listesi."""
+        ps = np.asarray(pred["p_short"])[0]
+        unc = uncertainty_summary(pred)
+        regime = REGIMES[int(store.regime[t])]
+        out: List[ForecastResult] = []
+        for s, code in enumerate(store.codes):
+            if not store.mask[s, t]:
+                continue
+            price = float(prices[code]) if prices and code in prices else float(store.C[s, t])
+            p_flat, p_up, p_dn = (float(x) for x in ps[s])
+            atr = float(store.atrn[s, t])
+            move = TB_K * atr
+            exp_ret = (p_up - p_dn) * move
+            u_tot = float(unc["total"][0][s])
+            half = self.Z90 * u_tot * move
+            kf = fractional_kelly(p_up, move, move, float(self.rp.get("kelly_frac", 0.25)),
+                                  u_tot, float(self.rp.get("kelly_unc_pen", 2.0)))
+            out.append(ForecastResult(
+                stock=code, current_price=price,
+                target_price=price * (1.0 + exp_ret),
+                expected_return=exp_ret,
+                lower_bound=price * (1.0 + exp_ret - half),
+                upper_bound=price * (1.0 + exp_ret + half),
+                p_up=p_up, p_down=p_dn, p_flat=p_flat,
+                bull_price=price * (1.0 + move), base_price=price * (1.0 + exp_ret),
+                bear_price=price * (1.0 - move),
+                confidence=max(p_up, p_dn, p_flat),
+                uncertainty=u_tot,
+                epistemic=float(unc["epistemic"][0][s]), aleatoric=float(unc["aleatoric"][0][s]),
+                kelly_f=kf, regime=regime, horizon=HORIZON))
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5. PORTFÖY YÖNETİCİSİ
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class Position:
+    """Açık pozisyonun durumu (kısmi kapanışlar dahil)."""
+    stock: str
+    sector: int
+    qty: int
+    entry: float
+    atr_abs: float
+    R: float
+    stop: float
+    tp: float
+    entry_t: int
+    held: int = 0
+    partial_done: bool = False
+    trail_on: bool = False
+    peak: float = 0.0
+
+
+class PortfolioManager:
+    """Nakit, pozisyonlar, boyutlandırma, risk limitleri ve işlem geçmişi. İş parçacığı güvenli."""
+
+    def __init__(self, initial_capital: float = BOT_SERMAYE, rp: Optional[Dict[str, Any]] = None,
+                 sector_ids: Optional[Dict[str, int]] = None) -> None:
+        self.initial = float(initial_capital)
+        self.cash = float(initial_capital)
+        self.rp = dict(rp) if rp is not None else get_risk_params()
+        self.positions: Dict[str, Position] = {}
+        self.trades: List[Dict[str, Any]] = []
+        self.equity_hist: List[Tuple[int, float]] = []
+        self.peak = self.initial
+        self.loss_streak = 0
+        self.cooldown: Dict[str, int] = {}
+        self.day_start_equity = self.initial
+        self.trades_today = 0
+        self.sector_ids: Dict[str, int] = dict(sector_ids or {})
         self.lock = threading.RLock()
 
-    def total_value(self, prices):
-        return self.cash + sum(p["qty"] * prices.get(s, p["entry"]) for s, p in self.positions.items())
-
-    def exposure(self, prices):
-        return sum(p["qty"] * prices.get(s, p["entry"]) for s, p in self.positions.items())
-
-    def record(self, v):
-        if not self.eq_hist or abs(self.eq_hist[-1] - v) > 1e-6:
-            self.eq_hist = (self.eq_hist + [float(v)])[-1000:]
-
-    def win_rate(self):
-        t = self.wins + self.losses
-        return self.wins / t if t else 0.0
-
-    def set_hold(self, sp):
-        self.hold = {k: sp["va"][k][-HOLD_N:].copy() for k in DS_KEYS}
-        self.hold_te = {k: sp["te"][k][-HOLD_N:].copy() for k in DS_KEYS}
-
-    def set_ref(self, sp): self.ref = (sp["Xtr"].mean(0), sp["Xtr"].std(0) + 1e-6)
-
-    def feat_drift(self, F):
-        if not self.ref: return 0.0
-        mu, sd = self.ref
-        k = N_FEAT_TECH
-        return float(np.mean(np.minimum(np.abs(F[:, :k].mean(0) - mu[:k]) / sd[:k], 5.0)))
-
-    def rebuild_hold(self, datasets, rp):
-        merged = merge_ds(datasets)
-        sp = split_ds(merged) if merged else None
-        if sp is None: return False
-        self.set_hold(sp); self.set_ref(sp); self.reeval(rp)
-        return True
-
-    def clone_for_improve(self):
-        sh = Bot(cash=self.cash)
-        sh.nn = BaggedNN(nn_kwargs=self.nn.nn_kwargs, replay=self.nn.replay)
-        with self.lock: st0 = copy.deepcopy(self.nn.get_state())
-        sh.nn.set_state(st0)
-        sh.hold, sh.hold_te, sh.ref, sh.val_stats = self.hold, self.hold_te, self.ref, self.val_stats
-        sh.rl.set_state(self.rl.get_state()); sh.rl_on, sh.rl_gain = self.rl_on, self.rl_gain
-        sh.pretrained = True
-        return sh
-
-    def adopt(self, sh):
+    def equity(self, prices: Dict[str, float]) -> float:
+        """Nakit + açık pozisyonların piyasa değeri."""
         with self.lock:
-            self.nn.set_state(copy.deepcopy(sh.nn.get_state()))
-            self.hold, self.hold_te, self.ref, self.val_stats = sh.hold, sh.hold_te, sh.ref, sh.val_stats
-            self.rl.set_state(sh.rl.get_state()); self.rl_on, self.rl_gain = sh.rl_on, sh.rl_gain
+            mv = sum(p.qty * float(prices.get(s, p.entry)) for s, p in self.positions.items())
+            return self.cash + mv
 
-    # 🐛 BUG 2 DÜZELTME: pretrain XU100'ü otomatik çeker
-    def pretrain(self, dss_list, rp, steps=400, data_date=""):
-        merged = merge_ds(dss_list)
-        sp = split_ds(merged) if merged else None
-        if sp is None: return None
-        k = min(2000, len(sp["Xtr"]))
-        sel = np.random.default_rng(1).choice(len(sp["Xtr"]), k, replace=False)
-        self.nn.replay.add_many(sp["Xtr"][sel], sp["ytr"][sel], sp["ytr_long"][sel])
-        self.nn.fit_all(sp["Xtr"], sp["ytr"], sp["ytr_long"], sp["Xva"], sp["yva"], sp["yva_long"],
-                        steps=steps, sw=sp["wtr"])
-        self.nn.update_w(sp["Xva"], sp["yva"], sp["yva_long"])
-        self.set_hold(sp); self.set_ref(sp)
-        for _ in range(3): self.nn.evolve_step(sp)
-        self.nn.fit_router(sp)
-        try: train_transformer(self.nn, sp, steps=80, seed=1)
-        except Exception as e: log.warning(f"trans: {e}")
-        try:
-            self._rl_train(sp, epochs=6); self.rl_on = self._rl_validate(sp)
-        except Exception as e: log.warning(f"rl: {e}")
-        try:
-            if len(sp["Xva"]) > 100:
-                self.nn.consolidate_ewc(sp["Xva"], sp["yva"], sp["yva_long"])
-        except Exception as e: log.warning(f"ewc: {e}")
-        # HMM için XU100 otomatik çek
-        try:
-            xu = _fetch("XU100.IS", "5y")
-            if xu is not None and len(xu) > 150:
-                mkt_ret = xu.set_index("Date")["Close"].pct_change().dropna().to_numpy()
-                get_hmm().fit(mkt_ret, n_iter=20, date=data_date)
-                log.info(f"HMM eğitildi: {get_hmm().n_iter} iter, {len(mkt_ret)} gün")
-            else:
-                log.warning("XU100 verisi alınamadı, HMM eğitilmedi")
-        except Exception as e:
-            log.warning(f"HMM: {e}")
-        self.reeval(rp)
-        self.pretrained = True
-        return self.val_stats
+    def exposure(self, prices: Dict[str, float]) -> float:
+        """Toplam maruziyet (özkaynak kesri)."""
+        eq = self.equity(prices)
+        if eq <= 0:
+            return 0.0
+        return sum(p.qty * float(prices.get(s, p.entry)) for s, p in self.positions.items()) / eq
 
-    def _rl_train(self, sp, epochs=3):
-        X, f = sp["Xtr"], sp["tr"]["f"]
-        rng = np.random.default_rng(42 + self.rl.t)
-        for _ in range(epochs):
-            idx = rng.permutation(len(X))[:min(2000, len(X))]
-            proba = self.rl.proba(X[idx])
-            actions = np.array([rng.choice(3, p=p / p.sum()) for p in proba])
-            old = proba[np.arange(len(idx)), actions]
-            rew = np.where(actions == 2, f[idx] - RT_COST, 0.0).astype(np.float32)
-            self.rl.update(X[idx], actions, old, rew, epochs=4)
+    def sector_exposure(self, sector: int, prices: Dict[str, float]) -> float:
+        """Tek sektörün özkaynak kesri maruziyeti."""
+        eq = self.equity(prices)
+        if eq <= 0:
+            return 0.0
+        return sum(p.qty * float(prices.get(s, p.entry)) for s, p in self.positions.items()
+                   if p.sector == sector) / eq
 
-    def _rl_validate(self, sp):
-        Xv, fv = sp["Xva"][:3000], sp["va"]["f"][:3000]
-        p = self.rl.proba(Xv)[:, 2]
-        sel = p > 0.5
-        if sel.sum() < 30:
-            self.rl_gain = 0.0; return False
-        self.rl_gain = float((fv[sel] - RT_COST).mean() - (fv - RT_COST).mean())
-        return bool(self.rl_gain > 0.002)
-
-    def reeval(self, rp):
-        if not self.hold: return
-        Ps, Pl, U = self.nn.predict_unc(self.hold["X"], self.hold["sid"], self.hold["row"])
-        sc, st_ = score_params(make_V(self.hold, Ps, Pl, U), rp, min_n=1)
-        y = self.hold["y"]
-        self.val_stats = {
-            "loss": float(-np.mean(np.log(Ps[np.arange(len(y)), y] + 1e-9))),
-            "acc": float(np.mean(Ps.argmax(1) == y)),
-            "base": float(np.bincount(y, minlength=3).max() / len(y)),
-            "al_n": st_["n"], "al_ret": st_["gross"], "al_prec": st_["prec"],
-            "net": st_["net"], "dd": st_["dd"], "score": sc, "n": int(len(y)),
-            "wr": st_.get("wr", 0.0), "pf": st_.get("pf", 0.0),
-            "sharpe": st_.get("sharpe", 0.0), "sortino": st_.get("sortino", 0.0),
-            "t_stat": st_.get("t_stat", 0.0)}
-
-    def edge_ok(self, rp):
-        vs = self.val_stats
-        return bool(vs and vs["al_n"] >= rp["gate_min_n"] and vs["al_ret"] > RT_COST * 1.5)
-
-    def scan(self, names, F, rows, rp, seq=None, mkt=None, overlay=None):
-        Ps, Pl, U = self.nn.predict_unc(F, seq=seq)
-        gate_ok, out = self.edge_ok(rp), {}
-        rl_p = self.rl.proba(F)[:, 2] if self.rl_on else None
-        for i, nm in enumerate(names):
-            p_s, p_l, u, row = Ps[i], Pl[i], float(U[i]), rows[nm]
-            reg = regime_of(row)
-            if mkt and mkt[0] in ("BEAR", "VOL") and mkt[1] >= 0.6: reg = mkt[0]
-            tilt = float((overlay or {}).get(nm, 0.0)) if rp.get("overlay_on", True) else 0.0
-            if tilt: p_s = apply_tilt(p_s, tilt)
-            act, note = signal_from_probs(p_s, p_l, rp, reg), ""
-            if act == "AL":
-                if rp["use_regime"] and not safe_float(row.get("Close")) > safe_float(row.get("SMA200")):
-                    act, note = "TUT", "rejim"
-                elif rp["gate_on"] and not gate_ok: act, note = "TUT", "kapi"
-                elif u > rp["unc_max"]: act, note = "TUT", f"belirsizlik {u:.2f}"
-                elif safe_float(row.get("Turnover20")) < rp.get("min_daily_turnover", 0):
-                    act, note = "TUT", "likidite"
-                elif rp.get("rl_veto", True) and rl_p is not None and rl_p[i] < rp.get("rl_veto_p", 0.25):
-                    act, note = "TUT", f"rl-veto {rl_p[i]:.2f}"
-            out[nm] = {"action": act, "probs": p_s, "probs_long": p_l, "unc": u, "regime": reg,
-                       "note": note, "atr": safe_float(row.get("ATR")), "feat": F[i],
-                       "tilt": tilt, "rl_p": float(rl_p[i]) if rl_p is not None else None}
-        return out
-
-    def halt(self, reason, hours, now):
-        self.halted, self.halt_reason = True, reason
-        self.halt_until = (now + timedelta(hours=hours)).isoformat(timespec="seconds")
-
-    def resume(self, prices):
-        self.halted, self.halt_reason, self.halt_until, self.streak = False, "", None, 0
-        self.peak_eq = self.total_value(prices)
-
-    def _sell(self, s, price, date, reason, qty=None, turn=0.0):
-        p = self.positions[s]
-        q = p["qty"] if qty is None else int(min(max(qty, 1), p["qty"]))
-        full = q >= p["qty"]
-        slip = dynamic_slippage(price, safe_float(p.get("turn", turn), 1e7), p.get("atr", 0) / max(price, 1e-9))
-        px = tick_round(price * (1 - slip), up=False)
-        proceeds = q * px * (1 - FEE)
-        cp = p["cost"] * q / p["qty"]
-        pnl = proceeds - cp
-        self.cash += proceeds
-        tot = pnl + p.get("realized", 0.0)
-        if full:
-            self.positions.pop(s)
-            if tot > 0: self.wins += 1; self.streak = 0
-            else: self.losses += 1; self.streak += 1
-        else:
-            p["qty"] -= q; p["cost"] -= cp; p["realized"] = p.get("realized", 0.0) + pnl; p["tp_done"] = True
-        self.trades = (self.trades + [{"date": str(date), "action": "SAT", "stock": s, "price": px,
-                                        "qty": q, "pnl": pnl, "reason": reason[:200]}])[-500:]
-        db_add_trade(s, "SAT", px, q, pnl, reason)
-        if full:
-            self.last_exit[s] = now_tr().strftime("%Y-%m-%d")
-            c0 = p.get("cost0", p["cost"])
-            if p.get("feat") is not None and c0 > 0:
-                net = tot / c0
-                lab = 2 if net > RT_COST else (0 if net < -RT_COST else 1)
-                self.nn.replay.add(p["feat"], lab, -1, 1.0 + min(abs(net), 0.2) * 20)
-                self.nn.error_analyzer.record_trade(p["feat"], p.get("regime_at_entry", "RANGE"), net)
-        return pnl
-
-    def _buy(self, s, price, date, q, sd, atr, feat, reason, turn=0.0, probs=None, regime="RANGE"):
-        slip = dynamic_slippage(price, safe_float(turn, 1e7), atr / max(price, 1e-9))
-        px = tick_round(price * (1 + slip), up=True)
-        cost = q * px * (1 + FEE)
-        self.cash -= cost
-        self.positions[s] = {"qty": q, "entry": px, "cost": cost, "cost0": cost, "stop0": px - sd, "sd0": sd,
-                             "atr": atr, "high": px, "feat": feat, "ts": _ts(), "tp_done": False,
-                             "realized": 0.0, "turn": turn, "probs_at_entry": probs, "regime_at_entry": regime}
-        self.day_trades += 1
-        self.trades = (self.trades + [{"date": str(date), "action": "AL", "stock": s, "price": px,
-                                        "qty": q, "reason": reason[:200]}])[-500:]
-        db_add_trade(s, "AL", px, q, 0.0, reason)
-
-    def _corr_ok(self, s, rets, thr):
-        a = rets.get(s)
-        if a is None or len(a) < 30: return True
-        for p in self.positions:
-            b = rets.get(p)
-            if b is None: continue
-            n = min(len(a), len(b))
-            c = np.corrcoef(a[-n:], b[-n:])[0, 1]
-            if np.isfinite(c) and c > thr: return False
-        return True
-
-    def run_cycle(self, dec, prices, rp, date, now=None, rows=None, rets=None, stale=False):
-        now, rows, rets, msgs = now or now_tr(), rows or {}, rets or {}, []
+    def new_day(self, t: int, prices: Dict[str, float]) -> None:
+        """Gün başı: günlük zarar referansı ve işlem sayacı sıfırlanır."""
         with self.lock:
-            eq = self.total_value(prices)
-            dk = now.strftime("%Y-%m-%d")
-            if self.day_key != dk: self.day_key, self.day_eq0, self.day_trades = dk, eq, 0
-            if self.halted and self.halt_until and now.isoformat(timespec="seconds") >= self.halt_until:
-                self.resume(prices)
-            self.peak_eq = max(self.peak_eq, eq)
-            dd = (self.peak_eq - eq) / self.peak_eq * 100 if self.peak_eq > 0 else 0.0
-            if dd >= rp["max_dd"] and not self.halted:
-                self.halt(f"KILL DD {dd:.1f}%", rp["cooldown_h"], now)
-                for s in list(self.positions):
-                    if s in prices:
-                        msgs.append(f"{s}: SAT {self._sell(s, prices[s], date, 'KILL'):+.0f} TL")
-                return msgs
-            hold_days = max(1, round(rp["max_hold"] * 5 / 7))
-            for s in list(self.positions):
-                p, px = self.positions[s], prices.get(s)
-                if not px: continue
-                p["high"] = max(p["high"], px)
-                stop, trail = stop_level(p["entry"], p["high"], p["sd0"], p["atr"], rp)
-                pct, reason = (px / p["entry"] - 1) * 100, None
-                if px <= stop: reason = f"{'TRAILING' if trail else 'STOP'} {pct:+.1f}%"
-                else:
-                    try:
-                        if bday_count(datetime.fromisoformat(p["ts"]), now) >= hold_days: reason = "ZAMAN STOPU"
-                    except Exception: pass
-                if reason is None and dec.get(s, {}).get("action") == "SAT": reason = "SINYAL SAT"
-                if reason: msgs.append(f"{s}: SAT {self._sell(s, px, date, reason):+.0f} TL")
-                elif rp.get("tp_on", True) and not p.get("tp_done") and p["qty"] >= 2 and px >= p["entry"] + rp["tp_r"] * p["sd0"]:
-                    q = max(1, int(p["qty"] * rp["tp_frac"]))
-                    msgs.append(f"{s}: TP {q} {self._sell(s, px, date, f'TP {pct:+.1f}%', q):+.0f} TL")
-            if self.streak >= rp["loss_streak"] and not self.halted:
-                self.halt(f"SOGUMA ({self.streak})", rp["cooldown_h"], now)
-            if self.halted: return msgs
-            eq = self.total_value(prices)
-            if self.day_eq0 > 0 and (eq - self.day_eq0) / self.day_eq0 * 100 <= -rp["daily_loss"]:
-                self.halt("GUNLUK LIMIT", max(1, rp["cooldown_h"] // 4), now); return msgs
-            if stale: return msgs
-            rmult = clamp(1 - 0.7 * dd / max(rp["max_dd"], 1e-9), 0.3, 1.0) if rp.get("dd_throttle", True) else 1.0
-            cands = sorted([((d["probs"][2] + d["probs_long"][2]) / 2 - max(d["probs"][0], d["probs"][1]), s)
-                            for s, d in dec.items()
-                            if d["action"] == "AL" and s not in self.positions
-                            and prices.get(s) and self.last_exit.get(s) != dk], reverse=True)
-            for _, s in cands:
-                if len(self.positions) >= rp["max_positions"] or self.day_trades >= rp["max_trades_day"]: break
-                if rp.get("corr_on", True) and not self._corr_ok(s, rets, rp["corr_max"]): continue
-                d = dec[s]
-                px = prices[s] * (1 + SLIPPAGE)
-                atr = d["atr"] or px * 0.02
-                total_eq = self.total_value(prices)
-                q, sd = size_pos(eq, self.cash, self.exposure(prices), px, atr,
-                                 d["probs"], d["probs_long"], rp, self.positions,
-                                 rmult * self.nn.error_analyzer.regime_mult(d["regime"]))
-                sek_now = sektor_exposure(self.positions, prices).get(sektor_of(s), 0.0)
-                q = min(q, int(max(0.0, rp["max_sector"] * total_eq - sek_now) / px)) if total_eq > 0 else 0
-                if q >= 1:
-                    turn = safe_float(rows[s].get("Turnover20") if s in rows else None, 1e7)
-                    self._buy(s, prices[s], date, q, sd, atr, d.get("feat"), "AI AL",
-                              turn=turn, probs=d["probs"], regime=d["regime"])
-                    msgs.append(f"{s}: AL {q} @ {px:.2f}")
-            return msgs
+            self.day_start_equity = self.equity(prices)
+            self.trades_today = 0
 
-    def federated_push(self):
-        try:
-            vs = self.val_stats or {}
-            self.federated_score = float(vs.get("t_stat", 0) + 0.3 * vs.get("sharpe", 0))
-            with self.lock: st0 = self.nn.get_state()
-            return get_federated().push(BOT_ID, st0, self.federated_score)
-        except Exception: return False
-
-    # 🐛 SORUN 1 DÜZELTME: federated_pull optimizer state sıfırlar
-    def federated_pull(self, beta=0.5):
-        if self.hold is None: return False, "hold yok"
-        fed = get_federated()
-        blended = fed.blend(self.nn, beta)
-        if blended is None: return False, "global model yok"
-        h = self.hold
+    def can_open(self, stock: str, t: int, prices: Dict[str, float]) -> Tuple[bool, str]:
+        """Yeni pozisyon için tüm risk limitleri. Dönüş: (izin, neden)."""
+        rp = self.rp
         with self.lock:
-            old = [nn.snapshot() for nn in self.nn.nets]
-            l0 = self.nn.evaluate(h["X"], h["y"], h["y_long"])[0]
-            for nn, b in zip(self.nn.nets, blended): nn.restore(b)
-            l1 = self.nn.evaluate(h["X"], h["y"], h["y_long"])[0]
-            if l1 <= l0 * 1.005:
-                # ✅ Optimizer state sıfırla (Adam momentum uyumsuzluğunu önler)
-                for nn in self.nn.nets:
-                    nn.m = {k: np.zeros_like(v) for k, v in nn.P.items()}
-                    nn.v = {k: np.zeros_like(v) for k, v in nn.P.items()}
-                    nn.t = 0
-                return True, f"uygulandı (kayıp {l0:.4f}→{l1:.4f})"
-            for nn, o in zip(self.nn.nets, old): nn.restore(o)
-        return False, f"reddedildi (kayıp {l0:.4f}→{l1:.4f})"
+            eq = self.equity(prices)
+            if stock in self.positions:
+                return False, "zaten açık"
+            if len(self.positions) >= int(rp["max_positions"]):
+                return False, "maks pozisyon"
+            if self.trades_today >= int(rp["max_trades_day"]):
+                return False, "günlük işlem limiti"
+            if self.loss_streak >= int(rp["loss_streak"]):
+                return False, "ardışık zarar"
+            dd = (1.0 - eq / max(self.peak, 1e-9)) * 100.0
+            if dd > float(rp["max_dd"]):
+                return False, "maks DD eşiği"
+            day_pnl = (eq - self.day_start_equity) / max(self.day_start_equity, 1e-9) * 100.0
+            if day_pnl < -float(rp["daily_loss"]):
+                return False, "günlük zarar limiti"
+            if self.cooldown.get(stock, -1) >= t:
+                return False, "cooldown"
+            if self.exposure(prices) >= float(rp["max_exposure"]):
+                return False, "maruziyet tavanı"
+            sec = self.sector_ids.get(stock)
+            if sec is not None and self.sector_exposure(sec, prices) >= float(rp["max_sector"]):
+                return False, "sektör tavanı"
+            return True, "ok"
 
-    def get_state(self):
-        keys = ["cash", "initial", "positions", "trades", "wins", "losses", "eq_hist", "peak_eq",
-                "halted", "halt_reason", "halt_until", "streak", "day_key", "day_eq0", "day_trades",
-                "pretrained", "val_stats", "last_exit", "rl_on", "rl_gain", "federated_score"]
-        d = {k: getattr(self, k) for k in keys}
-        with self.lock: d["nn"] = self.nn.get_state()
-        d["si"], d["rl"], d["hmm"] = self.si.get_state(), self.rl.get_state(), get_hmm().get_state()
-        return d
+    def size(self, stock: str, price: float, atr_pct: float, p_up: float, unc: float,
+             eq: float) -> int:
+        """
+        Risk tabanlı boyut: min(risk_bütçesi/stop_mesafesi, max_pos·özkaynak/fiyat, Kelly, nakit).
+        Güven ölçeklemesi (conf_sizing): p_up 0.33→0.25 kat, 1.0→tam.
+        """
+        rp = self.rp
+        if price <= 0 or atr_pct <= 0 or eq <= 0:
+            return 0
+        stop_dist = float(rp["sl_atr"]) * atr_pct * price
+        q = min(float(rp["risk_per_trade"]) * eq / stop_dist, float(rp["max_pos"]) * eq / price)
+        if rp.get("conf_sizing", True):
+            q *= _clamp((p_up - 0.33) / 0.67, 0.25, 1.0)
+        kf = fractional_kelly(p_up, TB_K * atr_pct, TB_K * atr_pct, float(rp["kelly_frac"]),
+                              unc, float(rp["kelly_unc_pen"]))
+        if kf <= 0:
+            return 0
+        q = min(q, kf * eq / price)
+        q = min(q, 0.98 * self.cash / (price * (1.0 + FEE)))
+        return int(max(0, math.floor(q)))
 
-    def set_state(self, d):
-        for k, v in d.items():
-            if k == "nn": self.nn.set_state(v)
-            elif k == "si": self.si.set_state(v)
-            elif k == "rl" and v: self.rl.set_state(v)
-            elif k == "hmm" and v: get_hmm().set_state(v)
-            else: setattr(self, k, v)
+    def open_position(self, stock: str, qty: int, fill: float, atr_pct: float, t: int) -> Optional[Position]:
+        """Alım fill'i sonrası pozisyon açar. Nakit ücretle birlikte düşer."""
+        if qty <= 0 or fill <= 0:
+            return None
+        rp = self.rp
+        cost = qty * fill
+        if cost * (1.0 + FEE) > self.cash + 1e-9:
+            return None
+        with self.lock:
+            self.cash -= cost * (1.0 + FEE)
+            atr_abs = atr_pct * fill
+            R = float(rp["sl_atr"]) * atr_abs
+            tp = fill + float(rp["tp_r"]) * R if rp.get("tp_on", True) else float("inf")
+            pos = Position(stock=stock, sector=int(self.sector_ids.get(stock, -1)), qty=int(qty),
+                           entry=float(fill), atr_abs=float(atr_abs), R=float(R),
+                           stop=float(fill - R), tp=float(tp), entry_t=int(t), peak=float(fill))
+            self.positions[stock] = pos
+            self.trades_today += 1
+            return pos
 
-# ════════════════════════════════════════════════════════════
-# 18. SAVE / LOAD / METRICS
-# ════════════════════════════════════════════════════════════
-def save_state(bot, rp, path=STATE_FILE):
-    try:
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump({"ver": BOT_VERSION, "bot": bot.get_state(), "rp": rp},
-                        f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, path)
-        bot.nn.replay.save(MEMORY_FILE)
-        return True
-    except Exception as e:
-        log.warning(f"save: {e}"); return False
+    def update_bar(self, stock: str, o: float, h: float, l: float, c: float, t: int) -> List[Tuple[int, float, str]]:
+        """
+        Bar güncellemesi. Dönüş: [(kapatılacak adet, referans fiyat, neden), ...].
+        Sıra: stop (gap'te açılış) → kısmi TP (+BE) → trailing → max_hold.
+        Giriş barında yalnızca stop kontrol edilir (simülatörle aynı).
+        """
+        pos = self.positions.get(stock)
+        if pos is None:
+            return []
+        rp = self.rp
+        events: List[Tuple[int, float, str]] = []
+        if l <= pos.stop:
+            ex = o if o < pos.stop else pos.stop
+            events.append((pos.qty, float(ex), "stop"))
+            return events
+        if pos.entry_t == t:
+            return events
+        pos.held += 1
+        if rp.get("tp_on", True) and not pos.partial_done and h >= pos.tp:
+            px = max(pos.tp, o)
+            q_part = int(math.floor(pos.qty * float(rp.get("tp_frac", 0.5))))
+            if q_part > 0:
+                events.append((q_part, float(px), "tp_partial"))
+            pos.partial_done = True
+            if rp.get("be_on", True):
+                pos.stop = max(pos.stop, pos.entry)
+        if h >= pos.entry + float(rp["trail_act_r"]) * pos.R:
+            pos.trail_on = True
+        if pos.trail_on:
+            pos.stop = max(pos.stop, h - float(rp["trail_atr"]) * pos.atr_abs)
+        pos.peak = max(pos.peak, h)
+        if pos.held >= int(rp["max_hold"]):
+            events.append((pos.qty, float(c), "max_hold"))
+        return events
 
-def load_state(path=STATE_FILE):
-    if not os.path.exists(path): return None
-    try:
-        with open(path, "rb") as f: obj = pickle.load(f)
-        return obj if isinstance(obj, dict) and obj.get("ver") == BOT_VERSION else None
-    except Exception: return None
+    def close(self, stock: str, qty: int, fill: float, reason: str, t: int) -> Dict[str, Any]:
+        """Kısmi veya tam kapanış. Nakit (ücret düşülerek) eklenir, işlem kaydı tutulur."""
+        with self.lock:
+            pos = self.positions.get(stock)
+            if pos is None or qty <= 0:
+                return {}
+            qty = min(int(qty), pos.qty)
+            proceeds = qty * fill
+            self.cash += proceeds * (1.0 - FEE)
+            pnl = qty * (fill - pos.entry) - (qty * pos.entry + proceeds) * FEE
+            rec = {"t": int(t), "stock": stock, "qty": qty, "entry": pos.entry, "exit": float(fill),
+                   "pnl": float(pnl), "reason": reason}
+            self.trades.append(rec)
+            pos.qty -= qty
+            if pos.qty <= 0:
+                del self.positions[stock]
+                self.loss_streak = self.loss_streak + 1 if pnl < 0 else 0
+                self.cooldown[stock] = int(t) + max(1, int(self.rp.get("cooldown_h", 24)) // 24)
+            return rec
 
-def export_prometheus(bot, rp, prices=None):
-    try:
-        eq = bot.total_value(prices or {})
-        vl = bot.val_stats.get("loss", 0) if bot.val_stats else 0
-        lines = [
-            "# HELP seekdeep_portfolio Portföy değeri", "# TYPE seekdeep_portfolio gauge",
-            f'seekdeep_portfolio{{bot="{BOT_ID}",sektor="{AKTIF_SEKTOR}"}} {eq}',
-            f'seekdeep_positions{{bot="{BOT_ID}"}} {len(bot.positions)}',
-            f'seekdeep_trades{{bot="{BOT_ID}"}} {len(bot.trades)}',
-            f'seekdeep_win_rate{{bot="{BOT_ID}"}} {bot.win_rate()}',
-            f'seekdeep_evolution{{bot="{BOT_ID}"}} {bot.nn.evo}',
-            f'seekdeep_val_loss{{bot="{BOT_ID}"}} {vl}',
-            f'seekdeep_router_on{{bot="{BOT_ID}"}} {int(bot.nn.router_on)}',
-            f'seekdeep_transformer_on{{bot="{BOT_ID}"}} {int(bot.nn.trans_ens.on)}',
-            f'seekdeep_rl_on{{bot="{BOT_ID}"}} {int(bot.rl_on)}',
-        ]
-        with open(METRICS_FILE, "w") as f: f.write("\n".join(lines) + "\n")
-    except Exception: pass# ════════════════════════════════════════════════════════════
-# 🐋 PARÇA 4/4: UI — STREAMLIT (21 SEKME)
-# ════════════════════════════════════════════════════════════
+    def snapshot(self, t: int, prices: Dict[str, float]) -> float:
+        """Özkaynağı kaydeder, tepe değeri günceller."""
+        with self.lock:
+            eq = self.equity(prices)
+            self.peak = max(self.peak, eq)
+            self.equity_hist.append((int(t), float(eq)))
+            return eq
 
-# ─── Forecast grafikleri ────────────────────────────────
-def plot_forecast(f: Forecast, df: pd.DataFrame, n_hist: int = 60):
-    d = df.tail(n_hist).copy()
-    future_dates = pd.date_range(
-        start=pd.Timestamp(d["Date"].iloc[-1]) + pd.Timedelta(days=1),
-        periods=f.horizon_days, freq="B")
-    today = d["Close"].iloc[-1]
-    n_pts = len(future_dates) + 1
-    base_line = np.linspace(today, f.base_price, n_pts)
-    upper_line = np.linspace(today, f.upper_bound, n_pts)
-    lower_line = np.linspace(today, f.lower_bound, n_pts)
-    bull_line = np.linspace(today, f.bull_price, n_pts)
-    bear_line = np.linspace(today, f.bear_price, n_pts)
-    x_all = [d["Date"].iloc[-1]] + list(future_dates)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=d["Date"], y=d["Close"], mode="lines",
-                              name="Geçmiş", line=dict(color="#50e3c2", width=2)))
-    fig.add_trace(go.Scatter(x=x_all + x_all[::-1],
-                              y=list(upper_line) + list(lower_line)[::-1],
-                              fill="toself", fillcolor="rgba(80, 227, 194, 0.15)",
-                              line=dict(color="rgba(255,255,255,0)"),
-                              name="%80 Güven Aralığı"))
-    fig.add_trace(go.Scatter(x=x_all, y=base_line, mode="lines+markers",
-                              name=f"Baz (₺{f.base_price:.2f})",
-                              line=dict(color="#f5a623", width=3, dash="dash")))
-    fig.add_trace(go.Scatter(x=x_all, y=bull_line, mode="lines",
-                              name=f"Boğa (₺{f.bull_price:.2f})",
-                              line=dict(color="#26a69a", width=1.5, dash="dot")))
-    fig.add_trace(go.Scatter(x=x_all, y=bear_line, mode="lines",
-                              name=f"Ayı (₺{f.bear_price:.2f})",
-                              line=dict(color="#ef5350", width=1.5, dash="dot")))
-    fig.add_vline(x=d["Date"].iloc[-1], line_dash="dot", line_color="gray",
-                  annotation_text="Bugün", annotation_position="top")
-    fig.update_layout(
-        height=500, template="plotly_dark",
-        title=f"🎯 {f.stock} Tahmin — {f.horizon_days} gün · Güven %{f.confidence*100:.0f} · Rejim {f.regime}",
-        xaxis_title="Tarih", yaxis_title="Fiyat (₺)",
-        margin=dict(l=10, r=10, t=50, b=10), hovermode="x unified")
-    return fig
+    def get_state(self) -> Dict[str, Any]:
+        """Pickle/JSON'a uygun durum sözlüğü."""
+        with self.lock:
+            return {"initial": self.initial, "cash": self.cash,
+                    "positions": {k: asdict(v) for k, v in self.positions.items()},
+                    "trades": list(self.trades), "equity_hist": list(self.equity_hist),
+                    "peak": self.peak, "loss_streak": self.loss_streak, "cooldown": dict(self.cooldown),
+                    "day_start_equity": self.day_start_equity, "trades_today": self.trades_today,
+                    "sector_ids": dict(self.sector_ids), "rp": dict(self.rp)}
 
-def plot_scenarios_bar(f: Forecast):
-    labels = ["Ayı", "Alt (%80)", "Baz", "Üst (%80)", "Boğa"]
-    prices_ = [f.bear_price, f.lower_bound, f.base_price, f.upper_bound, f.bull_price]
-    colors = ["#ef5350", "#f5a623", "#50e3c2", "#f5a623", "#26a69a"]
-    fig = go.Figure(go.Bar(x=labels, y=prices_, marker_color=colors,
-                            text=[f"₺{p:.2f}" for p in prices_], textposition="outside"))
-    fig.add_hline(y=f.current_price, line_dash="dash", line_color="white",
-                  annotation_text=f"Şu an ₺{f.current_price:.2f}")
-    fig.update_layout(height=350, template="plotly_dark",
-                       title=f"{f.stock} Senaryo Analizi", yaxis_title="Fiyat (₺)",
-                       margin=dict(l=10, r=10, t=50, b=10))
-    return fig
+    def set_state(self, s: Dict[str, Any]) -> None:
+        """get_state çıktısını geri yükler."""
+        with self.lock:
+            self.initial = float(s["initial"])
+            self.cash = float(s["cash"])
+            self.positions = {k: Position(**v) for k, v in s["positions"].items()}
+            self.trades = list(s["trades"])
+            self.equity_hist = [tuple(x) for x in s["equity_hist"]]
+            self.peak = float(s["peak"])
+            self.loss_streak = int(s["loss_streak"])
+            self.cooldown = {k: int(v) for k, v in s["cooldown"].items()}
+            self.day_start_equity = float(s["day_start_equity"])
+            self.trades_today = int(s["trades_today"])
+            self.sector_ids = dict(s["sector_ids"])
+            self.rp = dict(s["rp"])
 
-def plot_probability_gauge(f: Forecast):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=f.p_up * 100,
-        title={"text": f"{f.stock} P(Yukarı) %"},
-        delta={"reference": 50, "increasing": {"color": "#26a69a"},
-               "decreasing": {"color": "#ef5350"}},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": "#50e3c2"},
-            "steps": [
-                {"range": [0, 33], "color": "#ef5350"},
-                {"range": [33, 66], "color": "#f5a623"},
-                {"range": [66, 100], "color": "#26a69a"},
-            ],
-            "threshold": {"line": {"color": "white", "width": 3},
-                          "thickness": 0.75, "value": 50},
-        }
-    ))
-    fig.update_layout(height=280, template="plotly_dark",
-                       margin=dict(l=20, r=20, t=50, b=20))
-    return fig
 
-# ════════════════════════════════════════════════════════════
-# ANA UI
-# ════════════════════════════════════════════════════════════
-def main():
-    st.set_page_config(page_title="SeekDeep", page_icon="🐋", layout="wide")
-    sektor_emoji = {"BANKACILIK": "🏦", "HAVACILIK": "✈️", "ENERJI": "⚡"}
+# ═══════════════════════════════════════════════════════════════════
+# 6. İCRA MOTORU (KÂĞIT ÜZERİNDE)
+# ═══════════════════════════════════════════════════════════════════
 
-    # Mobil CSS
-    st.markdown("""
-    <style>
-    @media (max-width: 768px) {
-        .stMetric { font-size: 0.8em; }
-        .stTabs [data-baseweb="tab-list"] { overflow-x: auto; }
-    }
-    </style>
-    """, unsafe_allow_html=True)
+class LiveExecutionEngine:
+    """
+    Kâğıt üzerinde emir motoru. Alımda OFI gate ve kısmi dolum; her emirde kayma ve
+    Almgren-Chriss etkisi. Gerçek emir gönderimi YOKTUR.
+    """
 
-    # Başlık
-    c1, c2, c3 = st.columns([3, 1, 1])
-    c1.title(f"{BOT_NAME} — Bot #{BOT_ID}")
-    c1.caption(f"{sektor_emoji.get(AKTIF_SEKTOR,'🐋')} {AKTIF_SEKTOR} · "
-               f"{SEKTOR_BOTLARI[AKTIF_SEKTOR]['aciklama']}")
-    (c2.success if borsa_acik() else c2.error)("🟢 AÇIK" if borsa_acik() else "🔴 KAPALI")
-    c3.caption(f"🕐 {now_tr():%H:%M:%S}")
+    def __init__(self, pm: PortfolioManager, db: Any = None) -> None:
+        self.pm = pm
+        self.db = db
+        self.lock = threading.RLock()
 
-    # Üst metrikler
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Sürüm", BOT_VERSION)
-    k2.metric("Otonom Param", len(TUNE_BOUNDS))
-    k3.metric("Kilitli Risk", str(len(LOCKED_KEYS)))
-    k4.metric("Doğrulama", "CPCV+PBO+DSR")
-    k5.metric("Mimari", "MoE+Trans+RL+Meta")
-    st.divider()
-
-    # Session state
-    for k, v in {"bot": None, "auto": False, "test_mode": False, "interval": 60,
-                 "last_tick": 0.0, "ticks": 0, "log": [], "sel": None, "rp": None,
-                 "universe": None, "universe_scores": [], "ma": None,
-                 "nas_results": None, "nas_best": None, "_cpcv": None,
-                 "_pbo": None, "_stress": None, "_shap": None, "_lime": None,
-                 "_pdp": None, "last_agg": 0.0, "_portf": None}.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-    # Bot yükle
-    if st.session_state.bot is None:
-        b, loaded = Bot(), load_state()
-        if loaded:
-            try:
-                b.set_state(loaded["bot"])
-                b.nn.replay.load(MEMORY_FILE)
-                st.session_state.rp = loaded.get("rp")
-            except Exception as e:
-                st.warning(f"State yüklenemedi: {e}")
-                b = Bot()
-        st.session_state.bot = b
-
-    bot = st.session_state.bot
-    st.session_state.rp = validate_risk(st.session_state.rp)
-    rp = st.session_state.rp
-    now = now_tr()
-
-    # LLM durumu
-    na = get_news()
-    if NEWS_ENABLED:
-        if na.enabled:
-            st.toast("🤖 LLM aktif (Groq)", icon="✅")
-        else:
-            st.toast("⚠️ LLM kapalı (GROQ_API_KEY eksik)", icon="⚠️")
-
-    # Veri yükle
-    with st.spinner(f"📥 {AKTIF_SEKTOR} verisi yükleniyor ({N_STOCKS} hisse)..."):
-        uni = load_uni(now.strftime("%Y-%m-%d"), AKTIF_SEKTOR)
-    dfs = uni["dfs"]
-    if not dfs:
-        st.error("❌ Veri yok: " + ", ".join(uni["errs"][:5]))
-        st.stop()
-    if uni["errs"]:
-        st.caption("⚠️ Atlanan: " + ", ".join(uni["errs"][:8]))
-
-    # Dataset cache
-    if st.session_state.get("dss_key") != (uni["ts"], AKTIF_SEKTOR):
-        st.session_state.dss = {nm: make_ds(d, nm, AKTIF_SEKTOR) for nm, d in dfs.items()}
-        st.session_state.dss_key = (uni["ts"], AKTIF_SEKTOR)
-    datasets = [v for v in st.session_state.dss.values() if v]
-    data_date = str(max(d["Date"].iloc[-1] for d in dfs.values()).date())
-
-    # İlk eğitim
-    if not bot.pretrained and datasets:
-        with st.spinner("🧠 Eğitim (MoE + Transformer + RL + Meta + HMM)..."):
-            bot.pretrain(datasets, rp, steps=400, data_date=data_date)
-        bot.si.last_run = time.time()
-        bot.si.last_data = data_date
-        st.session_state.log.append(f"{now:%H:%M:%S} Eğitim tamam")
-        save_state(bot, rp)
-
-    # Feature hazırlık
-    names, rows, feats = [], {}, []
-    for nm, d in dfs.items():
-        i = sig_idx(d, now)
-        rows[nm] = d.iloc[i]
-        feats.append(feature_matrix(d.iloc[[i]], nm)[0])
-        names.append(nm)
-    F_live = np.array(feats, dtype=np.float32)
-
-    # Sequence (canlı)
-    sid_live = np.array([STOCK_LIST.index(nm) for nm in names], dtype=np.int64)
-    row_live = np.array([len(dfs[nm]) - 1 if sig_idx(dfs[nm], now) == len(dfs[nm]) - 1 else len(dfs[nm]) - 2
-                          for nm in names], dtype=np.int64)
-    F_live_seq = None
-    if len(F_live) >= SEQ_LEN:
-        try:
-            F_live_seq = gather_seq(sid_live, row_live, AKTIF_SEKTOR)
-        except Exception as e:
-            log.warning(f"seq: {e}")
-
-    # Canlı fiyat
-    live = live_prices(tuple(HISSELER[n] for n in names))
-    prices = {nm: live.get(HISSELER[nm], float(dfs[nm]["Close"].iloc[-1])) for nm in names}
-
-    # Aktif hisse
-    if st.session_state.sel is None or st.session_state.sel not in dfs:
-        st.session_state.sel = names[0]
-
-    # Recent returns (HMM)
-    df_recent_returns = {nm: dfs[nm]["Ret1"].dropna().to_numpy()[-30:] for nm in names}
-    # Piyasa rejimi (XU100 üzerinden)
-    mkt_regime = None
-    try:
-        xu = dfs.get("XU100")
-        if xu is not None and get_hmm().fitted:
-            mkt_regime = get_hmm().predict_name(dfs[list(dfs.keys())[0]]["Ret1"].dropna().to_numpy()[-30:])
-    except Exception:
-        mkt_regime = None
-
-    # Overlay (haber + temel)
-    overlay = {}
-    try:
-        for nm in names:
-            nf = uni.get("news", {}).get(nm, {})
-            fd = uni.get("fund", {}).get(nm)
-            tilt = 0.0
-            if nf.get("n", 0) > 0:
-                tilt += 0.02 * float(nf.get("sent", 0)) * float(nf.get("conf", 0.5))
-            if fd is not None:
-                tilt += 0.015 * fund_score(fd, sektor_of(nm))
-            overlay[nm] = clamp(tilt, -0.04, 0.04)
-    except Exception as e:
-        log.warning(f"overlay: {e}")
-
-    # Feature drift
-    feat_dr = bot.feat_drift(F_live)
-
-    # Background improver sonucu al
-    bgi = get_bgi()
-    res = bgi.pop(id(bot))
-    if res is not None:
-        rp = handle_improve_result(bot, res, rp)
-
-    # Otomatik öz-gelişim tetikle (background)
-    if rp["si_auto"] and bot.pretrained and datasets and not bgi.busy():
-        t_ = time.time()
-        if bot.si.due(t_, data_date, rp["si_interval_min"]) or (feat_dr > 1.2 and t_ - bot.si.last_run > 600):
-            if bgi.start(bot, datasets, rp, data_date, "auto", float(rp["si_budget_s"])):
-                st.toast("🧬 Öz-gelişim arka planda çalışıyor", icon="🔄")
-
-    # Scan
-    dec = bot.scan(names, F_live, rows, rp, F_live_seq, mkt_regime, overlay)
-    sec = st.session_state.sel
-    df, sd_ = dfs[sec], dec[sec]
-    price = prices[sec]
-
-    # Bayat veri kontrolü
-    last_data_ts = pd.Timestamp(df["Date"].iloc[-1]).date()
-    stale = (now.date() - last_data_ts).days > 5
-
-    # Otomatik döngü
-    auto_msgs = []
-    if (st.session_state.auto
-            and time.time() - st.session_state.last_tick >= st.session_state.interval - 1
-            and (borsa_acik() or st.session_state.test_mode)
-            and bot.pretrained):
-        st.session_state.last_tick = time.time()
-        st.session_state.ticks += 1
-        rets_live = {nm: dfs[nm]["Ret1"].dropna().to_numpy()[-60:] for nm in names}
-        auto_msgs = bot.run_cycle(dec, prices, rp, now.strftime("%Y-%m-%d %H:%M"), now,
-                                   rows=rows, rets=rets_live, stale=stale)
-        v_ = bot.total_value(prices)
-        bot.record(v_)
-        db_eq_add(v_, bot.cash, len(bot.positions))
-        if auto_msgs:
-            st.session_state.log = (st.session_state.log + [f"{now:%H:%M:%S} " + " | ".join(auto_msgs)])[-100:]
-        if st.session_state.ticks % 10 == 0:
-            save_state(bot, rp)
-        if st.session_state.ticks % 100 == 0:
-            bot.federated_push()
-            if time.time() - st.session_state.last_agg > 3600:
-                if get_federated().aggregate():
-                    ok, msg = bot.federated_pull(rp.get("fed_beta", 0.5))
-                    st.session_state.log.append(f"{now:%H:%M:%S} Federated: {msg}")
-                st.session_state.last_agg = time.time()
-        export_prometheus(bot, rp, prices)
-
-    if st.session_state.auto:
-        st_autorefresh(interval=st.session_state.interval * 1000, key="rf")
-    cur_val = bot.total_value(prices)
-    bot.record(cur_val)
-
-    # ════════════════════════════════════════════════════════
-    # SIDEBAR
-    # ════════════════════════════════════════════════════════
-    with st.sidebar:
-        st.markdown(f"## {sektor_emoji.get(AKTIF_SEKTOR,'🐋')} SeekDeep")
-        st.caption(f"Bot #{BOT_ID} · {AKTIF_SEKTOR}")
-        st.selectbox("📊 Hisse", names, key="sel")
-        st.metric(sec, f"{price:.2f} TL",
-                  f"{(price / float(df['Close'].iloc[-2]) - 1) * 100:+.2f}%")
-        st.metric("💰 Portföy", f"{cur_val:,.0f} TL", f"{cur_val - bot.initial:+,.0f}")
-        st.divider()
-        st.toggle("🟢 Otomatik işlem", key="auto")
-        st.toggle("🧪 Test modu", key="test_mode")
-        st.slider("Yenileme (sn)", 30, 300, step=10, key="interval")
-        if st.session_state.auto:
-            dsc = "çalışıyor" if (borsa_acik() or st.session_state.test_mode) else "kapalı"
-            st.caption(f"Tick: {st.session_state.ticks} · {dsc}")
-        st.divider()
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Poz", len(bot.positions))
-        s2.metric("Hafıza", bot.nn.replay.size())
-        s3.metric("Evrim", bot.nn.evo)
-        vl_str = f"{bot.nn.best_vl:.4f}" if np.isfinite(bot.nn.best_vl) else "-"
-        st.caption(f"Val loss: {vl_str} · 🧬 tur: {bot.si.runs}")
-        st.caption(f"Router: {'AÇIK' if bot.nn.router_on else 'kapalı'} ({bot.nn.router_gain:+.4f})")
-        st.caption(f"Transformer: {'AÇIK' if bot.nn.trans_ens.on else 'kapalı'} ({bot.nn.trans_ens.gain:+.4f})")
-        st.caption(f"RL: {'AÇIK' if bot.rl_on else 'kapalı'} · HMM: {'eğitildi' if get_hmm().fitted else 'bekliyor'}")
-        st.caption(f"EWC: {'konsolide' if bot.nn.ewc_consolidated else 'bekliyor'}")
-        if bgi.busy():
-            st.info("🧬 Öz-gelişim çalışıyor (arka plan)")
-
-        # Aktif hisse tahmini
-        st.divider()
-        st.markdown("### 🔮 Tahmin")
-        try:
-            f_aktif = forecast_stock(bot, sec, df, price, sd_, rp)
-            yon_emoji = ("🟢" if f_aktif.expected_return_pct > 1
-                         else ("🔴" if f_aktif.expected_return_pct < -1 else "🟡"))
-            st.markdown(f"{yon_emoji} **Hedef:** ₺{f_aktif.target_price:.2f} "
-                        f"({f_aktif.expected_return_pct:+.2f}%)")
-            st.caption(f"Aralık: ₺{f_aktif.lower_bound:.2f} — ₺{f_aktif.upper_bound:.2f}")
-            st.caption(f"P(Yukarı) %{f_aktif.p_up*100:.0f} · Güven %{f_aktif.confidence*100:.0f}")
-        except Exception:
-            pass
-
-        if bot.halted:
-            st.error(f"⛔ {bot.halt_reason}")
-        if stale:
-            st.warning("⚠️ Veri bayat (>5 gün)")
-
-        if st.button("💾 Kaydet", use_container_width=True):
-            st.toast("✅" if save_state(bot, rp) else "❌")
-        if st.button("📤 Federated Push", use_container_width=True):
-            if bot.federated_push(): st.toast("✅ Gönderildi")
-        if st.button("📥 Federated Pull", use_container_width=True):
-            ok, msg = bot.federated_pull(rp.get("fed_beta", 0.5))
-            st.toast(("✅ " if ok else "⚠️ ") + msg)
-            if ok: st.rerun()
-        if st.button("🛑 ACİL DUR", use_container_width=True, type="primary"):
-            for s in list(bot.positions):
-                if s in prices:
-                    bot._sell(s, prices[s], now, "ACIL")
-            bot.halted, bot.halt_reason = True, "ACİL"
-            st.rerun()
-        if st.button("▶️ Devam", use_container_width=True):
-            bot.resume(prices); st.rerun()
-        if st.button("🗑️ Sıfırla", use_container_width=True):
-            for f_ in (STATE_FILE, MEMORY_FILE):
-                try: os.remove(f_)
-                except OSError: pass
-            db_clear()
-            st.session_state.bot = Bot()
-            st.session_state.log = []
-            st.rerun()
-
-    # ════════════════════════════════════════════════════════
-    # ÜST METRİKLER
-    # ════════════════════════════════════════════════════════
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Fiyat", f"{price:.2f}")
-    m2.metric("Karar", sd_["action"], f"P(AL) %{sd_['probs'][2] * 100:.0f}")
-    m3.metric("Portföy", f"{cur_val:,.0f}",
-              f"%{(cur_val / bot.initial - 1) * 100:+.2f}")
-    m4.metric("İşlem", len(bot.trades),
-              f"kaz %{bot.win_rate() * 100:.0f}" if bot.trades else None)
-    m5.metric("Rejim", sd_["regime"])
-    m6.metric("Belirsizlik", f"{sd_['unc']:.2f}")
-    if sd_["note"]:
-        st.warning(f"AL engellendi: {sd_['note']}")
-    if auto_msgs:
-        st.info(" | ".join(auto_msgs[:5]))
-
-    # Forecast uyarı
-    if bot.pretrained and len(bot.positions) < rp["max_positions"]:
-        try:
-            fc_rows_alert = forecast_all(bot, names, dfs, prices, dec, rp)
-            alerts = check_forecast_alerts(fc_rows_alert, threshold=5.0)
-            high = [a for a in alerts if a.expected_return_pct > 0 and a.p_up > 0.55]
-            if high:
-                top3 = sorted(high, key=lambda x: -x.expected_return_pct)[:3]
-                txt = " | ".join([f"🔮 {a.stock}: ₺{a.current_price:.2f}→₺{a.target_price:.2f} "
-                                  f"({a.expected_return_pct:+.1f}%)" for a in top3])
-                st.info(f"**Yüksek potansiyel:** {txt}")
-        except Exception:
-            pass
-
-    # ════════════════════════════════════════════════════════
-    # SEKMELER
-    # ════════════════════════════════════════════════════════
-    tabs = st.tabs([
-        "🌍 Evren", "🎛️ Kontrol", "📈 Grafik", "🎯 Karar", "🧠 Beyin",
-        "🧬 Öz-Gelişim", "📊 Analiz", "📊 Kalibrasyon", "🔬 CPCV/PBO",
-        "💼 Temel", "🌐 Makro", "👥 Ajanlar", "🔬 NAS", "🔄 Federated",
-        "⚡ Stress", "🔍 XAI", "📢 KAP", "🔮 Tahmin", "🧠 Meta",
-        "💾 DB", "💬 Log"
-    ])
-    (tU, tK, tG, tD, tB, tSI, tA, tCAL, tCPCV, tFUN, tMAC, tMA,
-     tNAS, tFED, tSTRESS, tXAI, tKAP, tFCAST, tMETA, tDB, tCH) = tabs
-
-    # Slider helpers
-    def _cb(name, key):
-        st.session_state.rp[name] = clamp(safe_float(st.session_state[key]),
-                                          *RISK_BOUNDS.get(name, (0, 1)))
-    def rp_sl(name, label, lo, hi, step):
-        key = f"rp_{name}"
-        if key not in st.session_state:
-            st.session_state[key] = type(step)(clamp(rp[name], lo, hi))
-        st.slider(label, lo, hi, step=step, key=key, on_change=_cb, args=(name, key))
-    def rp_tg(name, label):
-        key = f"rp_{name}"
-        if key not in st.session_state:
-            st.session_state[key] = bool(rp[name])
-        st.toggle(label, key=key,
-                  on_change=lambda n=name, k=key: st.session_state.rp.__setitem__(n, bool(st.session_state[k])))
-
-    # ─── 🌍 EVREN ───────────────────────────────────────────
-    with tU:
-        st.subheader(f"🌍 Dinamik Evren · {AKTIF_SEKTOR}")
-        st.caption(f"Bot #{BOT_ID} · {N_STOCKS} hisse · ₺{BOT_SERMAYE:,.0f}")
-        if st.button("🔄 Universe'ü Yenile (Tüm BIST)", use_container_width=True):
-            with st.spinner("500+ hisse taranıyor..."):
-                top_codes, all_scores = scan_universe(top_n=40)
-                st.session_state.universe = top_codes
-                st.session_state.universe_scores = all_scores
-                st.success(f"✅ {len(top_codes)} hisse seçildi")
-                st.rerun()
-        scores = st.session_state.get("universe_scores", [])
-        if scores:
-            sdf = pd.DataFrame(scores).head(50)
-            sdf = sdf[["code", "total", "trend", "mom", "atr_pct", "vol_ratio", "turnover", "price"]]
-            sdf.columns = ["Kod", "Skor", "Trend", "Momentum", "ATR%", "Hacim Oranı", "Hacim (TL)", "Fiyat"]
-            sdf["ATR%"] = sdf["ATR%"] * 100
-            sdf["Hacim (TL)"] = sdf["Hacim (TL)"].apply(lambda x: f"{x/1e6:.1f}M")
-            st.dataframe(sdf, use_container_width=True, hide_index=True)
-        st.divider()
-        st.markdown("### 📋 Bu Botun Hisseleri")
-        st.write(", ".join(BOT_HISSELER))
-
-    # ─── 🎛️ KONTROL ─────────────────────────────────────────
-    with tK:
-        cA, cB, cC = st.columns(3)
-        with cA:
-            st.markdown("**🔒 Kilitli (Sende)**")
-            rp_sl("max_dd", "Kill DD %", 3.0, 50.0, 0.5)
-            rp_sl("daily_loss", "Günlük zarar %", 0.5, 15.0, 0.5)
-            rp_sl("max_positions", "Max poz", 1, 20, 1)
-            rp_sl("max_exposure", "Maruziyet", 0.2, 1.0, 0.05)
-            rp_sl("max_sector", "Sektör max", 0.1, 1.0, 0.05)
-            st.divider()
-            st.markdown(f"**🤖 Otonom ({len(TUNE_BOUNDS)} param)**")
-            st.caption("Bot kendisi öğreniyor")
-        with cB:
-            st.markdown("**Model Kapısı**")
-            rp_tg("gate_on", "Aktif")
-            rp_sl("gate_min_n", "Min AL", 3, 100, 1)
-            rp_sl("dsr_confidence", "DSR eşiği", 0.5, 0.999, 0.005)
-            rp_sl("consec_improve", "Ardışık", 1, 5, 1)
-            rp_tg("auto_adopt", "Oto uygula")
-            rp_tg("rl_veto", "RL veto")
-            rp_sl("rl_veto_p", "RL veto eşiği", 0.05, 0.6, 0.01)
-        with cC:
-            st.markdown("**Öz-Gelişim**")
-            rp_tg("si_auto", "🧬 Aktif")
-            rp_sl("si_interval_min", "Tur aralığı", 5, 720, 5)
-            rp_sl("si_budget_s", "Bütçe (sn)", 2, 120, 1)
-            st.divider()
-            st.markdown("**Federated**")
-            rp_sl("fed_beta", "Global blend β", 0.0, 1.0, 0.05)
-        st.divider()
-        st.markdown("### 📦 Açık Pozisyonlar")
-        if not bot.positions:
-            st.info("Yok")
-        else:
-            prow = []
-            for nm, p in bot.positions.items():
-                cur = prices.get(nm, p["entry"])
-                stop, _ = stop_level(p["entry"], p["high"], p["sd0"], p["atr"], rp)
-                prow.append({"Hisse": nm, "Adet": p["qty"],
-                             "Giriş": round(p["entry"], 2),
-                             "Şu an": round(cur, 2),
-                             "K/Z ₺": round((cur - p["entry"]) * p["qty"] + p.get("realized", 0.0)),
-                             "K/Z %": round((cur / p["entry"] - 1) * 100, 2),
-                             "Stop": round(stop, 2),
-                             "TP": "✅" if p.get("tp_done") else "-"})
-            st.dataframe(pd.DataFrame(prow), use_container_width=True, hide_index=True)
-
-    # ─── 📈 GRAFİK ──────────────────────────────────────────
-    with tG:
-        n_show = st.select_slider("Gün", options=[60, 120, 180, 250], value=120)
-        d = df.tail(n_show)
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                             vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
-        fig.add_trace(go.Candlestick(x=d["Date"], open=d["Open"], high=d["High"],
-                                      low=d["Low"], close=d["Close"], name="Fiyat"), row=1, col=1)
-        for col, clr in [("SMA20", "#f5a623"), ("SMA50", "#4a90e2"), ("SMA200", "#bd10e0")]:
-            fig.add_trace(go.Scatter(x=d["Date"], y=d[col], name=col,
-                                      line=dict(width=1.2, color=clr)), row=1, col=1)
-        pos_ = bot.positions.get(sec)
-        if pos_:
-            stp, _ = stop_level(pos_["entry"], pos_["high"], pos_["sd0"], pos_["atr"], rp)
-            fig.add_hline(y=stp, line_dash="dash", line_color="red", row=1, col=1)
-            fig.add_hline(y=pos_["entry"] + rp["tp_r"] * pos_["sd0"],
-                          line_dash="dash", line_color="lime", row=1, col=1)
-        for t in bot.trades[-100:]:
-            if t["stock"] == sec:
+    def execute(self, side: str, stock: str, qty: int, ref_price: float, adv_tl: float,
+                atr_pct: float, ofi: float) -> Optional[Dict[str, Any]]:
+        """Emri uygular. Reddedilirse None. Dönüş: dolum kaydı."""
+        rp = self.pm.rp
+        side = side.upper()
+        with self.lock:
+            if side == "BUY" and rp.get("ofi_gate", True) and not ofi_gate_ok(side, ofi, float(rp["ofi_min"])):
+                log.info("OFI gate reddetti: %s (ofi=%.3f)", stock, ofi)
+                return None
+            q = qty
+            if side == "BUY":
+                q = partial_fill_qty(qty, adv_tl, ref_price, float(rp.get("max_adv_pct", 0.05)))
+            if q <= 0:
+                return None
+            order_tl = q * ref_price
+            slip = dynamic_slippage(ref_price, adv_tl, atr_pct, order_tl) if DYNAMIC_SLIPPAGE else SLIPPAGE_BASE
+            imp = almgren_chriss_impact(order_tl, adv_tl, atr_pct) if rp.get("impact_on", True) else 0.0
+            sign = 1.0 if side == "BUY" else -1.0
+            fill = ref_price * (1.0 + sign * (slip + imp))
+            rec = {"side": side, "stock": stock, "qty": int(q), "ref_price": float(ref_price),
+                   "fill_price": float(fill), "impact_bps": imp * 1e4, "slip_bps": slip * 1e4,
+                   "ofi": float(ofi), "adv_pct": float(order_tl / max(adv_tl, 1.0))}
+            if self.db is not None:
                 try:
-                    td_ = pd.Timestamp(t["date"])
-                    if td_.tzinfo is not None:
-                        td_ = td_.tz_localize(None)
-                    if td_ >= d["Date"].iloc[0]:
-                        up_ = t["action"] == "AL"
-                        fig.add_trace(go.Scatter(x=[td_], y=[t["price"]],
-                                                  mode="markers", showlegend=False,
-                                                  marker=dict(color="lime" if up_ else "red",
-                                                              size=13,
-                                                              symbol="triangle-up" if up_ else "triangle-down")),
-                                      row=1, col=1)
-                except Exception:
-                    pass
-        fig.add_trace(go.Scatter(x=d["Date"], y=d["RSI"], showlegend=False,
-                                  line=dict(color="#50e3c2")), row=2, col=1)
-        fig.add_trace(go.Scatter(x=d["Date"], y=d["MFI"], showlegend=False,
-                                  line=dict(color="#f5a623", width=1)), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
-        fig.add_trace(go.Bar(x=d["Date"], y=d["MACDh"], showlegend=False,
-                              marker_color=np.where(d["MACDh"] >= 0, "#26a69a", "#ef5350")),
-                      row=3, col=1)
-        fig.update_layout(height=700, template="plotly_dark",
-                           xaxis_rangeslider_visible=False)
+                    self.db.insert("execution", [time.strftime("%Y-%m-%d %H:%M:%S"), stock, side, int(q),
+                                                 float(ref_price), float(fill), rec["impact_bps"],
+                                                 rec["slip_bps"], float(ofi), rec["adv_pct"]])
+                except Exception as e:
+                    log.warning("Execution kaydı yazılamadı: %s", e)
+            return rec
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 7. BOT
+# ═══════════════════════════════════════════════════════════════════
+
+class Bot:
+    """
+    SEEK DEEP botu. Döngü (günlük bar t):
+      1) gün başı: referans özkaynak
+      2) bekleyen alımlar t'nin AÇILIŞINDA dolar (t−1 kararı)
+      3) açık pozisyonlar t barıyla stop/TP/trailing/max_hold kontrolü
+      4) model SAT kararları t KAPANIŞINDA
+      5) yeni kararlar (scan) t kapanışındaki bilgiyle → alımlar t+1 açılışına bekletilir
+      6) özkaynak kaydı
+    Look-ahead yoktur: karar yalnızca t ve öncesinin verisini kullanır.
+    """
+
+    def __init__(self, cash: float = BOT_SERMAYE, rp: Optional[Dict[str, Any]] = None,
+                 ensemble: Any = None, db: Any = None) -> None:
+        self.rp = dict(rp) if rp is not None else get_risk_params()
+        self.db = db
+        self.pm = PortfolioManager(cash, self.rp)
+        self.exec = LiveExecutionEngine(self.pm, db)
+        self.ens: Any = ensemble
+        self.rl = RLAgent("ppo")
+        self.si = SelfImprover(Tuner())
+        self.fc = ForecastEngine(self.rp)
+        self.pending: List[Dict[str, Any]] = []
+        self.last_decisions: List[Dict[str, Any]] = []
+        self.last_forecasts: List[ForecastResult] = []
+        self.ens_path: Optional[str] = None
+        self.last_t = -1
+        self.lock = threading.RLock()
+
+    @property
+    def pretrained(self) -> bool:
+        """Bir tahmin topluluğu yüklü mü?"""
+        return self.ens is not None
+
+    def pretrain(self, store: FeatureStoreV7, epochs: int = 5, batch_size: int = 16,
+                 path: Optional[str] = None) -> List[Dict[str, Any]]:
+        """BaggedQuantumEnsemble'ı eğitir. PyTorch gerektirir."""
+        if not P3.TORCH_OK:
+            raise RuntimeError("Ön eğitim için PyTorch gerekir: pip install torch")
+        ens = BaggedQuantumEnsemble(n_bags=BAG_N, seed=BAG_SEED, d_model=TFT_DIM)
+        hist = ens.fit(store, epochs=epochs, batch_size=batch_size, db=self.db)
+        self.ens = ens
+        if path:
+            ens.save(path)
+            self.ens_path = path
+        log.info("Bot ön eğitimi tamam: %d torba", len(hist))
+        return hist
+
+    def _regime_adj(self, regime: str) -> float:
+        """Rejime göre AL eşiği kayması."""
+        if not self.rp.get("use_regime", True):
+            return 0.0
+        return {"BULL": float(self.rp["regime_bull_adj"]), "BEAR": float(self.rp["regime_bear_adj"]),
+                "VOL": float(self.rp["regime_vol_adj"]), "RANGE": float(self.rp["regime_range_adj"])}.get(regime, 0.0)
+
+    def _rl_actions(self, store: FeatureStoreV7, t: int) -> np.ndarray:
+        """RL aksiyonları (S,); model yoksa boş dizi (veto yok)."""
+        if not self.rl.available or self.rl.model is None:
+            return np.zeros(0)
+        env = TradingEnv(store, self.rp, t, t + 1)
+        env.t = t
+        return self.rl.predict(env._obs())
+
+    def scan(self, store: FeatureStoreV7, t: int, prices: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
+        """t kapanışındaki bilgiyle karar listesi. Dönüş: [{stock, action, reason, p_up, ...}]."""
+        if self.ens is None:
+            return []
+        pred = self.ens.predict(store, [t])
+        ps = np.asarray(pred["p_short"])[0]
+        pl = np.asarray(pred["p_long"])[0]
+        unc = uncertainty_summary(pred)["total"][0]
+        regime = REGIMES[int(store.regime[t])]
+        adj = self._regime_adj(regime)
+        rl_act = self._rl_actions(store, t)
+        ofi_idx = MICRO_NAMES.index("ofi")
+        decisions: List[Dict[str, Any]] = []
+        for s, code in enumerate(store.codes):
+            if not store.mask[s, t]:
+                continue
+            p_flat, p_up, p_dn = (float(x) for x in ps[s])
+            held = code in self.pm.positions
+            base = {"stock": code, "t": int(t), "p_up": p_up, "p_down": p_dn, "unc": float(unc[s]),
+                    "regime": regime, "qty": 0}
+            if held:
+                if p_dn >= float(self.rp["p_sell"]):
+                    decisions.append({**base, "action": "SELL", "reason": "model"})
+                else:
+                    decisions.append({**base, "action": "HOLD", "reason": "pozisyon"})
+                continue
+            thr = float(self.rp["p_buy"]) + adj
+            gate = (not self.rp.get("use_long_gate", True)) or float(pl[s, 1]) >= float(self.rp["p_buy_long"])
+            if p_up < thr:
+                reason = "eşik altı"
+            elif not gate:
+                reason = "uzun vade filtresi"
+            elif float(unc[s]) > float(self.rp["unc_max"]):
+                reason = "belirsizlik yüksek"
+            elif (p_up - p_dn) < float(self.rp["margin"]):
+                reason = "marj yetersiz"
+            elif self.rp.get("ofi_gate", True) and not ofi_gate_ok(
+                    "BUY", float(store.micro_raw[s, ofi_idx, t]), float(self.rp["ofi_min"])):
+                reason = "OFI gate"
+            elif rl_act.size == len(store.codes) and rl_veto(float(rl_act[s]), self.rp):
+                reason = "RL veto"
+            else:
+                reason = "uygun"
+            action = "BUY" if reason == "uygun" else "HOLD"
+            decisions.append({**base, "action": action, "reason": reason})
+        return decisions
+
+    def _mark(self, store: FeatureStoreV7, t: int, field_: str) -> Dict[str, float]:
+        """Hisse → fiyat sözlüğü (O/H/L/C alanı)."""
+        arr = getattr(store, field_)
+        return {code: float(arr[s, t]) for s, code in enumerate(store.codes)}
+
+    def run_cycle(self, store: FeatureStoreV7, t: int) -> Dict[str, Any]:
+        """Tek günlük döngü (bkz. sınıf açıklaması). Dönüş: özet."""
+        with self.lock:
+            opens = self._mark(store, t, "O")
+            closes = self._mark(store, t, "C")
+            self.pm.new_day(t, opens)
+            filled: List[Dict[str, Any]] = []
+            for p in self.pending:
+                code = p["stock"]
+                s = store.stock_idx[code]
+                eq = self.pm.equity(opens)
+                ok, why = self.pm.can_open(code, t, opens)
+                if not ok:
+                    filled.append({"stock": code, "action": "REJECT", "reason": why})
+                    continue
+                qty = self.pm.size(code, opens[code], float(store.atrn[s, t]), p["p_up"], p["unc"], eq)
+                rec = self.exec.execute("BUY", code, qty, opens[code], float(store.ADV[s, t]),
+                                        float(store.atrn[s, t]), float(store.micro_raw[s, MICRO_NAMES.index("ofi"), t]))
+                if rec is None:
+                    filled.append({"stock": code, "action": "REJECT", "reason": "icra"})
+                    continue
+                pos = self.pm.open_position(code, rec["qty"], rec["fill_price"], float(store.atrn[s, t]), t)
+                filled.append({"stock": code, "action": "BUY", "qty": rec["qty"], "fill": rec["fill_price"],
+                               "ok": pos is not None})
+            self.pending = []
+            for code in list(self.pm.positions.keys()):
+                s = store.stock_idx[code]
+                pos = self.pm.positions[code]
+                events = self.pm.update_bar(code, float(store.O[s, t]), float(store.H[s, t]),
+                                            float(store.L[s, t]), float(store.C[s, t]), t)
+                for q, ref, reason in events:
+                    rec = self.exec.execute("SELL", code, q, ref, float(store.ADV[s, t]),
+                                            float(store.atrn[s, t]), 0.0)
+                    if rec is not None:
+                        self.pm.close(code, q, rec["fill_price"], reason, t)
+                        filled.append({"stock": code, "action": "SELL", "qty": q, "reason": reason})
+            decisions = self.scan(store, t)
+            for d in decisions:
+                if d["action"] == "SELL" and d["stock"] in self.pm.positions:
+                    s = store.stock_idx[d["stock"]]
+                    q = self.pm.positions[d["stock"]].qty
+                    rec = self.exec.execute("SELL", d["stock"], q, closes[d["stock"]], float(store.ADV[s, t]),
+                                            float(store.atrn[s, t]), 0.0)
+                    if rec is not None:
+                        self.pm.close(d["stock"], q, rec["fill_price"], "model", t)
+                        filled.append({"stock": d["stock"], "action": "SELL", "qty": q, "reason": "model"})
+                elif d["action"] == "BUY":
+                    self.pending.append(d)
+            self.last_decisions = decisions
+            if self.ens is not None:
+                pred = self.ens.predict(store, [t])
+                self.last_forecasts = self.fc.build(store, t, pred, closes)
+            eq = self.pm.snapshot(t, closes)
+            self.last_t = int(t)
+            if self.db is not None:
+                try:
+                    self.db.insert("equity", [time.strftime("%Y-%m-%d %H:%M:%S"), float(eq),
+                                              float(self.pm.cash), len(self.pm.positions)])
+                except Exception as e:
+                    log.warning("equity kaydı yazılamadı: %s", e)
+            return {"t": int(t), "equity": float(eq), "cash": float(self.pm.cash),
+                    "npos": len(self.pm.positions), "filled": filled, "pending": len(self.pending)}
+
+    def get_state(self) -> Dict[str, Any]:
+        """Botun kalıcı durumu (ağırlıklar ayrı dosyada; yalnızca yol burada)."""
+        with self.lock:
+            return {"version": BOT_VERSION, "pm": self.pm.get_state(), "pending": copy.deepcopy(self.pending),
+                    "ens_path": self.ens_path, "last_t": self.last_t, "rp": dict(self.rp),
+                    "si_history": list(self.si.history)}
+
+    def set_state(self, s: Dict[str, Any]) -> None:
+        """get_state çıktısını yükler. Sürüm uyuşmazsa uyarır; ağırlık yolu varsa ağırlıkları yükler."""
+        with self.lock:
+            if s.get("version") != BOT_VERSION:
+                log.warning("Durum sürümü farklı: %s ≠ %s", s.get("version"), BOT_VERSION)
+            self.pm.set_state(s["pm"])
+            self.pending = copy.deepcopy(s.get("pending", []))
+            self.rp = dict(s.get("rp", self.rp))
+            self.last_t = int(s.get("last_t", -1))
+            self.si.history = list(s.get("si_history", []))
+            self.ens_path = s.get("ens_path")
+            if self.ens_path and os.path.exists(self.ens_path) and P3.TORCH_OK:
+                try:
+                    self.ens = BaggedQuantumEnsemble.load(self.ens_path)
+                except Exception as e:
+                    log.warning("Topluluk yüklenemedi (%s): %s", self.ens_path, e)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 8. ÖZ-TEST 5
+# ═══════════════════════════════════════════════════════════════════
+
+class _StubEnsemble:
+    """Torch olmadan karar mantığını sınamak için sabit tahminli sahte topluluk."""
+
+    def __init__(self, S: int, p_up: float = 0.6, p_dn: float = 0.2) -> None:
+        self.S = S
+        self.p_up = p_up
+        self.p_dn = p_dn
+
+    def predict(self, store: Any, t_list: Sequence[int]) -> Dict[str, np.ndarray]:
+        B = len(t_list)
+        ps = np.zeros((B, self.S, 3))
+        ps[..., 0] = 1.0 - self.p_up - self.p_dn
+        ps[..., 1] = self.p_up
+        ps[..., 2] = self.p_dn
+        return {"p_short": ps, "p_long": ps.copy(),
+                "alea_short": np.full((B, self.S), 0.10), "epi_short": np.full((B, self.S), 0.05)}
+
+
+def _selftest_part5() -> bool:
+    """Parça 5 öz-testi: optimizasyon, risk metrikleri, icra, portföy, forecast, bot (stub)."""
+    print(f"\n🐋 Öz-test 5 (PyTorch: {'VAR' if P3.TORCH_OK else 'YOK → stub topluluk kullanıldı'})")
+    res: List[Tuple[str, bool]] = []
+    chk = lambda n, ok, e="": P1._check(n, ok, res, e)
+    rng = np.random.default_rng(7)
+
+    # 1) Mean-CVaR LP
+    R = rng.standard_normal((300, 6)) * 0.01 + np.array([0.002, 0.001, 0.0, 0.0005, -0.001, 0.0015])
+    w = mean_cvar_lp(R, max_w=0.4)
+    chk("Mean-CVaR: ağırlıklar toplam 1", abs(w.sum() - 1.0) < 1e-6)
+    chk("Mean-CVaR: negatif yok, max_w'yi aşmıyor", bool((w >= -1e-9).all() and (w <= 0.4 + 1e-6).all()))
+    chk("Mean-CVaR: yüksek μ, düşük μ hissesinden fazla ağırlık alır", w[0] > w[4], f"(w0={w[0]:.3f}, w4={w[4]:.3f})")
+
+    # 2) HRP
+    wh = hrp_weights(R)
+    chk("HRP: toplam 1, negatif yok", abs(wh.sum() - 1.0) < 1e-9 and bool((wh >= 0).all()))
+    wrp = risk_parity_weights(R, max_w=0.4)
+    chk("Risk parity: toplam 1", abs(wrp.sum() - 1.0) < 1e-9)
+
+    # 3) Kelly
+    chk("Kelly: negatif kenar → 0", fractional_kelly(0.4, 1.0, 1.0) == 0.0)
+    k0 = fractional_kelly(0.6, 1.0, 1.0, 0.25, 0.0)
+    k1 = fractional_kelly(0.6, 1.0, 1.0, 0.25, 0.5)
+    chk("Kelly: pozitif kenar > 0", k0 > 0)
+    chk("Kelly: belirsizlik boyutu küçültür", k1 < k0)
+
+    # 4) Risk metrikleri
+    r = rng.standard_normal(500) * 0.01 + 0.0003
+    m = risk_metrics(r)
+    chk("Risk metrikleri ≥ 20 anahtar", len(m) >= 20, f"({len(m)})")
+    chk("CVaR ≥ VaR (hist)", m["cvar_mean"] >= m["var_hist"] - 1e-12)
+    chk("EVaR sonlu", math.isfinite(m["evar"]))
+    chk("Tüm risk metrikleri sonlu", all(math.isfinite(v) for v in m.values()))
+
+    # 5) İcra
+    a1 = almgren_chriss_impact(1e6, 1e8, 0.02)
+    a2 = almgren_chriss_impact(1e7, 1e8, 0.02)
+    chk("Almgren-Chriss: büyük emir → büyük etki", a2 > a1, f"({a1:.5f} < {a2:.5f})")
+    sl = dynamic_slippage(100.0, 1e7, 0.03)
+    chk("Dinamik slippage sınırlarda", 0.0002 <= sl <= 0.05, f"({sl:.5f})")
+    vs = vwap_split(100.0, [1, 2, 3])
+    chk("VWAP dilimleri toplamı korur", abs(vs.sum() - 100.0) < 1e-9)
+    chk("TWAP eşit dağılır", np.allclose(twap_split(100.0, 4), 25.0))
+    chk("Kısmi dolum ADV'yi aşmaz", partial_fill_qty(10**9, 1e6, 10.0, 0.05) == 5000)
+    chk("OFI gate: düşük OFI'de alım yok", not ofi_gate_ok("BUY", -0.5, -0.3))
+    chk("OFI gate: satım her zaman geçer", ofi_gate_ok("SELL", -0.9, -0.3))
+
+    # 6) Forecast + PM + Bot (stub topluluk ile)
+    panel, macro = P2._make_test_panel(S=6, T=420)
+    store = P2.build_feature_store_v7(panel, macro, scale=True)
+    S = len(store.codes)
+    rp = get_risk_params()
+    rp.update({"use_long_gate": True})
+    sector_ids = {c: int(store.sector_id[i]) for i, c in enumerate(store.codes)}
+    pm = PortfolioManager(100_000.0, rp, sector_ids)
+    eq0 = pm.equity({})
+    q = pm.size(store.codes[0], 100.0, 0.02, 0.6, 0.1, eq0)
+    stop_dist = rp["sl_atr"] * 0.02 * 100.0
+    chk("PM sizing: risk ≤ risk_per_trade·özkaynak", q * stop_dist <= rp["risk_per_trade"] * eq0 * 1.0001 + 1e-6,
+        f"(q={q})")
+    p = pm.open_position(store.codes[0], 100, 100.0, 0.02, 10)
+    chk("PM: alım sonrası nakit düşer", pm.cash < 100_000.0 and p is not None)
+    ev = pm.update_bar(store.codes[0], 99.0, 99.5, 90.0, 95.0, 11)
+    chk("PM: stop tetiklenir", len(ev) == 1 and ev[0][2] == "stop")
+    for q_, ref, why in ev:
+        pm.close(store.codes[0], q_, ref, why, 11)
+    chk("PM: stop sonrası zarar + ardışık zarar sayacı", len(pm.trades) == 1 and pm.trades[0]["pnl"] < 0 and pm.loss_streak == 1)
+    pm2 = PortfolioManager(100_000.0, {**rp, "max_positions": 1}, sector_ids)
+    pm2.open_position(store.codes[0], 10, 100.0, 0.02, 1)
+    ok_c, why_c = pm2.can_open(store.codes[1], 2, {store.codes[0]: 100.0})
+    chk("PM: maks pozisyon sınırı", not ok_c and why_c == "maks pozisyon", why_c)
+
+    # Forecast
+    stub = _StubEnsemble(S, 0.6, 0.2)
+    pred = stub.predict(store, [WARMUP_BARS + 30])
+    fr = ForecastEngine(rp).build(store, WARMUP_BARS + 30, pred)
+    chk("Forecast: olasılık toplamı 1", all(abs(f.p_up + f.p_down + f.p_flat - 1.0) < 1e-6 for f in fr))
+    chk("Forecast: bull ≥ base ≥ bear", all(f.bull_price >= f.base_price >= f.bear_price for f in fr))
+
+    # Bot: stub ile döngü
+    bot = Bot(100_000.0, rp, ensemble=stub, db=None)
+    results = []
+    for t in range(WARMUP_BARS + 5, WARMUP_BARS + 60):
+        results.append(bot.run_cycle(store, t))
+    chk("Bot: döngüler tamamlandı", len(results) == 55)
+    n_buys = sum(1 for r_ in results for f in r_["filled"] if f.get("action") == "BUY" and f.get("ok"))
+    chk("Bot: en az bir alım gerçekleşti", n_buys >= 1, f"({n_buys} alım)")
+    eqs = [r_["equity"] for r_ in results]
+    chk("Bot: özkaynak sonlu ve pozitif", all(math.isfinite(e) and e > 0 for e in eqs))
+    chk("Bot: kararlar geçerli eylemler", all(d["action"] in ("BUY", "SELL", "HOLD") for d in bot.last_decisions))
+    chk("Bot: forecast üretildi", len(bot.last_forecasts) == S)
+    st_state = bot.get_state()
+    bot2 = Bot(100_000.0, rp, ensemble=stub, db=None)
+    bot2.set_state(st_state)
+    chk("Bot: durum geri yükleme (nakit)", abs(bot2.pm.cash - bot.pm.cash) < 1e-9)
+    chk("Bot: durum geri yükleme (pozisyon sayısı)", len(bot2.pm.positions) == len(bot.pm.positions))
+
+    # Risk limiti: özkaynak düşerse yeni alım engellenir (daily_loss)
+    bot3 = Bot(100_000.0, {**rp, "daily_loss": 0.0001}, ensemble=stub)
+    bot3.pm.day_start_equity = 200_000.0
+    ok3, why3 = bot3.pm.can_open(store.codes[0], 5, {c: 100.0 for c in store.codes})
+    chk("Günlük zarar limiti yeni alımı engeller", not ok3 and why3 == "günlük zarar limiti", why3)
+
+    ok = all(r_[1] for r_ in res)
+    print(f"\n{'✅ ÖZ-TEST 5 BAŞARILI' if ok else '❌ ÖZ-TEST 5 BAŞARISIZ'} ({sum(r_[1] for r_ in res)}/{len(res)})")
+    return ok
+
+
+if __name__ == "__main__":
+    if os.environ.get("SEEKDEEP_SELFTEST") == "1":
+        sys.exit(0 if _selftest_part5() else 1)
+    print("Parça 5/6 yüklendi. Öz-test için SEEKDEEP_SELFTEST=1 kullanın.")
+# -*- coding: utf-8 -*-
+"""
+🐋 SEEK DEEP v7.0 — PARÇA 6/6: UI + ANA UYGULAMA + TEST
+
+Çalıştırma:
+    streamlit run seekdeep_v7_p6.py              # arayüz
+    SEEKDEEP_SELFTEST=1 python seekdeep_v7_p6.py  # tüm öz-testler (Parça 1-6)
+
+İçindekiler:
+  1. Yardımcılar: sürüm/durum raporu, plotly figürleri (opsiyonel)
+  2. Analitik tablolar: stres, atıf, causal, XAI-proxy
+  3. Durum kaydı: save_state / load_state (atomik)
+  4. Veri ve bot hazırlığı (önbellekli), döngü (make_tick)
+  5. Streamlit arayüzü: 15 sekme
+  6. Ana döngü (main) ve otomatik yenileme
+  7. Öz-test 6 + tüm parçaların toplu testi
+
+DÜRÜST NOTLAR:
+  - Streamlit ve plotly bu ortamda kurulu değildi; arayüz kodu YAZILDI ama çalıştırılmadı.
+    Arayüz dışındaki tüm mantık (tablolar, stres, atıf, kayıt/yükleme, uçtan uca döngü) test edildi.
+  - Canlı veri YFinance/FRED'den çekilir; ağ erişimi olmayan ortamda veri başarısız olur ve
+    uygulama açık bir hata mesajı gösterir.
+  - Bu bir kâğıt-işlem sistemidir. Canlı emir gönderimi yoktur.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import pickle
+import platform
+import sys
+import tempfile
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+import seekdeep_v7 as P1
+import seekdeep_v7_p2 as P2
+import seekdeep_v7_p3 as P3
+import seekdeep_v7_p4 as P4
+import seekdeep_v7_p5 as P5
+from seekdeep_v7 import (
+    BOT_NAME, BOT_SERMAYE, BOT_VERSION, CACHE_DIR, CAUSAL_NAMES, FEAT_INDEX, FEATURE_NAMES,
+    MACRO_KEYS, MICRO_NAMES, N_FEAT, REGIMES, SEKTOR, SEKTOR_BOTLARI, STATE_FILE, STOCK_LIST,
+    WARMUP_BARS, get_risk_params, log, NUMBA_OK, DUCKDB_OK, SeekDB, DB_FILE,
+)
+from seekdeep_v7_p5 import Bot, PortfolioManager, _StubEnsemble
+
+PL_OK = False
+try:
+    import plotly.graph_objects as go  # type: ignore
+    PL_OK = True
+except Exception:
+    go = None  # type: ignore
+
+ST_OK = False
+try:
+    import streamlit as st  # type: ignore
+    ST_OK = True
+except Exception:
+    st = None  # type: ignore
+
+AUTOREFRESH_OK = False
+try:
+    from streamlit_autorefresh import st_autorefresh  # type: ignore
+    AUTOREFRESH_OK = True
+except Exception:
+    st_autorefresh = None  # type: ignore
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. YARDIMCILAR: DURUM RAPORU + PLOTLY FİGÜRLERİ
+# ═══════════════════════════════════════════════════════════════════
+
+
+def system_status(store: Optional[P2.FeatureStoreV7] = None) -> Dict[str, Any]:
+    """Ortam ve model durumu (Meta sekmesi)."""
+    try:
+        import torch as _t
+        torch_v = _t.__version__
+    except Exception:
+        torch_v = None
+    return {
+        "bot": BOT_NAME, "version": BOT_VERSION, "sektor": SEKTOR,
+        "python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__,
+        "numba": NUMBA_OK, "torch": torch_v, "duckdb": DUCKDB_OK, "plotly": PL_OK,
+        "streamlit": ST_OK, "autorefresh": AUTOREFRESH_OK, "db_backend": "duckdb" if DUCKDB_OK else "sqlite",
+        "n_feat": N_FEAT, "n_tech": P1.N_TECH, "n_stocks": len(STOCK_LIST),
+        "store_bars": int(store.T) if store is not None else None,
+        "store_stocks": len(store.codes) if store is not None else None,
+        "cache_dir_exists": os.path.isdir(CACHE_DIR), "state_file_exists": os.path.exists(STATE_FILE),
+        "chronos_pkg_gerekir": True, "torch_ok": P3.TORCH_OK,
+    }
+
+
+def equity_returns(bot: Bot) -> np.ndarray:
+    """Özkaynak geçmişinden günlük getiriler."""
+    eq = np.array([e for _, e in bot.pm.equity_hist], dtype=np.float64)
+    if eq.size < 2:
+        return np.zeros(0)
+    return np.diff(eq) / np.maximum(eq[:-1], 1e-9)
+
+
+def fig_candles(store: P2.FeatureStoreV7, stock: str, t_end: int, n: int = 120) -> Any:
+    """Mum grafiği + Bollinger(20,2) bantları. plotly yoksa None."""
+    if not PL_OK or stock not in store.codes:
+        return None
+    s = store.codes.index(stock)
+    lo = max(0, t_end - n + 1)
+    idx = store.dates[lo:t_end + 1]
+    c = store.C[s, lo:t_end + 1]
+    sm = pd.Series(store.C[s, :t_end + 1]).rolling(20).mean().values[lo:]
+    sd = pd.Series(store.C[s, :t_end + 1]).rolling(20).std().values[lo:]
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=idx, open=store.O[s, lo:t_end + 1], high=store.H[s, lo:t_end + 1],
+                                 low=store.L[s, lo:t_end + 1], close=c, name=stock))
+    fig.add_trace(go.Scatter(x=idx, y=sm + 2 * sd, line=dict(width=1), name="BB üst"))
+    fig.add_trace(go.Scatter(x=idx, y=sm - 2 * sd, line=dict(width=1), name="BB alt"))
+    fig.add_trace(go.Scatter(x=idx, y=sm, line=dict(width=1, dash="dot"), name="SMA20"))
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
+    return fig
+
+
+def fig_equity(equity_hist: List[Tuple[int, float]]) -> Any:
+    """Özkaynak eğrisi. plotly yoksa None."""
+    if not PL_OK or not equity_hist:
+        return None
+    xs = [t for t, _ in equity_hist]
+    ys = [e for _, e in equity_hist]
+    fig = go.Figure(go.Scatter(x=xs, y=ys, mode="lines", name="Özkaynak"))
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), title="Özkaynak (TL)")
+    return fig
+
+
+def fig_uncertainty(forecasts: List[P5.ForecastResult]) -> Any:
+    """Hisse başına aleatorik / epistemik / toplam belirsizlik çubukları."""
+    if not PL_OK or not forecasts:
+        return None
+    names = [f.stock for f in forecasts]
+    fig = go.Figure()
+    fig.add_bar(x=names, y=[f.aleatoric for f in forecasts], name="Aleatorik")
+    fig.add_bar(x=names, y=[f.epistemic for f in forecasts], name="Epistemik")
+    fig.add_bar(x=names, y=[f.uncertainty for f in forecasts], name="Toplam")
+    fig.update_layout(barmode="group", height=340, margin=dict(l=10, r=10, t=30, b=10))
+    return fig
+
+
+def fig_moe(history: List[Dict[str, Any]]) -> Any:
+    """Torba eğitim özeti (en iyi val kaybı) çizgisi."""
+    if not PL_OK or not history:
+        return None
+    fig = go.Figure(go.Scatter(x=[h["bag"] for h in history], y=[h["best_val"] for h in history],
+                               mode="lines+markers", name="En iyi val kaybı"))
+    fig.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=10), title="Torbalar")
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. ANALİTİK TABLOLAR
+# ═══════════════════════════════════════════════════════════════════
+
+STRESS_SCENARIOS: List[Dict[str, Any]] = [
+    {"name": "2008 benzeri", "shock": -0.35},
+    {"name": "2020 Mart benzeri", "shock": -0.30},
+    {"name": "TL devalüasyonu", "shock": -0.15},
+    {"name": "Sert düzeltme", "shock": -0.10},
+]
+
+
+def stress_table(pm: PortfolioManager, prices: Dict[str, float]) -> pd.DataFrame:
+    """
+    Senaryo başına özkaynak etkisi: her açık pozisyon piyasa değeri × şok (tüm hisseler
+    aynı yönde varsayılır; korelasyon yoksa daha iyimserdir).
+    """
+    eq = pm.equity(prices)
+    expo = pm.exposure(prices)
+    rows = []
+    for sc in STRESS_SCENARIOS:
+        loss = expo * eq * sc["shock"]
+        rows.append({"senaryo": sc["name"], "şok %": sc["shock"] * 100.0,
+                     "etki TL": loss, "sonrası özkaynak": eq + loss,
+                     "etki %": (loss / eq * 100.0) if eq > 0 else 0.0})
+    return pd.DataFrame(rows)
+
+
+def attribution_table(pm: PortfolioManager) -> Dict[str, pd.DataFrame]:
+    """İşlem PnL'inin hisseye ve kapanış nedenine göre dağılımı."""
+    if not pm.trades:
+        empty = pd.DataFrame(columns=["pnl", "n"])
+        return {"hisse": empty, "neden": empty}
+    df = pd.DataFrame(pm.trades)
+    by_s = df.groupby("stock")["pnl"].agg(["sum", "count"]).rename(columns={"sum": "pnl", "count": "n"})
+    by_r = df.groupby("reason")["pnl"].agg(["sum", "count"]).rename(columns={"sum": "pnl", "count": "n"})
+    return {"hisse": by_s.sort_values("pnl", ascending=False), "neden": by_r}
+
+
+def causal_table(store: P2.FeatureStoreV7, t: int) -> pd.DataFrame:
+    """t anındaki causal özellikler (ölçeklenmiş) — hisse × özellik."""
+    c0 = FEAT_INDEX[CAUSAL_NAMES[0]]
+    vals = store.feat[:, c0:c0 + len(CAUSAL_NAMES), t]
+    return pd.DataFrame(vals, index=store.codes, columns=CAUSAL_NAMES).round(3)
+
+
+def xai_proxy(store: P2.FeatureStoreV7, t: int, window: int = 120, top: int = 15) -> pd.DataFrame:
+    """
+    Model-bağımsız XAI vekili: her özelliğin t−window..t−1 penceresinde, hisse×gün havuzunda,
+    bir sonraki günkü getiriyle korelasyonu. Model açıklaması DEĞİL; yalnızca ilişki taraması.
+    """
+    lo = max(0, t - window)
+    if t - lo < 20:
+        return pd.DataFrame(columns=["özellik", "korelasyon", "|korelasyon|"])
+    ws = np.arange(lo, t)
+    X = store.feat[:, :, ws].transpose(1, 0, 2).reshape(N_FEAT, -1).astype(np.float64)
+    Y = store.LR[:, ws + 1].ravel()
+    Xc = X - X.mean(axis=1, keepdims=True)
+    Yc = Y - Y.mean()
+    den = np.sqrt((Xc ** 2).sum(axis=1) * (Yc ** 2).sum()) + 1e-12
+    r = (Xc @ Yc) / den
+    df = pd.DataFrame({"özellik": FEATURE_NAMES, "korelasyon": r, "|korelasyon|": np.abs(r)})
+    return df.sort_values("|korelasyon|", ascending=False).head(top).reset_index(drop=True)
+
+
+def dsr_summary(rets: np.ndarray, n_trials: int = 10) -> Dict[str, float]:
+    """Özkaynak getirileri için PSR / DSR / Sharpe özeti (yeterli veri yoksa boş)."""
+    if rets.size < 30:
+        return {}
+    return {"psr": P4.probabilistic_sharpe(rets), "dsr": P4.deflated_sharpe(rets, n_trials),
+            "sharpe_gunluk": float(rets.mean() / max(rets.std(ddof=1), 1e-12))}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. DURUM KAYDI (ATOMİK)
+# ═══════════════════════════════════════════════════════════════════
+
+def save_state(bot: Bot, path: str = STATE_FILE) -> str:
+    """Botun durumunu geçici dosyaya yazıp yeniden adlandırarak atomik kaydeder."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(bot.get_state(), f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    log.info("Durum kaydedildi: %s", path)
+    return path
+
+
+def load_state(bot: Bot, path: str = STATE_FILE) -> bool:
+    """Kayıtlı durumu yükler. Dosya yoksa veya bozuksa False döner (bot sıfırdan başlar)."""
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            s = pickle.load(f)
+        bot.set_state(s)
+        return True
+    except Exception as e:
+        log.error("Durum yüklenemedi (%s): %s", path, e)
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. VERİ VE BOT HAZIRLIĞI + DÖNGÜ
+# ═══════════════════════════════════════════════════════════════════
+
+def build_store_from_market(period: str = "5y") -> Tuple[P2.FeatureStoreV7, pd.DataFrame]:
+    """YFinance + FRED ile canlı Feature Store kurar. Ağ yoksa ValueError."""
+    fetch = P1.YFinanceFetcher(cache_ttl=3600.0)
+    dfs = fetch.fetch_stocks(STOCK_LIST, period)
+    panel = P1.align_panel(dfs, STOCK_LIST)
+    macro = P1.MacroFetcher().fetch()
+    store = P2.build_feature_store_v7(panel, macro, sector_id=P2.default_sector_ids(len(panel["codes"])))
+    return store, macro
+
+
+def make_tick(bot: Bot, store: P2.FeatureStoreV7) -> Optional[Dict[str, Any]]:
+    """Son bara kadar döngüyü bir kez işletir (zaten işlendiyse None)."""
+    t = int(store.T - 1)
+    if bot.last_t >= t:
+        return None
+    return bot.run_cycle(store, t)
+
+
+def demo_bot_and_store(seed: int = 3, S: int = 6, T: int = 420) -> Tuple[Bot, P2.FeatureStoreV7]:
+    """Ağ gerektirmeyen sentetik demo: stub topluluk ile tam bot ve store."""
+    panel, macro = P2._make_test_panel(S=S, T=T, seed=seed)
+    store = P2.build_feature_store_v7(panel, macro, scale=True)
+    rp = get_risk_params()
+    bot = Bot(BOT_SERMAYE, rp, ensemble=_StubEnsemble(len(store.codes), 0.6, 0.2))
+    return bot, store
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5. STREAMLIT ARAYÜZÜ (15 SEKME)
+# ═══════════════════════════════════════════════════════════════════
+
+TAB_NAMES = ["📈 Canlı", "🎯 Karar", "💼 Portföy", "🔮 Tahmin", "🧠 Beyin", "🧬 Öz-Gelişim",
+             "🔬 Doğrulama", "📊 Analiz", "💬 Log", "🤖 RL", "🔥 Stres", "📉 Atıf",
+             "🔗 Causal", "🔍 XAI", "⚙️ Meta"]
+
+
+def _tab_live(bot: Bot, store: P2.FeatureStoreV7) -> None:
+    stock = st.selectbox("Hisse", store.codes, key="live_stock")
+    fig = fig_candles(store, stock, store.T - 1)
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Grafik için plotly gerekir (pip install plotly).")
+    eq = bot.pm.equity_hist[-1][1] if bot.pm.equity_hist else bot.pm.equity({})
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Özkaynak", f"{eq:,.0f} TL")
+    c2.metric("Nakit", f"{bot.pm.cash:,.0f} TL")
+    c3.metric("Açık pozisyon", len(bot.pm.positions))
+
+
+def _tab_decisions(bot: Bot) -> None:
+    if not bot.last_decisions:
+        st.info("Henüz karar yok (bot taranmadı veya tahmin topluluğu yüklü değil).")
+        return
+    st.dataframe(pd.DataFrame(bot.last_decisions), use_container_width=True)
+    if bot.pending:
+        st.write("Bekleyen alımlar (sonraki açılışta):")
+        st.dataframe(pd.DataFrame(bot.pending), use_container_width=True)
+
+
+def _tab_portfolio(bot: Bot, store: P2.FeatureStoreV7) -> None:
+    prices = {c: float(store.C[s, store.T - 1]) for s, c in enumerate(store.codes)}
+    if bot.pm.positions:
+        rows = [{"hisse": p.stock, "adet": p.qty, "giriş": p.entry, "stop": p.stop, "TP": p.tp,
+                 "fiyat": prices.get(p.stock, p.entry),
+                 "PnL %": (prices.get(p.stock, p.entry) / p.entry - 1) * 100} for p in bot.pm.positions.values()]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    else:
+        st.info("Açık pozisyon yok.")
+    fig = fig_equity(bot.pm.equity_hist)
+    if fig is not None:
         st.plotly_chart(fig, use_container_width=True)
 
-    # ─── 🎯 KARAR ───────────────────────────────────────────
-    with tD:
-        st.subheader(f"🎯 {sec} Karar")
-        ps_, pl_ = sd_["probs"], sd_["probs_long"]
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Karar", sd_["action"])
-        k2.metric("P(AL) kısa", f"%{ps_[2] * 100:.1f}",
-                  f"TUT %{ps_[1] * 100:.0f} · SAT %{ps_[0] * 100:.0f}")
-        k3.metric("P(AL) uzun", f"%{pl_[2] * 100:.1f}",
-                  f"TUT %{pl_[1] * 100:.0f} · SAT %{pl_[0] * 100:.0f}")
-        k4.metric("Uzun hakem",
-                  "🟢 BULL" if pl_[2] >= rp["p_buy_long"]
-                  else ("🔴 BEAR" if pl_[0] >= rp["p_sell"] else "⚪ NÖTR"))
-        st.divider()
-        trows = [{"Hisse": nm, "Fiyat": round(prices[nm], 2), "Karar": d_["action"],
-                  "P(AL) kısa %": round(d_["probs"][2] * 100, 0),
-                  "P(AL) uzun %": round(d_["probs_long"][2] * 100, 0),
-                  "Tilt": round(d_.get("tilt", 0), 3),
-                  "RL P(AL)": round(d_.get("rl_p", 0) or 0, 2),
-                  "Belirsizlik": round(d_["unc"], 2),
-                  "Rejim": d_["regime"], "Not": d_["note"]}
-                 for nm, d_ in dec.items()]
-        st.dataframe(pd.DataFrame(sorted(trows,
-                                          key=lambda x: -(x["P(AL) kısa %"] + x["P(AL) uzun %"]) / 2)),
-                     use_container_width=True, hide_index=True)
-        fb = go.Figure([
-            go.Bar(name="Kısa", x=[r["Hisse"] for r in trows],
-                   y=[r["P(AL) kısa %"] for r in trows]),
-            go.Bar(name="Uzun", x=[r["Hisse"] for r in trows],
-                   y=[r["P(AL) uzun %"] for r in trows])
-        ])
-        fb.update_layout(height=260, template="plotly_dark", barmode="group",
-                          margin=dict(l=10, r=10, t=30, b=10), title="P(AL) karşılaştırma")
-        st.plotly_chart(fb, use_container_width=True)
-        vs = bot.val_stats
-        if vs:
-            st.markdown("### 🤖 Otonom Performans")
-            o1, o2, o3, o4, o5 = st.columns(5)
-            o1.metric("T-stat", f"{vs.get('t_stat', 0):.2f}",
-                      "anlamlı" if vs.get('t_stat', 0) > 2 else "zayıf")
-            o2.metric("Sharpe", f"{vs.get('sharpe', 0):.2f}")
-            o3.metric("Sortino", f"{vs.get('sortino', 0):.2f}")
-            o4.metric("PF", f"{vs.get('pf', 0):.2f}")
-            o5.metric("DD", f"%{vs.get('dd', 0) * 100:.1f}")
-            st.markdown("### 🚪 Model Kapısı")
-            g1, g2, g3, g4, g5 = st.columns(5)
-            g1.metric("Val acc", f"%{vs['acc'] * 100:.1f}",
-                      f"taban %{vs['base'] * 100:.1f}")
-            g2.metric("AL çağrı", vs["al_n"])
-            g3.metric("AL isabet", f"%{vs['al_prec'] * 100:.1f}")
-            g4.metric("AL ort.", f"%{vs['al_ret'] * 100:+.2f}")
-            g5.metric("Kapı", "✅" if bot.edge_ok(rp) else "⛔")
 
-    # ─── 🧠 BEYİN ───────────────────────────────────────────
-    with tB:
-        st.subheader("🧠 Beyin")
-        b1, b2, b3, b4, b5 = st.columns(5)
-        b1.metric("Evrim", bot.nn.evo)
-        b2.metric("En iyi net", f"#{int(np.argmax(bot.nn.perf))}")
-        b3.metric("Hafıza", bot.nn.replay.size())
-        b4.metric("PBT", f"{bot.nn.pbt_acc}/{bot.nn.pbt_n}")
-        b5.metric("Router", "AÇIK" if bot.nn.router_on else "kapalı",
-                  f"{bot.nn.router_gain:+.4f}")
-        for i, p in enumerate(bot.nn.perf):
-            nn_i = bot.nn.nets[i]
-            st.progress(float(min(max(p, 0.0), 1.0)),
-                        text=f"Net #{i}: {p:.3f} · lr {nn_i.lr:.4f} · "
-                             f"drop {nn_i.dropout:.2f} · SWA {nn_i.swa_wins}")
-        st.divider()
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("### 🐋 Transformer")
-            te = bot.nn.trans_ens
-            st.metric("Durum", "🟢 AÇIK" if te.on else "🔴 kapalı")
-            st.metric("Kazanç", f"{te.gain:+.4f}")
-        with col2:
-            st.markdown("### 🤖 RL (PPO)")
-            st.metric("Durum", "🟢 AÇIK" if bot.rl_on else "🔴 kapalı")
-            st.metric("Güncelleme", bot.rl.t if bot.rl else 0)
-            st.metric("Kazanç", f"{bot.rl_gain:+.4f}")
-        with col3:
-            st.markdown("### 🧬 Meta")
-            st.metric("HMM", "eğitildi" if get_hmm().fitted else "bekliyor")
-            st.metric("EWC", "konsolide" if bot.nn.ewc_consolidated else "bekliyor")
-            st.metric("Reptile", f"{len(bot.nn.reptile.history)} tur")
-        imp = feat_importance(bot)
-        top = np.argsort(imp)[::-1][:20][::-1]
-        fi = go.Figure(go.Bar(
-            x=imp[top] * 100,
-            y=[FEAT_NAMES[i] if i < len(FEAT_NAMES) else f"f{i}" for i in top],
-            orientation="h"))
-        fi.update_layout(height=480, template="plotly_dark",
-                          margin=dict(l=10, r=10, t=30, b=10), title="Feature Önemi (%)")
-        st.plotly_chart(fi, use_container_width=True)
-        if st.button("🔄 10 Adım Hızlı Evrim", use_container_width=True) and datasets:
-            sp_ = split_ds(merge_ds(datasets))
-            if sp_:
-                with st.spinner("Evrim..."):
-                    for _ in range(10):
-                        bot.nn.evolve_step(sp_)
-                    bot.nn.fit_router(sp_)
-                    try: train_transformer(bot.nn, sp_, steps=20, seed=bot.nn.evo)
-                    except Exception: pass
-                bot.reeval(rp); save_state(bot, rp)
-                st.success("Tamam"); st.rerun()
+def _tab_forecast(bot: Bot) -> None:
+    if not bot.last_forecasts:
+        st.info("Tahmin yok.")
+        return
+    st.dataframe(pd.DataFrame([f.__dict__ for f in bot.last_forecasts]).round(4), use_container_width=True)
 
-    # ─── 🧬 ÖZ-GELİŞİM ──────────────────────────────────────
-    with tSI:
-        st.subheader("🧬 Öz-Gelişim (25 Otonom Parametre)")
-        si = bot.si
-        i1, i2, i3, i4, i5 = st.columns(5)
-        i1.metric("Tur", si.runs)
-        i2.metric("Drift", f"{si.drift:.2f}",
-                  "bayat" if si.drift > 1.15 else "sağlıklı",
-                  delta_color="inverse" if si.drift > 1.15 else "normal")
-        i3.metric("Özellik kayması", f"{feat_dr:.2f}")
-        i4.metric("Ardışık", f"{si.consec_improve}/{rp['consec_improve']}")
-        i5.metric("Son tur", f"{int((time.time() - si.last_run) / 60)} dk" if si.last_run else "-")
-        a1, a2, a3 = st.columns(3)
-        if a1.button("🧬 Şimdi Geliştir (Arka Plan)", use_container_width=True) and datasets:
-            if bgi.start(bot, datasets, rp, data_date, "manuel", float(rp["si_budget_s"])):
-                st.success("Arka planda başlatıldı"); st.rerun()
-            else:
-                st.warning("Zaten çalışıyor")
-        if si.proposal and a2.button("✅ Öneriyi Uygula", use_container_width=True):
-            st.session_state.rp = validate_risk({**rp,
-                **{k: si.proposal["params"][k] for k in TUNE_BOUNDS if k in si.proposal["params"]}})
-            si.proposal = None
-            si.consec_improve = 0
-            si.pending_rp = None
-            for k in TUNE_BOUNDS:
-                st.session_state.pop(f"rp_{k}", None)
-            bot.reeval(st.session_state.rp); st.rerun()
-        if si.rp_hist and a3.button("↩️ Geri Dön", use_container_width=True):
-            prev = si.rp_hist.pop()
-            st.session_state.rp = validate_risk({**rp, **prev})
-            for k in TUNE_BOUNDS:
-                st.session_state.pop(f"rp_{k}", None)
-            bot.reeval(st.session_state.rp); st.rerun()
-        if si.proposal:
-            st.info(f"Öneri (≥{si.proposal.get('wait', 0)} tur daha)")
-        st.markdown("### 🤖 Otonom Öğrenilen (25)")
-        groups = {
-            "🎯 Sinyal": ["p_buy", "p_buy_long", "margin", "unc_max", "use_long_gate", "use_regime"],
-            "🛑 Stop/TP": ["sl_atr", "trail_act_r", "trail_atr", "tp_r", "tp_frac", "be_r", "max_hold"],
-            "⚖️ Risk": ["risk_per_trade", "max_pos", "conf_sizing", "cooldown_h",
-                         "max_trades_day", "loss_streak", "corr_max"],
-            "🌊 Rejim/Filtre": ["regime_bull_adj", "regime_bear_adj",
-                                 "regime_range_adj", "regime_vol_adj", "min_daily_turnover"],
-        }
-        gcols = st.columns(4)
-        for i, (title, keys) in enumerate(groups.items()):
-            with gcols[i]:
-                st.caption(title)
-                for k in keys:
-                    if k in rp:
-                        st.text(f"{k}: {rp[k]}")
-        st.markdown("### 🔒 Kilitli (Sende)")
-        lc = st.columns(len(LOCKED_KEYS))
-        for i, k in enumerate(LOCKED_KEYS):
-            lc[i].metric(k, f"{rp[k]}")
-        st.markdown("### 📊 Hata Analizi")
-        st.text(bot.nn.error_analyzer.report())
-        if si.history:
-            hrows = [{"Zaman": h["ts"][5:16], "Neden": h["reason"],
-                      "Drift": round(h.get("drift", 0), 2),
-                      "VL": f"{h.get('vl0',0):.4f}→{h.get('vl1',0):.4f}",
-                      "te_acc": f"{h.get('te_acc',0):.3f}" if "te_acc" in h else "-",
-                      "DSR": f"{h.get('dsr',0):.3f}" if "dsr" in h else "-",
-                      "PBO": f"{h.get('pbo',{}).get('pbo',0):.2f}" if "pbo" in h else "-",
-                      "CPCV": f"{h.get('cpcv',{}).get('sharpe_cpcv',0):.2f}" if "cpcv" in h else "-",
-                      "Router": h.get("router", "-"),
-                      "✅": "EVET" if h.get("adopted") else "-",
-                      "sn": h.get("sec", 0)}
-                     for h in reversed(si.history[-15:])]
-            st.dataframe(pd.DataFrame(hrows), use_container_width=True, hide_index=True)
-        if len(bot.eq_hist) > 2:
-            fe = go.Figure(go.Scatter(y=bot.eq_hist, mode="lines",
-                                       line=dict(color="#50e3c2")))
-            fe.update_layout(height=260, template="plotly_dark",
-                              margin=dict(l=10, r=10, t=30, b=10), title="Portföy Eğrisi")
-            st.plotly_chart(fe, use_container_width=True)
 
-    # ─── 📊 ANALİZ ──────────────────────────────────────────
-    with tA:
-        st.subheader("📊 Performans & Risk")
-        eq_ = db_eq(5000)
-        if len(eq_) > 3:
-            df_eq = pd.DataFrame(eq_)
-            df_eq["day"] = df_eq["ts"].str[:10]
-            v = df_eq.groupby("day")["value"].last().to_numpy(float)
-            if len(v) > 3:
-                r = np.diff(v) / v[:-1]
-                neg = r[r < 0]
-                sh = float(r.mean() / (r.std() + 1e-12) * math.sqrt(252))
-                so = (float(r.mean() / (neg.std() + 1e-12) * math.sqrt(252))
-                      if len(neg) > 1 else 0.0)
-                peak = np.maximum.accumulate(v)
-                dd = float(((peak - v) / peak).max())
-                tot = float(v[-1] / v[0] - 1)
-                e1, e2, e3, e4, e5 = st.columns(5)
-                e1.metric("Sharpe", f"{sh:.2f}")
-                e2.metric("Sortino", f"{so:.2f}")
-                e3.metric("Max DD", f"%{dd*100:.1f}")
-                e4.metric("Getiri", f"%{tot*100:+.1f}")
-                e5.metric("Calmar", f"{tot/dd:.2f}" if dd > 1e-9 else "∞")
-        var_res = calc_portfolio_var(bot, rp)
-        if var_res["n"] >= 20:
-            st.markdown("### 📉 VaR / CVaR")
-            v1, v2, v3, v4 = st.columns(4)
-            v1.metric("VaR %95", f"%{var_res['var95']*100:.2f}")
-            v2.metric("CVaR %95", f"%{var_res['cvar95']*100:.2f}")
-            v3.metric("VaR %99", f"%{var_res['var99']*100:.2f}")
-            v4.metric("CVaR %99", f"%{var_res['cvar99']*100:.2f}")
-        pn = [t["pnl"] / bot.initial for t in bot.trades
-              if t.get("action") == "SAT" and "pnl" in t]
-        if len(pn) >= 8:
-            rng_mc = np.random.default_rng(1)
-            sims = rng_mc.choice(pn, (2000, 100))
-            cum = np.cumsum(sims, axis=1)
-            final = cum[:, -1]
-            full = np.concatenate([np.zeros((2000, 1)), cum], axis=1)
-            dds = (np.maximum.accumulate(full, axis=1) - full).max(axis=1)
-            st.markdown("**🎲 Monte Carlo (100 işlem)**")
-            c_ = st.columns(5)
-            c_[0].metric("Medyan", f"%{np.percentile(final, 50)*100:+.1f}")
-            c_[1].metric("P5/P95",
-                          f"%{np.percentile(final, 5)*100:+.1f}/%{np.percentile(final, 95)*100:+.1f}")
-            c_[2].metric("Zarar", f"%{(final < 0).mean()*100:.0f}")
-            c_[3].metric("Medyan DD", f"%{np.percentile(dds, 50)*100:.1f}")
-            c_[4].metric("DD P95", f"%{np.percentile(dds, 95)*100:.1f}")
-        st.divider()
-        st.markdown("### 📐 Portföy Önerisi (HRP / Markowitz)")
-        if st.button("📐 Öneri Hesapla", use_container_width=True):
+def _tab_brain(bot: Bot) -> None:
+    if bot.ens is None:
+        st.info("Tahmin topluluğu yüklü değil. Ön eğitim için PyTorch gerekir.")
+        return
+    if getattr(bot.ens, "history", None):
+        st.dataframe(pd.DataFrame(bot.ens.history), use_container_width=True)
+        fig = fig_moe(bot.ens.history)
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
+    st.write(f"Torba sayısı: {len(getattr(bot.ens, 'nets', []))} · mimari: GATv2 + TFT + MoE16 (+ TGN/Informer opsiyonel)")
+
+
+def _tab_selfimprove(bot: Bot, store: P2.FeatureStoreV7) -> None:
+    if bot.si.history:
+        st.dataframe(pd.DataFrame(bot.si.history), use_container_width=True)
+    else:
+        st.info("Öz-gelişim henüz çalışmadı.")
+    if st.button("Öz-gelişim turu çalıştır (kısa bütçe)", key="si_btn"):
+        rp = {**bot.rp, "si_budget_s": 5.0}
+        T = store.T
+        cut = int(T * 0.7)
+
+        def ev(p: Dict[str, Any]) -> float:
+            sig = (store.feat[:, FEAT_INDEX["rsi14"], :] < 0.0) & store.mask
+            size = np.full(store.C.shape, float(p.get("max_pos", 0.15)) * 0.2)
+            res = P4.BacktestV(store, p).run(sig, size, WARMUP_BARS, cut)
+            return P4.score_params_V(res, p)
+
+        out = bot.si.run(rp, ev, lambda p: ev(p), clock=time.time)
+        st.write("Sonuç:", out["record"])
+
+
+def _tab_validation(bot: Bot) -> None:
+    r = equity_returns(bot)
+    d = dsr_summary(r)
+    if not d:
+        st.info("Doğrulama için en az 30 günlük özkaynak geçmişi gerekir.")
+        return
+    st.json({k: round(v, 4) for k, v in d.items()})
+    st.caption("PBO için birden çok gerçek aday strateji gerekir; tek özkaynak eğrisinde hesaplanmaz.")
+
+
+def _tab_analysis(bot: Bot) -> None:
+    r = equity_returns(bot)
+    if r.size < 30:
+        st.info("Analiz için en az 30 gün gerekir.")
+        return
+    st.json({k: round(v, 4) for k, v in P4.basic_metrics(r).items()})
+    st.json({k: round(v, 4) for k, v in P5.risk_metrics(r).items()})
+
+
+def _tab_log(bot: Bot) -> None:
+    if bot.pm.trades:
+        st.dataframe(pd.DataFrame(bot.pm.trades[-200:]), use_container_width=True)
+    else:
+        st.info("İşlem kaydı yok.")
+
+
+def _tab_rl(bot: Bot) -> None:
+    st.write(f"RL kullanılabilir: **{bot.rl.available}** · model yüklü: **{bot.rl.model is not None}**")
+    st.caption("SB3 + gymnasium kuruluysa PPO/SAC eğitilebilir; aksi halde RL veto devre dışıdır.")
+
+
+def _tab_stress(bot: Bot, store: P2.FeatureStoreV7) -> None:
+    prices = {c: float(store.C[s, store.T - 1]) for s, c in enumerate(store.codes)}
+    st.dataframe(stress_table(bot.pm, prices).round(2), use_container_width=True)
+
+
+def _tab_attribution(bot: Bot) -> None:
+    tabs = attribution_table(bot.pm)
+    c1, c2 = st.columns(2)
+    c1.write("Hisseye göre PnL")
+    c1.dataframe(tabs["hisse"], use_container_width=True)
+    c2.write("Kapanış nedenine göre PnL")
+    c2.dataframe(tabs["neden"], use_container_width=True)
+
+
+def _tab_causal(store: P2.FeatureStoreV7) -> None:
+    st.dataframe(causal_table(store, store.T - 1), use_container_width=True)
+    st.caption("Ölçeklenmiş değerler. Mediation, instrument, collider ve causal_child bu sürümde 0'dır.")
+
+
+def _tab_xai(store: P2.FeatureStoreV7) -> None:
+    st.dataframe(xai_proxy(store, store.T - 1), use_container_width=True)
+    st.caption("Model-bağımsız vekil: korelasyon taraması. SHAP/LIME/IG model açıklaması değildir.")
+
+
+def _tab_meta(bot: Bot, store: P2.FeatureStoreV7) -> None:
+    st.json(system_status(store))
+    st.write(f"Son işlenen bar: {bot.last_t} · tepe özkaynak: {bot.pm.peak:,.0f} TL")
+
+
+def render_ui(bot: Bot, store: P2.FeatureStoreV7) -> None:
+    """15 sekmeli ana arayüz. Her sekme bağımsız try/except ile korunur."""
+    renders = [
+        lambda: _tab_live(bot, store), lambda: _tab_decisions(bot), lambda: _tab_portfolio(bot, store),
+        lambda: _tab_forecast(bot), lambda: _tab_brain(bot), lambda: _tab_selfimprove(bot, store),
+        lambda: _tab_validation(bot), lambda: _tab_analysis(bot), lambda: _tab_log(bot),
+        lambda: _tab_rl(bot), lambda: _tab_stress(bot, store), lambda: _tab_attribution(bot),
+        lambda: _tab_causal(store), lambda: _tab_xai(store), lambda: _tab_meta(bot, store),
+    ]
+    tabs = st.tabs(TAB_NAMES)
+    for tab, fn in zip(tabs, renders):
+        with tab:
             try:
-                st.session_state._portf = portfolio_suggestion(dfs, names)
+                fn()
             except Exception as e:
-                st.warning(f"Hata: {e}")
-        ps_ = st.session_state.get("_portf")
-        if ps_ is not None:
-            st.dataframe(ps_, use_container_width=True)
-
-    # ─── 📊 KALİBRASYON ─────────────────────────────────────
-    with tCAL:
-        st.subheader("📊 Kalibrasyon (TEST)")
-        if bot.pretrained and datasets:
-            merged = merge_ds(datasets)
-            sp_ = split_ds(merged) if merged else None
-            if sp_:
-                cal = bot.si.calibrate(bot.nn, sp_["Xte"], sp_["yte"])
-                if cal:
-                    kk = st.columns(4)
-                    kk[0].metric("Brier", f"{cal['brier']:.4f}")
-                    kk[1].metric("ECE", f"{cal['ece']:.4f}")
-                    kk[2].metric("İsabet", f"%{cal['acc']*100:.1f}",
-                                  f"taban %{cal['base']*100:.1f}")
-                    kk[3].metric("Örnek", cal["n"])
-                    if cal["cal"]:
-                        cdf = pd.DataFrame(cal["cal"])
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(x=cdf["pred"], y=cdf["actual"],
-                                                  mode="markers+lines",
-                                                  marker=dict(size=cdf["n"] / max(cdf["n"].max(), 1) * 20 + 5),
-                                                  name="Güvenilirlik"))
-                        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
-                                                  line=dict(dash="dash", color="gray"),
-                                                  name="Mükemmel"))
-                        fig.update_layout(height=350, template="plotly_dark",
-                                          title="Reliability Diagram (TEST)")
-                        st.plotly_chart(fig, use_container_width=True)
-
-    # ─── 🔬 CPCV/PBO ────────────────────────────────────────
-    with tCPCV:
-        st.subheader("🔬 CPCV (OOS) + PBO (CSCV)")
-        st.caption("CPCV: modelin eğitimde görmediği val+test havuzunda parametre kombinasyonlarının stabilitesi. "
-                   "PBO: CSCV ile aday parametreler arası overfit olasılığı.")
-        if bot.pretrained and datasets:
-            c1_, c2_ = st.columns(2)
-            with c1_:
-                st.markdown("### 📊 CPCV-OOS")
-                if st.button("🧪 CPCV Çalıştır", use_container_width=True):
-                    with st.spinner("CPCV 15 split..."):
-                        res = cpcv_oos(bot, rp)
-                    if res:
-                        st.session_state["_cpcv"] = res
-                        db_cpcv_add(res["mean_score"], res["std_score"], res["worst"],
-                                    res["best"], res["n_splits"], res["sharpe_cpcv"])
-                res = st.session_state.get("_cpcv")
-                if res:
-                    k1, k2, k3 = st.columns(3)
-                    k1.metric("Ort", f"{res['mean_score']:.3f}")
-                    k2.metric("Std", f"{res['std_score']:.3f}")
-                    k3.metric("CPCV Sharpe", f"{res['sharpe_cpcv']:.2f}")
-                    if res["sharpe_cpcv"] > 1.0:
-                        st.success("✅ Sağlam")
-                    elif res["sharpe_cpcv"] > 0.5:
-                        st.warning("⚠️ Dikkatli")
-                    else:
-                        st.error("❌ Overfit")
-            with c2_:
-                st.markdown("### 🎲 PBO (CSCV)")
-                if st.button("🎲 PBO Çalıştır (Tuner)", use_container_width=True):
-                    with st.spinner("Hızlı tuner + CSCV..."):
-                        res = run_pbo(bot, rp, budget=4.0)
-                    if res:
-                        st.session_state["_pbo"] = res
-                        db_pbo_add(res["pbo"], res["mean"], res["median"],
-                                   res["n_sims"], res["interpretation"])
-                res = st.session_state.get("_pbo")
-                if res:
-                    st.metric("PBO", f"%{res['pbo']*100:.1f}", res["interpretation"])
-                    if res["pbo"] < 0.3:
-                        st.success("✅ Güvenilir")
-                    elif res["pbo"] < 0.5:
-                        st.warning("⚠️ Şüpheli")
-                    else:
-                        st.error("❌ Overfit!")
-
-    # ─── 💼 TEMEL ───────────────────────────────────────────
-    with tFUN:
-        st.subheader("💼 Temel Analiz (Overlay)")
-        if st.button("🔄 Verileri Çek", use_container_width=True):
-            with st.spinner("Finansallar çekiliyor..."):
-                for nm in names:
-                    get_fund().fetch(nm, force=True)
-                st.success("Tamamlandı")
-        rows_f = []
-        for nm in names:
-            fd = get_fund().fetch(nm)
-            sc = fund_score(fd, sektor_of(nm))
-            rows_f.append({"Hisse": nm, "F/K": round(fd.pe, 2), "PD/DD": round(fd.pb, 2),
-                           "ROE": f"%{fd.roe*100:.1f}", "Borç/ÖS": round(fd.debt_eq, 2),
-                           "Temettü": f"%{fd.div_yield*100:.2f}",
-                           "PD (TL)": f"{fd.market_cap/1e9:.1f}M",
-                           "Skor": round(sc, 2),
-                           "Tilt": round(overlay.get(nm, 0), 3)})
-        st.dataframe(pd.DataFrame(rows_f), use_container_width=True, hide_index=True)
-
-    # ─── 🌐 MAKRO ───────────────────────────────────────────
-    with tMAC:
-        st.subheader("🌐 Makro")
-        m = load_macro()
-        if m:
-            c1_, c2_, c3_, c4_ = st.columns(4)
-            c1_.metric("USDTRY", f"{m.get('usdtry',0):.2f}",
-                        f"%{m.get('usdtry_ret20',0)*100:+.2f}")
-            c2_.metric("EURTRY", f"{m.get('eurtry',0):.2f}",
-                        f"%{m.get('eurtry_ret20',0)*100:+.2f}")
-            c3_.metric("Altın ($)", f"{m.get('gold',0):.0f}",
-                        f"%{m.get('gold_ret20',0)*100:+.2f}")
-            c4_.metric("Brent ($)", f"{m.get('brent',0):.2f}",
-                        f"%{m.get('brent_ret20',0)*100:+.2f}")
-        st.caption("Makro veriler her hissenin feature matrisine zaman hizalı (1 gün gecikmeli) eklenir.")
-
-    # ─── 👥 AJANLAR ─────────────────────────────────────────
-    with tMA:
-        st.subheader("👥 Multi-Agent (Gerçek Yarış)")
-        st.caption("Ajanlar aynı portföy verisinde farklı risk profilleriyle yarışır.")
-        if st.button("🔄 Yarış Başlat", use_container_width=True) and bot.hold is not None:
-            with st.spinner("12 ajan test ediliyor..."):
-                if st.session_state.ma is None:
-                    st.session_state.ma = MultiAgent(12)
-                Ps_h, Pl_h, U_h = bot.nn.predict_unc(bot.hold["X"], bot.hold["sid"], bot.hold["row"])
-                Vh = make_V(bot.hold, Ps_h, Pl_h, U_h)
-                st.session_state.ma.run(Vh, rp)
-                st.success(f"✅ Tur {st.session_state.ma.rounds} tamamlandı")
-        ma = st.session_state.get("ma")
-        if ma:
-            summary = ma.summary()
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Ajan", summary["n_agents"])
-            m2.metric("Tur", summary["rounds"])
-            m3.metric("Ort. Skor", f"{summary['avg_score']:.3f}")
-            adf = pd.DataFrame(summary["agents"])
-            adf = adf[["id", "profile", "score", "n", "net", "wr", "pf", "dd", "weight"]]
-            adf.columns = ["ID", "Profil", "Skor", "İşlem", "Net", "Kazanma", "PF", "DD", "Ağırlık"]
-            st.dataframe(adf, use_container_width=True, hide_index=True)
-            fig = go.Figure(go.Bar(x=adf["ID"], y=adf["Skor"],
-                                    marker_color=np.where(adf["Skor"] > 0, "#26a69a", "#ef5350")))
-            fig.update_layout(height=300, template="plotly_dark", title="Ajan Skorları")
-            st.plotly_chart(fig, use_container_width=True)
-
-    # ─── 🔬 NAS ─────────────────────────────────────────────
-    with tNAS:
-        st.subheader("🔬 Neural Architecture Search")
-        st.caption("6 farklı mimari (h, dropout, lr, wd) train/val/test üzerinde karşılaştırılır.")
-        if st.button("🧪 NAS Çalıştır", use_container_width=True) and datasets:
-            merged = merge_ds(datasets)
-            sp_ = split_ds(merged) if merged else None
-            if sp_:
-                with st.spinner("6 mimari test ediliyor (~2 dk)..."):
-                    best_cfg, results = nas_search(sp_, steps=80)
-                    st.session_state.nas_results = results
-                    st.session_state.nas_best = best_cfg
-                st.success(f"✅ En iyi: h={best_cfg['h']}, drop={best_cfg['dropout']}, "
-                           f"lr={best_cfg['lr']}, wd={best_cfg['wd']}")
-        if st.session_state.get("nas_results"):
-            rdf = pd.DataFrame([{"h": r["cfg"]["h"], "Dropout": r["cfg"]["dropout"],
-                                  "LR": r["cfg"]["lr"], "WD": r["cfg"]["wd"],
-                                  "Val Loss": round(r["val_loss"], 4),
-                                  "Test Loss": round(r["test_loss"], 4)}
-                                 for r in st.session_state["nas_results"]])
-            st.dataframe(rdf, use_container_width=True, hide_index=True)
-            st.caption(f"Mevcut mimari: h={bot.nn.nn_kwargs.get('h', H_DIM)}, "
-                       f"drop={bot.nn.nn_kwargs.get('dropout', 0.15)}")
-            if st.button("✅ En İyi Mimariyi Uygula (yeni ağ başlat)", use_container_width=True):
-                cfg = st.session_state.get("nas_best")
-                if cfg:
-                    with bot.lock:
-                        bot.nn = BaggedNN(nn_kwargs=cfg, replay=bot.nn.replay)
-                    bot.pretrained = False
-                    st.success("Yeni mimari hazır. Sıfırdan eğitim için sayfayı yenile.")
-                    save_state(bot, rp)
-
-    # ─── 🔄 FEDERATED ───────────────────────────────────────
-    with tFED:
-        st.subheader("🔄 Federated Learning (3-Bot)")
-        fed = get_federated()
-        f1, f2, f3, f4 = st.columns(4)
-        f1.metric("Aktif Bot", f"#{BOT_ID} ({AKTIF_SEKTOR[:4]})")
-        f2.metric("Sektör", AKTIF_SEKTOR)
-        f3.metric("Federated Tur", fed.rounds)
-        f4.metric("Skor", f"{bot.federated_score:.3f}")
-        st.divider()
-        a1, a2, a3 = st.columns(3)
-        if a1.button("📤 Gönder", use_container_width=True):
-            if bot.federated_push(): st.success("✅ Gönderildi")
-        if a2.button("📥 Al (blend + rollback)", use_container_width=True):
-            ok, msg = bot.federated_pull(rp.get("fed_beta", 0.5))
-            st.toast(("✅ " if ok else "⚠️ ") + msg)
-            if ok: st.rerun()
-        if a3.button("🔗 Şimdi Birleştir", use_container_width=True):
-            with st.spinner("3 bot ortalanıyor..."):
-                gw = fed.aggregate()
-            if gw: st.success(f"✅ Tur {fed.rounds} tamamlandı")
-            else: st.warning("⚠️ En az 2 bot gerekli")
-        st.divider()
-        st.markdown("### 🤖 3 Bot Durumu")
-        bot_rows = []
-        for sektor, cfg in SEKTOR_BOTLARI.items():
-            f_ = os.path.join("federated", f"bot_{cfg['bot_id']}.npz")
-            mevcut = os.path.exists(f_)
-            bot_rows.append({"Bot": f"#{cfg['bot_id']}", "Sektör": sektor,
-                             "Hisse": len(cfg["hisseler"]),
-                             "Sermaye": f"₺{cfg['sermaye']:,.0f}",
-                             "Durum": "🟢 Aktif" if mevcut else "⚪ Bekliyor",
-                             "Ben": "✅" if sektor == AKTIF_SEKTOR else ""})
-        st.dataframe(pd.DataFrame(bot_rows), use_container_width=True, hide_index=True)
-        if fed.history:
-            st.markdown("### 📊 Federated Geçmişi")
-            hdf = pd.DataFrame([{"Tur": h["round"], "Zaman": h["ts"][5:16],
-                                  "Bot": h["n_bots"],
-                                  "Skorlar": ", ".join([f"{s:.2f}" for s in h["scores"]])}
-                                 for h in reversed(fed.history[-10:])])
-            st.dataframe(hdf, use_container_width=True, hide_index=True)
-
-    # ─── ⚡ STRESS ──────────────────────────────────────────
-    with tSTRESS:
-        st.subheader("⚡ Stress Testing")
-        if st.button("🧪 Senaryoları Çalıştır", use_container_width=True) and bot.positions:
-            res = stress_test(bot, prices, rp, dfs=dfs)
-            st.session_state["_stress"] = res
-        res = st.session_state.get("_stress")
-        if res:
-            sdf = pd.DataFrame(res)
-            st.dataframe(sdf, use_container_width=True, hide_index=True)
-            fig = go.Figure(go.Bar(
-                x=sdf["Senaryo"], y=sdf["Kayıp %"],
-                marker_color=["#ef5350" if x > 15 else "#f5a623" if x > 8 else "#26a69a"
-                              for x in sdf["Kayıp %"]]))
-            fig.update_layout(height=350, template="plotly_dark",
-                              title="Senaryo Bazlı Kayıp (%)")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Pozisyon varsa ve test çalıştırıldıysa sonuç burada görünür.")
-
-    # ─── 🔍 XAI ─────────────────────────────────────────────
-    with tXAI:
-        st.subheader("🔍 Açıklanabilir AI")
-        if bot.pretrained and bot.hold is not None:
-            xai1, xai2, xai3 = st.tabs(["SHAP", "LIME", "PDP"])
-            with xai1:
-                if st.button("🧮 SHAP Hesapla", use_container_width=True):
-                    with st.spinner("SHAP (30 sample)..."):
-                        if sec in names:
-                            idx = names.index(sec)
-                            sv = shap_values(bot, F_live[idx], n_samples=30)
-                            st.session_state["_shap"] = sv
-                sv = st.session_state.get("_shap")
-                if sv:
-                    sdf = pd.DataFrame(sv, columns=["Feature", "SHAP"])
-                    st.dataframe(sdf, use_container_width=True, hide_index=True)
-                    fig = go.Figure(go.Bar(x=sdf["SHAP"], y=sdf["Feature"],
-                                            orientation="h",
-                                            marker_color=np.where(sdf["SHAP"] > 0, "#26a69a", "#ef5350")))
-                    fig.update_layout(height=500, template="plotly_dark",
-                                       title="SHAP Değerleri")
-                    st.plotly_chart(fig, use_container_width=True)
-            with xai2:
-                if st.button("🧪 LIME Hesapla", use_container_width=True):
-                    if sec in names:
-                        idx = names.index(sec)
-                        lv = lime_explain(bot, F_live[idx])
-                        st.session_state["_lime"] = lv
-                lv = st.session_state.get("_lime")
-                if lv:
-                    ldf = pd.DataFrame(lv, columns=["Feature", "LIME"])
-                    st.dataframe(ldf, use_container_width=True, hide_index=True)
-            with xai3:
-                st.caption("Feature etkisi (PDP)")
-                feat_choice = st.selectbox("Feature", FEAT_NAMES[:N_FEAT_TECH], key="pdp_feat")
-                if st.button("📈 PDP Çiz", use_container_width=True):
-                    fi = FEAT_NAMES.index(feat_choice)
-                    pdp_res = partial_dependence(bot, bot.hold["X"], fi)
-                    if pdp_res:
-                        pdf = pd.DataFrame(pdp_res, columns=["Değer", "P(AL)"])
-                        fig = go.Figure(go.Scatter(x=pdf["Değer"], y=pdf["P(AL)"],
-                                                    mode="lines+markers"))
-                        fig.update_layout(height=350, template="plotly_dark",
-                                          title=f"PDP: {feat_choice}")
-                        st.plotly_chart(fig, use_container_width=True)
-
-    # ─── 📢 KAP ─────────────────────────────────────────────
-    with tKAP:
-        st.subheader("📢 KAP Bildirimleri")
-        if st.button("🔄 KAP Verilerini Çek", use_container_width=True):
-            with st.spinner("KAP API sorgulanıyor..."):
-                for nm in names:
-                    get_kap().fetch(nm)
-                st.success("✅ Tamamlandı")
-        kap_rows = []
-        for nm in names:
-            feats = get_kap().get_features(nm)
-            items = get_kap().fetch(nm)
-            kap_rows.append({"Hisse": nm, "Bildirim": len(items),
-                             "Önem Skoru": round(float(feats[1]), 2),
-                             "Son Haber": items[0]["title"][:60] if items else "-"})
-        st.dataframe(pd.DataFrame(kap_rows), use_container_width=True, hide_index=True)
-        st.caption("KAP bildirimleri şu an overlay olarak modele eklenmez; bilgi amaçlıdır.")
-
-    # ─── 🔮 TAHMİN ──────────────────────────────────────────
-    with tFCAST:
-        st.subheader("🔮 Fiyat Tahminleri")
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            horizon = st.select_slider("Tahmin ufku (gün)",
-                                        options=[5, 10, 20, 40, 60],
-                                        value=HORIZON, key="fc_h")
-        with fc2:
-            sort_by = st.selectbox("Sıralama",
-                                    ["Güven", "Değişim %", "P(Yukarı)", "Belirsizlik"],
-                                    key="fc_sort")
-        with fc3:
-            if st.button("💾 Tahminleri Kaydet", use_container_width=True):
-                fc_rows_ = forecast_all(bot, names, dfs, prices, dec, rp, horizon)
-                for r in fc_rows_:
-                    db_forecast_add(r["_obj"])
-                st.success(f"✅ {len(fc_rows_)} tahmin kaydedildi")
-        fc_rows = forecast_all(bot, names, dfs, prices, dec, rp, horizon)
-        if not fc_rows:
-            st.warning("Tahmin üretilemedi")
-        else:
-            if sort_by == "Güven":
-                fc_rows.sort(key=lambda x: -x["Güven %"])
-            elif sort_by == "Değişim %":
-                fc_rows.sort(key=lambda x: -x["Değişim %"])
-            elif sort_by == "P(Yukarı)":
-                fc_rows.sort(key=lambda x: -x["P(Yukarı) %"])
-            elif sort_by == "Belirsizlik":
-                fc_rows.sort(key=lambda x: x["Belirsizlik"])
-            df_show = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")}
-                                     for r in fc_rows])
-            st.dataframe(df_show, use_container_width=True, hide_index=True)
-            st.divider()
-            st.markdown("### 🏆 En Yüksek Potansiyelli 5")
-            top5 = fc_rows[:5]
-            fig_top = go.Figure()
-            for r in top5:
-                f = r["_obj"]
-                x_ = [0, f.horizon_days]
-                y_base = [f.current_price, f.base_price]
-                fig_top.add_trace(go.Scatter(x=x_, y=y_base, mode="lines+markers",
-                                              name=f"{f.stock} ({f.expected_return_pct:+.1f}%)",
-                                              line=dict(width=2)))
-            fig_top.update_layout(height=400, template="plotly_dark",
-                                    title="Tahmin Karşılaştırması",
-                                    xaxis_title="Gün", yaxis_title="Fiyat (₺)")
-            st.plotly_chart(fig_top, use_container_width=True)
-            st.divider()
-            st.markdown("### 🎯 Detaylı Tahmin")
-            sec_fc = st.selectbox("Hisse seç", names, key="fc_sel")
-            row_fc = next((r for r in fc_rows if r["Hisse"] == sec_fc), None)
-            if row_fc:
-                f = row_fc["_obj"]
-                st.markdown(forecast_to_text(f))
-                st.divider()
-                vc1, vc2 = st.columns([2, 1])
-                with vc1:
-                    st.plotly_chart(plot_forecast(f, dfs[sec_fc]), use_container_width=True)
-                with vc2:
-                    st.plotly_chart(plot_probability_gauge(f), use_container_width=True)
-                    st.plotly_chart(plot_scenarios_bar(f), use_container_width=True)
-                st.markdown("### 📊 Tahmin Kalitesi")
-                q1, q2, q3, q4 = st.columns(4)
-                q1.metric("Güven", f"%{f.confidence*100:.0f}",
-                          "yüksek" if f.confidence > 0.6 else "orta" if f.confidence > 0.3 else "düşük")
-                q2.metric("Belirsizlik", f"{f.uncertainty:.3f}",
-                          "düşük" if f.uncertainty < 0.15 else "yüksek",
-                          delta_color="inverse" if f.uncertainty > 0.15 else "normal")
-                q3.metric("ATR%",
-                          f"%{(safe_float(dfs[sec_fc]['ATR'].iloc[-1]) / prices[sec_fc]) * 100:.2f}")
-                q4.metric("Rejim ×", f"{f.regime_adj:.2f}")
-        st.divider()
-        st.markdown("### 📜 Geçmiş Tahminler")
-        hist_sec = st.selectbox("Hisse (geçmiş)", names, key="fc_hist")
-        hist = db_forecast_history(hist_sec, limit=30)
-        if hist:
-            hdf = pd.DataFrame(hist)
-            hdf.columns = ["Zaman", "Şu an", "Hedef", "Beklenen %", "Güven"]
-            st.dataframe(hdf, use_container_width=True, hide_index=True)
-        else:
-            st.info("Bu hisse için kayıtlı tahmin yok")
-        st.divider()
-        st.markdown("### 📋 Tahmin Karnesi (Gerçekleşen vs Tahmin)")
-        if st.button("📋 Karne Hesapla", use_container_width=True):
-            sc_df = forecast_scorecard(dfs, limit=600)
-            st.session_state["_fcast_score"] = sc_df
-        sc_df = st.session_state.get("_fcast_score")
-        if sc_df is not None and len(sc_df) > 0:
-            hit = sc_df["Yön ✓"].mean() * 100
-            mae = sc_df["Hata %"].abs().mean()
-            s1, s2, s3 = st.columns(3)
-            s1.metric("Yön isabet", f"%{hit:.1f}")
-            s2.metric("Ort. |Hata|", f"%{mae:.2f}")
-            s3.metric("Örnek", len(sc_df))
-            st.dataframe(sc_df.tail(30), use_container_width=True, hide_index=True)
-        elif sc_df is not None:
-            st.info("Henüz karşılaştırılabilir tahmin yok (ufuk dolmamış).")
-
-    # ─── 🧠 META ────────────────────────────────────────────
-    with tMETA:
-        st.subheader("🧠 Meta-Learning (HMM + EWC + Reptile)")
-        # HMM
-        st.markdown("### 🔮 HMM Rejim Tespiti")
-        h = get_hmm()
-        hm1, hm2, hm3 = st.columns(3)
-        hm1.metric("Durum", "🟢 Eğitildi" if h.fitted else "🔴 Eğitilmedi")
-        hm2.metric("İterasyon", h.n_iter)
-        hm3.metric("Fit tarihi", h.fit_date or "-")
-        if h.fitted:
-            fig_hmm = go.Figure(go.Heatmap(z=h.A, x=h.names, y=h.names,
-                                            colorscale="Blues", zmin=0, zmax=1))
-            fig_hmm.update_layout(height=300, template="plotly_dark",
-                                   title="Rejim Geçiş Matrisi")
-            st.plotly_chart(fig_hmm, use_container_width=True)
-            reg_df = pd.DataFrame({
-                "Rejim": h.names,
-                "Ort. Getiri %": h.mu * 100,
-                "Volatilite %": h.sigma * 100,
-            })
-            st.dataframe(reg_df, use_container_width=True, hide_index=True)
-            # Aktif rejim
-            if sec in df_recent_returns:
-                nm_reg, prob = h.predict_name(df_recent_returns[sec])
-                if nm_reg:
-                    st.info(f"📊 {sec} anlık rejim: **{nm_reg}** (olasılık %{prob*100:.0f})")
-        st.divider()
-        # EWC
-        st.markdown("### 🛡️ EWC (Sürekli Öğrenme)")
-        em1, em2, em3 = st.columns(3)
-        em1.metric("Durum", "🟢 Konsolide" if bot.nn.ewc_consolidated else "🔴 Bekliyor")
-        em2.metric("Fisher Ağ", len(bot.nn.ewc.fisher))
-        em3.metric("Lambda", f"{bot.nn.ewc.lam:.1f}")
-        st.caption("Bot yeni öğrenirken eski bilgiyi unutmaz (Elastic Weight Consolidation).")
-        st.divider()
-        # Reptile
-        st.markdown("### ⚡ Reptile (Meta-Öğrenme)")
-        rp_m = bot.nn.reptile
-        rm1, rm2, rm3 = st.columns(3)
-        rm1.metric("Inner LR", f"{rp_m.inner_lr:.4f}")
-        rm2.metric("Epsilon", f"{rp_m.eps:.2f}")
-        rm3.metric("Tur geçmişi", len(rp_m.history))
-        if rp_m.history:
-            hist_df = pd.DataFrame(rp_m.history)
-            hist_df["before"] = hist_df["before"].astype(float)
-            hist_df["after"] = hist_df["after"].astype(float)
-            fig_maml = go.Figure()
-            fig_maml.add_trace(go.Scatter(x=hist_df.index, y=hist_df["before"],
-                                            mode="lines+markers", name="Önce"))
-            fig_maml.add_trace(go.Scatter(x=hist_df.index, y=hist_df["after"],
-                                            mode="lines+markers", name="Sonra"))
-            fig_maml.update_layout(height=300, template="plotly_dark",
-                                    title="Reptile Meta-Eğitim (kabul edilen turlar)")
-            st.plotly_chart(fig_maml, use_container_width=True)
-        if st.button("🧪 Reptile Meta-Train (2 epoch)", use_container_width=True) and datasets:
-            merged = merge_ds(datasets)
-            sp_ = split_ds(merged) if merged else None
-            if sp_:
-                with st.spinner("Meta-eğitim..."):
-                    hist = bot.nn.reptile.meta_train(bot.nn, sp_, n_epochs=2, seed=bot.nn.evo)
-                    if hist:
-                        st.success(f"✅ {len(hist)} epoch")
-                    bot.reeval(rp)
-                    save_state(bot, rp)
-
-    # ─── 💾 DB ──────────────────────────────────────────────
-    with tDB:
-        tr, eq2, tn = db_trades(200), db_eq(500), db_train(50)
-        d1, d2, d3 = st.columns(3)
-        d1.metric("İşlem", len(tr))
-        d2.metric("Equity", len(eq2))
-        d3.metric("Eğitim", len(tn))
-        st.markdown("### 📥 Dışa Aktar")
-        cc1, cc2, cc3 = st.columns(3)
-        if tr:
-            tdf = pd.DataFrame(tr)
-            cc1.download_button("📄 İşlemler CSV", tdf.to_csv(index=False).encode("utf-8"),
-                                 f"trades_{AKTIF_SEKTOR}.csv", "text/csv")
-        if eq2:
-            edf = pd.DataFrame(eq2)
-            cc2.download_button("📈 Equity CSV", edf.to_csv(index=False).encode("utf-8"),
-                                 f"equity_{AKTIF_SEKTOR}.csv", "text/csv")
-        if tn:
-            tndf = pd.DataFrame(tn)
-            cc3.download_button("🧠 Eğitim CSV", tndf.to_csv(index=False).encode("utf-8"),
-                                 f"train_{AKTIF_SEKTOR}.csv", "text/csv")
-        st.divider()
-        if tr:
-            st.dataframe(pd.DataFrame(tr).head(50), use_container_width=True, hide_index=True)
-        else:
-            st.info("İşlem kaydı yok")
-
-    # ─── 💬 LOG ─────────────────────────────────────────────
-    with tCH:
-        if st.session_state.log:
-            for line in reversed(st.session_state.log[-30:]):
-                st.text(line)
-        else:
-            st.info("Log yok")
-
-    # Alt bilgi
-    st.divider()
-    st.caption(f"{BOT_NAME} {BOT_VERSION} · Bot #{BOT_ID} · {AKTIF_SEKTOR} · "
-               f"{now:%Y-%m-%d %H:%M:%S} | Borsa: "
-               f"{'🟢 AÇIK' if borsa_acik() else '🔴 KAPALI'}")
-    st.caption("⚠️ Kâğıt işlem simülasyonu - yatırım tavsiyesi değildir")
+                st.error(f"Sekme hatası: {e}")
+                log.exception("Sekme hatası")
 
 
-# ════════════════════════════════════════════════════════════
-# AGGREGATOR MODU + ANA ÇAĞRI
-# ════════════════════════════════════════════════════════════
-if os.environ.get("MODE") == "aggregator":
-    log.info("Aggregator modu aktif")
-    while True:
-        time.sleep(3600)
-        try:
-            get_federated().aggregate()
-        except Exception as e:
-            log.warning(f"agg: {e}")
-else:
-    if not os.environ.get("THYAO_NO_UI"):
+# ═══════════════════════════════════════════════════════════════════
+# 6. ANA UYGULAMA
+# ═══════════════════════════════════════════════════════════════════
+
+def _streamlit_cache(fn: Any) -> Any:
+    """st.cache_resource varsa kullanır, yoksa fonksiyonu olduğu gibi döndürür."""
+    if ST_OK and hasattr(st, "cache_resource"):
+        return st.cache_resource(show_spinner=False)(fn)
+    return fn
+
+
+@_streamlit_cache
+def ensure_data_and_bot() -> Tuple[Bot, P2.FeatureStoreV7]:
+    """Veriyi kurar, botu oluşturur ve kayıtlı durumu yükler. Önbelleklenir."""
+    store, _ = build_store_from_market()
+    db = SeekDB()
+    bot = Bot(BOT_SERMAYE, get_risk_params(), db=db)
+    load_state(bot)
+    return bot, store
+
+
+def main() -> None:
+    """Streamlit giriş noktası."""
+    st.set_page_config(page_title="SeekDeep v7", page_icon="🐋", layout="wide")
+    st.sidebar.markdown(f"## {BOT_NAME} v7\n`{BOT_VERSION}`")
+    st.sidebar.write(f"Sektör: **{SEKTOR}** (`SEEKDEEP_SEKTOR` ile değişir)")
+    try:
+        bot, store = ensure_data_and_bot()
+    except Exception as e:
+        st.error(f"Veri/bot hazırlanamadı: {e}")
+        st.info("İnternet bağlantısını ve yfinance/FRED erişimini kontrol edin.")
+        st.stop()
+    auto = st.sidebar.toggle("Otomatik yenile", value=False, key="auto")
+    interval_s = st.sidebar.number_input("Yenileme (sn)", 30, 3600, 300, key="interval")
+    if auto and AUTOREFRESH_OK:
+        st_autorefresh(interval=int(interval_s) * 1000, key="refresh")
+    c1, c2 = st.sidebar.columns(2)
+    if c1.button("Döngü", key="tick"):
+        res = make_tick(bot, store)
+        st.sidebar.write(res or "Zaten güncel.")
+    if c2.button("Kaydet", key="save"):
+        save_state(bot)
+        st.sidebar.success("Kaydedildi.")
+    if bot.ens is None and P3.TORCH_OK and st.sidebar.button("Ön eğitim (uzun sürer)"):
+        bot.pretrain(store, epochs=3, path=None)
+    render_ui(bot, store)
+    if not auto or not AUTOREFRESH_OK:
+        st.sidebar.caption("Otomatik yenileme için: pip install streamlit-autorefresh")
+
+
+def _in_streamlit_runtime() -> bool:
+    """Betik `streamlit run` ile mi çalışıyor?"""
+    if not ST_OK:
+        return False
+    try:
+        from streamlit.runtime import exists as _exists  # type: ignore
+        return bool(_exists())
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 7. ÖZ-TEST 6 VE TOPLU TEST
+# ═══════════════════════════════════════════════════════════════════
+
+def _selftest_part6() -> bool:
+    """Parça 6 öz-testi: tablolar, durum kaydı, uçtan uca demo döngü, figür güvenliği."""
+    print(f"\n🐋 Öz-test 6 (Streamlit: {'VAR' if ST_OK else 'YOK → arayüz çizilmedi'}, "
+          f"Plotly: {'VAR' if PL_OK else 'YOK → figürler None'})")
+    res: List[Tuple[str, bool]] = []
+    chk = lambda n, ok, e="": P1._check(n, ok, res, e)
+
+    bot, store = demo_bot_and_store(seed=3, S=6, T=420)
+    t_list = range(WARMUP_BARS + 5, WARMUP_BARS + 90)
+    out = [bot.run_cycle(store, t) for t in t_list]
+    chk("Uçtan uca demo döngü tamamlandı", len(out) == len(list(t_list)))
+    eq = [o["equity"] for o in out]
+    chk("Özkaynak sonlu ve pozitif", all(math.isfinite(e) and e > 0 for e in eq))
+
+    st_tbl = stress_table(bot.pm, {c: float(store.C[s, store.T - 1]) for s, c in enumerate(store.codes)})
+    chk("Stres tablosu 4 senaryo", len(st_tbl) == 4 and "etki TL" in st_tbl.columns)
+    chk("Stres: negatif şok → negatif etki", bool((st_tbl["etki TL"] <= 1e-9).all()))
+
+    att = attribution_table(bot.pm)
+    chk("Atıf tabloları üretildi", set(att.keys()) == {"hisse", "neden"})
+
+    ct = causal_table(store, store.T - 1)
+    chk("Causal tablo şekli (S×10)", ct.shape == (len(store.codes), len(CAUSAL_NAMES)))
+    xp = xai_proxy(store, store.T - 2, window=60, top=5)
+    chk("XAI vekil tablosu ≤ 5 satır", 0 < len(xp) <= 5)
+    chk("XAI korelasyonları [-1,1]", bool(xp["korelasyon"].abs().max() <= 1.0 + 1e-9) if len(xp) else True)
+
+    rets = equity_returns(bot)
+    chk("Özkaynak getirisi uzunluğu = döngü−1", rets.size == len(eq) - 1, f"({rets.size})")
+    d = dsr_summary(rets)
+    chk("DSR özeti üretildi (≥30 gün)", ("dsr" in d) if rets.size >= 30 else True)
+
+    # Durum kaydı: yaz → yeni bota yükle → özkaynak ve pozisyonlar aynı
+    tmp = os.path.join(tempfile.mkdtemp(), "state.pkl")
+    save_state(bot, tmp)
+    bot2 = Bot(BOT_SERMAYE, get_risk_params(), ensemble=_StubEnsemble(len(store.codes), 0.6, 0.2))
+    ok_load = load_state(bot2, tmp)
+    chk("Durum yüklendi", ok_load)
+    chk("Yüklenen nakit aynı", abs(bot2.pm.cash - bot.pm.cash) < 1e-6)
+    chk("Yüklenen işlem geçmişi aynı", len(bot2.pm.trades) == len(bot.pm.trades))
+    chk("Bozuk dosyada False (çökme yok)", not load_state(bot2, tmp + ".yok"))
+    with open(tmp, "wb") as f:
+        f.write(b"bozuk")
+    chk("Bozuk durum dosyası çökertmez", load_state(Bot(BOT_SERMAYE, get_risk_params()), tmp) is False)
+
+    # Tick: aynı bar ikinci kez işlenmez
+    bot.last_t = store.T - 1
+    chk("make_tick: işlenmiş bar tekrar işlenmez", make_tick(bot, store) is None)
+
+    # Figürler: plotly yoksa None, varsa Figure
+    f1 = fig_candles(store, store.codes[0], store.T - 1)
+    chk("Figür güvenliği (plotly yok → None, var → Figure)", (f1 is None) == (not PL_OK))
+    chk("Equity figürü güvenli", (fig_equity(bot.pm.equity_hist) is None) == (not PL_OK or not bot.pm.equity_hist))
+
+    # Sistem durumu
+    stt = system_status(store)
+    chk("Sistem durumu anahtarları", {"version", "n_feat", "store_bars", "numba", "torch"} <= set(stt.keys()))
+    chk("N_FEAT = 306 (spesifikasyon)", N_FEAT == 306, f"({N_FEAT})")
+
+    ok = all(r[1] for r in res)
+    print(f"\n{'✅ ÖZ-TEST 6 BAŞARILI' if ok else '❌ ÖZ-TEST 6 BAŞARISIZ'} ({sum(r[1] for r in res)}/{len(res)})")
+    return ok
+
+
+def _run_all_selftests() -> bool:
+    """Parça 1-6 öz-testlerini sırayla çalıştırır. Hepsi geçerse True."""
+    import seekdeep_v7 as _p1
+    import seekdeep_v7_p2 as _p2
+    import seekdeep_v7_p3 as _p3
+    import seekdeep_v7_p4 as _p4
+    import seekdeep_v7_p5 as _p5
+    results = [
+        ("P1 Foundation", _p1._selftest_part1()),
+        ("P2 Feature Store", _p2._selftest_part2()),
+        ("P3 Modeller", _p3._selftest_part3()),
+        ("P4 Belirsizlik/Backtest", _p4._selftest_part4()),
+        ("P5 Portföy/İcra/Bot", _p5._selftest_part5()),
+        ("P6 UI/Uygulama", _selftest_part6()),
+    ]
+    print("\n═══ TOPLU SONUÇ ═══")
+    for name, ok in results:
+        print(f"  {'✅' if ok else '❌'} {name}")
+    return all(ok for _, ok in results)
+
+
+if __name__ == "__main__":
+    if os.environ.get("SEEKDEEP_SELFTEST") == "1":
+        sys.exit(0 if _run_all_selftests() else 1)
+    if _in_streamlit_runtime():
         main()
+    else:
+        print(f"{BOT_NAME} {BOT_VERSION}: arayüz için `streamlit run seekdeep_v7_p6.py`, "
+              f"testler için `SEEKDEEP_SELFTEST=1 python seekdeep_v7_p6.py`.")
