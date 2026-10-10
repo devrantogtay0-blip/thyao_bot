@@ -17,8 +17,6 @@ PARÇA 1/6: FOUNDATION (Config + DB + Veri + Numba Çekirdekleri + Panel Kernell
 
 NOT: Çalıştırma:  SEEKDEEP_SELFTEST=1 python seekdeep_v7.py
 """
-from __future__ import annotations
-
 import json
 import logging
 import math
